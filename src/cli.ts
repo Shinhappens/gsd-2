@@ -12,9 +12,10 @@ import {
 import { existsSync, readdirSync, renameSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { agentDir, sessionsDir, authFilePath } from './app-paths.js'
-import { initResources } from './resource-loader.js'
+import { initResources, buildResourceLoader } from './resource-loader.js'
 import { ensureManagedTools } from './tool-bootstrap.js'
 import { loadStoredEnvKeys } from './wizard.js'
+import { migratePiCredentials } from './pi-migration.js'
 import { shouldRunOnboarding, runOnboarding } from './onboarding.js'
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,7 @@ ensureManagedTools(join(agentDir, 'bin'))
 
 const authStorage = AuthStorage.create(authFilePath)
 loadStoredEnvKeys(authStorage)
+migratePiCredentials(authStorage)
 
 // Run onboarding wizard on first launch (no LLM provider configured)
 if (!isPrintMode && shouldRunOnboarding(authStorage)) {
@@ -240,7 +242,7 @@ if (existsSync(sessionsDir)) {
 const sessionManager = SessionManager.create(cwd, projectSessionsDir)
 
 initResources(agentDir)
-const resourceLoader = new DefaultResourceLoader({ agentDir })
+const resourceLoader = buildResourceLoader(agentDir)
 await resourceLoader.reload()
 
 const { session, extensionsResult } = await createAgentSession({
