@@ -158,14 +158,19 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_start: render branded GSD header + remote channel status ──
   pi.on("session_start", async (_event, ctx) => {
-    const theme = ctx.ui.theme;
-    const version = process.env.GSD_VERSION || "0.0.0";
+    // Theme access throws in RPC mode (no TUI) — header is decorative, skip it
+    try {
+      const theme = ctx.ui.theme;
+      const version = process.env.GSD_VERSION || "0.0.0";
 
-    const logoText = GSD_LOGO_LINES.map((line) => theme.fg("accent", line)).join("\n");
-    const titleLine = `  ${theme.bold("Get Shit Done")} ${theme.fg("dim", `v${version}`)}`;
+      const logoText = GSD_LOGO_LINES.map((line) => theme.fg("accent", line)).join("\n");
+      const titleLine = `  ${theme.bold("Get Shit Done")} ${theme.fg("dim", `v${version}`)}`;
 
-    const headerContent = `${logoText}\n${titleLine}`;
-    ctx.ui.setHeader((_ui, _theme) => new Text(headerContent, 1, 0));
+      const headerContent = `${logoText}\n${titleLine}`;
+      ctx.ui.setHeader((_ui, _theme) => new Text(headerContent, 1, 0));
+    } catch {
+      // RPC mode — no TUI, skip header rendering
+    }
 
     // Notify remote questions status if configured
     try {
