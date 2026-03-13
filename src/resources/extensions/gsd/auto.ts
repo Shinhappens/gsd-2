@@ -60,10 +60,12 @@ import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 
 import { execSync, execFileSync } from "node:child_process";
 import {
   autoCommitCurrentBranch,
+  captureIntegrationBranch,
   ensureSliceBranch,
   getCurrentBranch,
   getMainBranch,
   parseSliceBranch,
+  setActiveMilestoneId,
   switchToMain,
   mergeSliceToMain,
 } from "./worktree.ts";
@@ -361,6 +363,8 @@ export async function startAuto(
     unitDispatchCount.clear();
     // Re-initialize metrics in case ledger was lost during pause
     if (!getLedger()) initMetrics(base);
+    // Ensure milestone ID is set on git service for integration branch resolution
+    if (currentMilestoneId) setActiveMilestoneId(base, currentMilestoneId);
     ctx.ui.setStatus("gsd-auto", stepMode ? "next" : "auto");
     ctx.ui.setFooter(hideFooter);
     ctx.ui.notify(stepMode ? "Step-mode resumed." : "Auto-mode resumed.", "info");
@@ -467,6 +471,15 @@ export async function startAuto(
   currentMilestoneId = state.activeMilestone?.id ?? null;
   originalModelId = ctx.model?.id ?? null;
   originalModelProvider = ctx.model?.provider ?? null;
+
+  // Capture the integration branch — records the branch the user was on when
+  // auto-mode started. Slice branches will merge back to this branch instead
+  // of the repo's default (main/master). Idempotent: only writes if not
+  // already recorded, so restarts/resumes don't overwrite.
+  if (currentMilestoneId) {
+    captureIntegrationBranch(base, currentMilestoneId);
+    setActiveMilestoneId(base, currentMilestoneId);
+  }
 
   // Initialize metrics — loads existing ledger from disk
   initMetrics(base);
@@ -1002,8 +1015,13 @@ async function dispatchNextUnit(
     // Reset stuck detection for new milestone
     unitDispatchCount.clear();
     unitRecoveryCount.clear();
+    // Capture integration branch for the new milestone and update git service
+    captureIntegrationBranch(basePath, mid);
   }
-  if (mid) currentMilestoneId = mid;
+  if (mid) {
+    currentMilestoneId = mid;
+    setActiveMilestoneId(basePath, mid);
+  }
 
   if (!mid) {
     // Save final session before stopping
