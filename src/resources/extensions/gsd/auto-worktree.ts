@@ -54,7 +54,9 @@ export function shouldUseWorktreeIsolation(basePath: string, overridePrefs?: { i
 
   // Legacy detection: check for existing gsd/*/* branches (branch-per-slice pattern)
   try {
-    const output = execSync("git branch --list 'gsd/*/*'", {
+    // Use unquoted glob pattern — single quotes are not interpreted by cmd.exe on Windows,
+    // causing the pattern to match literally instead of as a glob.
+    const output = execSync("git branch --list gsd/*/*", {
       cwd: basePath,
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf-8",
