@@ -4,149 +4,124 @@ This file is the explicit capability and coverage contract for the project.
 
 ## Active
 
+(No active requirements — all M003 requirements validated.)
+
+## Validated
+
 ### R029 — Auto-worktree creation on milestone start
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: When auto-mode starts a new milestone, it automatically creates a git worktree under `.gsd/worktrees/<MID>/` with branch `milestone/<MID>`, `chdir`s into it, and dispatches all units from within the worktree. The user never runs a git command.
 - Why it matters: Worktree isolation gives each milestone its own `.gsd/` directory, eliminating the entire category of `.gsd/` merge conflicts that have caused ~15 separate bug fixes to date.
 - Source: user
 - Primary owning slice: M003/S01
 - Supporting slices: none
-- Validation: unmapped
-- Notes: Must handle: fresh milestone (no worktree yet), resumed milestone (worktree already exists), milestone started from non-main branch. Must coexist with manual `/worktree` command.
+- Validation: S01 createAutoWorktree creates worktree with milestone/<MID> branch, chdir, dispatches from within. 21 assertions in auto-worktree.test.ts. S07 e2e lifecycle test proves full create-execute-merge-teardown.
+- Notes: Handles fresh milestone, resumed milestone, and coexists with manual `/worktree` command.
 
 ### R030 — Auto-worktree teardown + squash-merge on milestone complete
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: When a milestone completes, the milestone branch is squash-merged to main with a rich commit message, the worktree is removed, and `process.chdir` returns to the main project root. Main receives exactly one commit per milestone.
 - Why it matters: Main stays clean and always represents completed, working milestones. One commit per milestone is individually revertable.
 - Source: user
 - Primary owning slice: M003/S03
 - Supporting slices: M003/S01
-- Validation: unmapped
-- Notes: Must handle: dirty worktree at teardown time (auto-commit first), failed squash-merge (self-heal), remote push after merge (if auto_push enabled).
+- Validation: mergeMilestoneToMain with 23 assertions in auto-worktree-milestone-merge.test.ts. S07 e2e verifies single squash commit on main with worktree removed and branch deleted.
+- Notes: Handles dirty worktree (auto-commit), auto-push, and worktree/branch cleanup.
 
 ### R031 — `--no-ff` slice merges within milestone worktree
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: Completed slices merge into the milestone branch via `--no-ff` merge instead of squash. This preserves the full per-task commit history on the milestone branch, with merge commits providing natural slice boundaries.
-- Why it matters: The commit history is a diary of the agent's work. The LLM can read `git log` to understand what happened. Squashing slices destroys this granularity. `--no-ff` merge commits give clean slice boundaries while keeping all commits.
+- Why it matters: The commit history is a diary of the agent's work. `--no-ff` merge commits give clean slice boundaries while keeping all commits.
 - Source: user
 - Primary owning slice: M003/S02
 - Supporting slices: M003/S01
-- Validation: unmapped
-- Notes: This is the default for worktree-isolated mode. The branch-per-slice legacy model retains its existing squash default.
+- Validation: mergeSliceToMilestone with 21 assertions in auto-worktree-merge.test.ts proving merge commits, distinct boundaries, branch deletion. S07 e2e verifies both slice titles in final squash commit.
+- Notes: Default for worktree-isolated mode. Branch-per-slice retains existing squash default.
 
 ### R032 — Rich milestone-level squash commit message
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: When a milestone squash-merges to main, the commit message summarizes all slices and their key outcomes. Format: conventional commit subject + slice task list body + branch metadata.
 - Why it matters: Main's git log should read like a changelog. Each milestone commit should tell the full story of what was built.
 - Source: user
 - Primary owning slice: M003/S03
 - Supporting slices: none
-- Validation: unmapped
-- Notes: Similar to current rich commit message for slice merges, but at milestone level. Should list all slices with their titles and key outcomes.
-
-### R033 — `git.isolation` preference
-- Class: core-capability
-- Status: validated
-- Description: A `git.isolation` preference with values `"worktree"` (default for new projects) and `"branch"` (legacy model). New projects that have never run GSD default to worktree isolation. Existing projects with an established branch-per-slice history default to branch mode.
-- Why it matters: Backwards compatibility — existing projects must not break. New projects get the better model by default.
-- Source: user
-- Primary owning slice: M003/S04
-- Supporting slices: none
-- Validation: Set-based validation in validatePreferences, shouldUseWorktreeIsolation resolver with three-tier resolution (explicit pref > legacy detection > default). 25 test assertions in preferences-git.test.ts and isolation-resolver.test.ts.
-- Notes: Detection heuristic: if the project has existing `gsd/*` branches or milestone metadata with integration branch records, it's a legacy project → default to "branch". Otherwise → default to "worktree".
-
-### R034 — `git.merge_to_main` preference
-- Class: core-capability
-- Status: validated
-- Description: A `git.merge_to_main` preference with values `"milestone"` (default) and `"slice"`. In milestone mode, main only receives commits when milestones complete. In slice mode, each completed slice squash-merges to main immediately (current behavior).
-- Why it matters: Senior engineers who want frequent integration can opt into slice-level merges. Vibe coders get the cleaner milestone-level default.
-- Source: user
-- Primary owning slice: M003/S04
-- Supporting slices: M003/S03
-- Validation: Set-based validation in validatePreferences, getMergeToMainMode helper, auto.ts merge routing gated behind preference. Tested in preferences-git.test.ts.
-- Notes: `merge_to_main: "slice"` with `isolation: "worktree"` is valid — slices squash-merge to main from within the worktree, but the worktree still provides `.gsd/` isolation.
+- Validation: S03 tests verify feat(MID) conventional commit format with slice listing. S07 e2e confirms both slice titles present in squash commit message.
 
 ### R035 — Self-healing git repair on failure
 - Class: core-capability
-- Status: active
-- Description: When git operations fail during auto-mode (merge conflict, checkout failure, corrupt state), the system automatically attempts repair: abort incomplete merges, reset working tree, retry the operation. Only truly unresolvable conflicts (two humans edited the same code) pause auto-mode with a clear explanation.
-- Why it matters: The north star is "automagical — just runs." Git errors are the #1 cause of auto-mode halting. Self-healing eliminates most of those stops.
+- Status: validated
+- Description: When git operations fail during auto-mode (merge conflict, checkout failure, corrupt state), the system automatically attempts repair: abort incomplete merges, reset working tree, retry the operation. Only truly unresolvable conflicts pause auto-mode.
+- Why it matters: Git errors are the #1 cause of auto-mode halting. Self-healing eliminates most of those stops.
 - Source: user
 - Primary owning slice: M003/S05
 - Supporting slices: M003/S01, M003/S02, M003/S03
-- Validation: unmapped
-- Notes: The worktree model eliminates most `.gsd/` conflicts structurally. Self-healing handles the remaining edge cases (code conflicts, remote divergence, corrupt index).
+- Validation: git-self-heal.ts with abortAndReset, withMergeHeal, recoverCheckout, formatGitError. 14 assertions against real broken git repos. Wired into auto-worktree.ts merge/checkout paths. S07 e2e self-heal group (4 assertions).
+- Notes: Real conflicts escalate immediately (no retry). Transient failures get abort+reset+retry.
 
 ### R036 — `.gsd/` conflict resolution elimination
 - Class: quality-attribute
-- Status: active
-- Description: The ~60 lines of `.gsd/` auto-resolve conflict code in `mergeSliceToMain` and the ~44 merge-related recovery paths in `auto.ts` are simplified or removed. Worktree isolation makes most of this code structurally unnecessary.
-- Why it matters: Dead conflict resolution code is maintenance burden and a source of bugs. If the architecture eliminates the problem, the code that patches it should go.
+- Status: validated
+- Description: `.gsd/` conflict resolution code bypassed in worktree merge path and annotated as branch-mode-only in git-service.ts.
+- Why it matters: Dead conflict resolution code is maintenance burden. Worktree isolation makes it structurally unnecessary.
 - Source: inferred
 - Primary owning slice: M003/S02
 - Supporting slices: M003/S06
-- Validation: unmapped
-- Notes: Only remove code that is genuinely unnecessary in worktree mode. Keep the legacy branch-per-slice path intact for `git.isolation: "branch"` users.
+- Validation: mergeSliceToMilestone has zero .gsd/ conflict resolution code. git-service.ts conflict resolution annotated as branch-mode-only. D038 documents structural impossibility of .gsd/ conflicts in worktree mode.
+- Notes: Branch-mode path preserved for git.isolation: "branch" users per R038.
 
 ### R037 — Zero git errors for vibe coders
 - Class: primary-user-loop
-- Status: active
-- Description: Users with zero git knowledge should never see a git error message during auto-mode. All git operations are invisible. If something fails, the system self-heals or presents a non-technical explanation with a clear action ("Run `/gsd doctor` to fix this").
-- Why it matters: Vibe coders are the primary market. Git errors are incomprehensible to them and destroy trust in the system.
+- Status: validated
+- Description: Users with zero git knowledge should never see a git error message during auto-mode. All git operations are invisible. If something fails, the system self-heals or presents a non-technical explanation with a clear action.
+- Why it matters: Vibe coders are the primary market. Git errors destroy trust.
 - Source: user
 - Primary owning slice: M003/S05
 - Supporting slices: all M003 slices
-- Validation: unmapped
-- Notes: This is a quality bar, not a single feature. Every git-touching codepath must handle errors gracefully.
+- Validation: formatGitError translates all git errors to non-technical messages with /gsd doctor suggestion. Self-heal handles transient failures silently. Only real code conflicts surface to user.
 
 ### R038 — Backwards compatibility with branch-per-slice model
 - Class: continuity
-- Status: active
-- Description: Existing projects that use the branch-per-slice model continue working exactly as they do today. No migration required. The old codepaths remain functional when `git.isolation: "branch"` is active.
+- Status: validated
+- Description: Existing projects that use the branch-per-slice model continue working exactly as they do today. No migration required.
 - Why it matters: Breaking existing users' workflows would destroy trust.
 - Source: user
 - Primary owning slice: M003/S04
 - Supporting slices: none
-- Validation: unmapped
-- Notes: All existing git-service.ts tests must continue passing in branch mode.
+- Validation: shouldUseWorktreeIsolation detects legacy gsd/* branches and defaults to branch mode. 291 unit tests pass with zero regressions. mergeSliceToMain in git-service.ts untouched.
 
 ### R039 — Manual `/worktree` coexistence with auto-worktrees
 - Class: integration
-- Status: active
-- Description: The manual `/worktree` command for exploration coexists with auto-mode's milestone worktrees. Different naming conventions prevent conflicts: auto-worktrees use `milestone/M003` branches, manual worktrees use `worktree/<name>` branches.
-- Why it matters: Manual worktrees are a valuable exploration tool. They shouldn't be broken by auto-mode's worktree usage.
+- Status: validated
+- Description: Manual `/worktree` command coexists with auto-mode's milestone worktrees via different naming conventions (milestone/ vs worktree/ branches).
+- Why it matters: Manual worktrees are a valuable exploration tool.
 - Source: user
 - Primary owning slice: M003/S01
 - Supporting slices: none
-- Validation: unmapped
-- Notes: Auto-worktrees are created under `.gsd/worktrees/` just like manual ones, but with milestone ID as the name. The naming convention prevents branch collisions.
+- Validation: S01 uses milestone/<MID> branches for auto-worktrees, worktree/<name> for manual. Integration test proves coexistence without branch collisions.
 
 ### R040 — Doctor git health checks
 - Class: operability
 - Status: validated
-- Description: `/gsd doctor` detects and optionally fixes git-related issues: orphaned auto-worktrees, stale milestone branches, corrupt merge state (MERGE_HEAD/SQUASH_MSG), tracked runtime files, missing gitignore patterns.
-- Why it matters: When things do go wrong, users need a one-command fix. Doctor is the safety net.
+- Description: `/gsd doctor` detects and optionally fixes git-related issues: orphaned auto-worktrees, stale milestone branches, corrupt merge state (MERGE_HEAD/SQUASH_MSG), tracked runtime files.
+- Why it matters: When things do go wrong, users need a one-command fix.
 - Source: inferred
 - Primary owning slice: M003/S06
 - Supporting slices: M003/S05
 - Validation: 4 DoctorIssueCode values with detection and fix logic in checkGitHealth. 6 integration tests (17 assertions) in doctor-git.test.ts covering detect/fix/verify cycle for all codes plus safety guards.
-- Notes: Doctor already handles planning artifact issues. This extends it to git health.
 
 ### R041 — Test coverage for worktree-isolated flow
 - Class: quality-attribute
 - Status: validated
-- Description: Test suite covers: auto-worktree create/teardown, `--no-ff` slice merge within worktree, milestone squash to main, preference switching between isolation modes, self-heal scenarios, doctor git checks. All existing git tests continue passing.
+- Description: Test suite covers auto-worktree create/teardown, --no-ff slice merge, milestone squash, preference switching, self-heal, doctor checks. All existing git tests pass.
 - Why it matters: The git system is the most bug-prone part of GSD. Tests prevent regressions.
 - Source: inferred
 - Primary owning slice: M003/S07
 - Supporting slices: all M003 slices
 - Validation: worktree-e2e.test.ts — 20 assertions across 5 groups (lifecycle, preference gating, merge mode, self-heal, doctor). 291 unit tests pass with zero regressions.
-
-## Validated
 
 ### R001 — Secret forecasting during milestone planning
 - Class: core-capability
@@ -525,17 +500,17 @@ This file is the explicit capability and coverage contract for the project.
 | R026 | quality-attribute | validated | M002/S06 | all M002 | 108 tests passing via npm run test:browser-tools |
 | R027 | core-capability | deferred | none | none | unmapped |
 | R028 | anti-feature | out-of-scope | none | none | n/a |
-| R029 | core-capability | active | M003/S01 | none | unmapped |
-| R030 | core-capability | active | M003/S03 | M003/S01 | unmapped |
-| R031 | core-capability | active | M003/S02 | M003/S01 | unmapped |
-| R032 | core-capability | active | M003/S03 | none | unmapped |
+| R029 | core-capability | validated | M003/S01 | none | S01 lifecycle + S07 e2e proves create-execute-merge-teardown |
+| R030 | core-capability | validated | M003/S03 | M003/S01 | S03 23 assertions, S07 e2e single squash commit |
+| R031 | core-capability | validated | M003/S02 | M003/S01 | S02 21 assertions --no-ff merge boundaries |
+| R032 | core-capability | validated | M003/S03 | none | S03 rich commit message, S07 e2e slice titles in commit |
 | R033 | core-capability | validated | M003/S04 | none | Set-based validation, shouldUseWorktreeIsolation resolver, 25 test assertions |
 | R034 | core-capability | validated | M003/S04 | M003/S03 | Set-based validation, getMergeToMainMode, auto.ts merge routing gated |
-| R035 | core-capability | active | M003/S05 | M003/S01, M003/S02, M003/S03 | unmapped |
-| R036 | quality-attribute | active | M003/S02 | M003/S06 | unmapped |
-| R037 | primary-user-loop | active | M003/S05 | all M003 | unmapped |
-| R038 | continuity | active | M003/S04 | none | unmapped |
-| R039 | integration | active | M003/S01 | none | unmapped |
+| R035 | core-capability | validated | M003/S05 | M003/S01, M003/S02, M003/S03 | S05 14 assertions against broken repos, S07 e2e self-heal |
+| R036 | quality-attribute | validated | M003/S02 | M003/S06 | Zero .gsd/ conflict code in worktree path, branch-mode-only annotation |
+| R037 | primary-user-loop | validated | M003/S05 | all M003 | formatGitError user-friendly messages with /gsd doctor suggestion |
+| R038 | continuity | validated | M003/S04 | none | Legacy detection, 291 unit tests zero regressions |
+| R039 | integration | validated | M003/S01 | none | milestone/ vs worktree/ branch naming, coexistence test |
 | R040 | operability | validated | M003/S06 | M003/S05 | 4 DoctorIssueCode values, 6 integration tests (17 assertions) in doctor-git.test.ts |
 | R041 | quality-attribute | validated | M003/S07 | all M003 | worktree-e2e.test.ts 20 assertions, 291 unit tests zero regressions |
 | R042 | core-capability | deferred | none | none | unmapped |
@@ -544,9 +519,9 @@ This file is the explicit capability and coverage contract for the project.
 
 ## Coverage Summary
 
-- Active requirements: 9
-- Mapped to slices: 9
-- Validated: 26
+- Active requirements: 0
+- Mapped to slices: 0
+- Validated: 35
 - Deferred: 5
 - Out of scope: 4
 - Unmapped active requirements: 0

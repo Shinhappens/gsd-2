@@ -20,7 +20,7 @@ The GSD extension is fully functional with:
 - Browser-tools `core.js` with shared utilities for action timeline, page registry, state diffing, assertions, fingerprinting
 - Worktree-isolated git architecture: auto-worktree per milestone, --no-ff slice merges, milestone squash to main, preference-gated isolation modes, self-healing git repair, doctor git health checks, full e2e test coverage
 - Auto-worktree lifecycle: `auto-worktree.ts` module creates isolated worktrees per milestone (`milestone/<MID>` branches), wired into auto.ts startAuto/resume/stop with split-brain prevention
-- Branch-per-slice git model with squash merge to main (being superseded by worktree-isolated model in M003)
+- Branch-per-slice git model with squash merge to main (legacy mode, supported via `git.isolation: "branch"` preference)
 
 ## Architecture / Key Patterns
 
@@ -42,4 +42,4 @@ See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement sta
 
 - [x] M001: Proactive Secret Management — Front-loaded API key collection into planning so auto-mode runs uninterrupted (10 requirements validated)
 - [x] M002: Browser Tools Performance & Intelligence — Module decomposition, action pipeline optimization, sharp-based screenshots, form intelligence, intent-ranked retrieval, semantic actions, 108-test suite (12 requirements validated)
-- [ ] M003: Worktree-Isolated Git Architecture — S01-S04 complete (worktree lifecycle, --no-ff slice merges, milestone squash-merge, preferences + backwards compat). S05-S07 remaining.
+- [x] M003: Worktree-Isolated Git Architecture — Auto-worktree per milestone, --no-ff slice merges, milestone squash to main, preferences + backwards compat, self-healing git repair, doctor health checks, full e2e test suite (13 requirements validated)
