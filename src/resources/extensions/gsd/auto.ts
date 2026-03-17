@@ -61,6 +61,13 @@ import {
 import { closeoutUnit } from "./auto-unit-closeout.js";
 import { recoverTimedOutUnit } from "./auto-timeout-recovery.js";
 import { selectAndApplyModel } from "./auto-model-selection.js";
+import {
+  syncProjectRootToWorktree,
+  syncStateToProjectRoot,
+  readResourceVersion,
+  checkResourcesStale,
+  escapeStaleWorktree,
+} from "./auto-worktree-sync.js";
 // complexity-classifier + model-router imports moved to auto-model-selection.ts
 import { initRoutingHistory, resetRoutingHistory, recordOutcome } from "./routing-history.js";
 import {
@@ -93,8 +100,7 @@ import {
 } from "./metrics.js";
 import { join } from "node:path";
 import { sep as pathSep } from "node:path";
-import { homedir } from "node:os";
-import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, statSync, cpSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, statSync } from "node:fs";
 import { nativeIsRepo, nativeInit, nativeAddPaths, nativeCommit } from "./native-git-bridge.js";
 import {
   autoCommitCurrentBranch,
@@ -159,108 +165,7 @@ import {
 import { isDbAvailable } from "./gsd-db.js";
 import { hasPendingCaptures, loadPendingCaptures, countPendingCaptures } from "./captures.js";
 
-// ─── Worktree → Project Root State Sync ───────────────────────────────────────
-// When running in an auto-worktree, dispatch state (.gsd/ metadata) diverges
-// between the worktree (where work happens) and the project root (where
-// startAutoMode reads initial state on restart). Without syncing, restarting
-// auto-mode reads stale state from the project root and re-dispatches
-// already-completed units.
-
-/**
- * Sync milestone artifacts from project root INTO worktree before deriveState.
- * Covers the case where the LLM wrote artifacts to the main repo filesystem
- * (e.g. via absolute paths) but the worktree has stale data. Also deletes
- * gsd.db in the worktree so it rebuilds from fresh disk state (#853).
- * Non-fatal — sync failure should never block dispatch.
- */
-function syncProjectRootToWorktree(projectRoot: string, worktreePath: string, milestoneId: string | null): void {
-  if (!worktreePath || !projectRoot || worktreePath === projectRoot) return;
-  if (!milestoneId) return;
-
-  const prGsd = join(projectRoot, ".gsd");
-  const wtGsd = join(worktreePath, ".gsd");
-
-  // Copy milestone directory from project root to worktree if the project root
-  // has newer artifacts (e.g. slices that don't exist in the worktree yet)
-  try {
-    const srcMilestone = join(prGsd, "milestones", milestoneId);
-    const dstMilestone = join(wtGsd, "milestones", milestoneId);
-    if (existsSync(srcMilestone)) {
-      mkdirSync(dstMilestone, { recursive: true });
-      cpSync(srcMilestone, dstMilestone, { recursive: true, force: false });
-    }
-  } catch { /* non-fatal */ }
-
-  // Delete worktree gsd.db so it rebuilds from the freshly synced files.
-  // Stale DB rows are the root cause of the infinite skip loop (#853).
-  try {
-    const wtDb = join(wtGsd, "gsd.db");
-    if (existsSync(wtDb)) {
-      unlinkSync(wtDb);
-    }
-  } catch { /* non-fatal */ }
-}
-
-/**
- * Sync dispatch-critical .gsd/ state files from worktree to project root.
- * Only runs when inside an auto-worktree (worktreePath differs from projectRoot).
- * Copies: STATE.md + active milestone directory (roadmap, slice plans, task summaries).
- * Non-fatal — sync failure should never block dispatch.
- */
-function syncStateToProjectRoot(worktreePath: string, projectRoot: string, milestoneId: string | null): void {
-  if (!worktreePath || !projectRoot || worktreePath === projectRoot) return;
-  if (!milestoneId) return;
-
-  const wtGsd = join(worktreePath, ".gsd");
-  const prGsd = join(projectRoot, ".gsd");
-
-  // 1. STATE.md — the quick-glance status used by initial deriveState()
-  try {
-    const src = join(wtGsd, "STATE.md");
-    const dst = join(prGsd, "STATE.md");
-    if (existsSync(src)) cpSync(src, dst, { force: true });
-  } catch { /* non-fatal */ }
-
-  // 2. Milestone directory — ROADMAP, slice PLANs, task summaries
-  // Copy the entire milestone .gsd subtree so deriveState reads current checkboxes
-  try {
-    const srcMilestone = join(wtGsd, "milestones", milestoneId);
-    const dstMilestone = join(prGsd, "milestones", milestoneId);
-    if (existsSync(srcMilestone)) {
-      mkdirSync(dstMilestone, { recursive: true });
-      cpSync(srcMilestone, dstMilestone, { recursive: true, force: true });
-    }
-  } catch { /* non-fatal */ }
-
-  // 3. Merge completed-units.json (set-union of both locations)
-  // Prevents already-completed units from being re-dispatched after crash/restart.
-  const srcKeysFile = join(wtGsd, "completed-units.json");
-  const dstKeysFile = join(prGsd, "completed-units.json");
-  if (existsSync(srcKeysFile)) {
-    try {
-      const srcKeys: string[] = JSON.parse(readFileSync(srcKeysFile, "utf8"));
-      let dstKeys: string[] = [];
-      if (existsSync(dstKeysFile)) {
-        try { dstKeys = JSON.parse(readFileSync(dstKeysFile, "utf8")); } catch { /* ignore corrupt dst */ }
-      }
-      const merged = [...new Set([...dstKeys, ...srcKeys])];
-      writeFileSync(dstKeysFile, JSON.stringify(merged, null, 2));
-    } catch { /* non-fatal */ }
-  }
-
-  // 4. Runtime records — unit dispatch state used by selfHealRuntimeRecords().
-  // Without this, a crash during a unit leaves the runtime record only in the
-  // worktree. If the next session resolves basePath before worktree re-entry,
-  // selfHeal can't find or clear the stale record (#769).
-  try {
-    const srcRuntime = join(wtGsd, "runtime", "units");
-    const dstRuntime = join(prGsd, "runtime", "units");
-    if (existsSync(srcRuntime)) {
-      mkdirSync(dstRuntime, { recursive: true });
-      cpSync(srcRuntime, dstRuntime, { recursive: true, force: true });
-    }
-  } catch { /* non-fatal */ }
-}
+// Worktree sync, resource staleness, stale worktree escape → auto-worktree-sync.ts
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -296,75 +201,13 @@ const MAX_CONSECUTIVE_SKIPS = 3;
 /** Persisted completed-unit keys — survives restarts. Loaded from .gsd/completed-units.json. */
 const completedKeySet = new Set<string>();
 
-/** Resource version captured at auto-mode start. If the managed-resources
- *  manifest version changes mid-session (e.g. npm update -g gsd-pi),
- *  templates on disk may expect variables the in-memory code doesn't provide.
- *  Detect this and stop gracefully instead of crashing.
- *  Uses gsdVersion (semver) instead of syncedAt (timestamp) so that
- *  launching a second session doesn't falsely trigger staleness (#804). */
 let resourceVersionOnStart: string | null = null;
 
-function readResourceVersion(): string | null {
-  const agentDir = process.env.GSD_CODING_AGENT_DIR || join(homedir(), ".gsd", "agent");
-  const manifestPath = join(agentDir, "managed-resources.json");
-  try {
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
-    return typeof manifest?.gsdVersion === "string" ? manifest.gsdVersion : null;
-  } catch {
-    return null;
-  }
-}
-
-function checkResourcesStale(): string | null {
-  if (resourceVersionOnStart === null) return null;
-  const current = readResourceVersion();
-  if (current === null) return null;
-  if (current !== resourceVersionOnStart) {
-    return "GSD resources were updated since this session started. Restart gsd to load the new code.";
-  }
-  return null;
-}
-
-/**
- * Resolve whether auto-mode should use worktree isolation.
- * Returns true for worktree mode (default), false for branch and none modes.
- * Branch mode works directly in the project root — useful for repos
- * with git submodules where worktrees don't work well (#531).
- * None mode skips all worktree and milestone-branch logic — commits
- * land on the current branch with no isolation (#M001-S02).
- */
 export function shouldUseWorktreeIsolation(): boolean {
   const prefs = loadEffectiveGSDPreferences()?.preferences?.git;
   if (prefs?.isolation === "none") return false;
   if (prefs?.isolation === "branch") return false;
   return true; // default: worktree
-}
-
-/**
- * Detect and escape a stale worktree cwd (#608).
- *
- * After milestone completion + merge, the worktree directory is removed but
- * the process cwd may still point inside `.gsd/worktrees/<MID>/`.
- * When a new session starts, `process.cwd()` is passed as `base` to startAuto
- * and all subsequent writes land in the wrong directory. This function detects
- * that scenario and chdir back to the project root.
- *
- * Returns the corrected base path.
- */
-function escapeStaleWorktree(base: string): string {
-  const marker = `${pathSep}.gsd${pathSep}worktrees${pathSep}`;
-  const idx = base.indexOf(marker);
-  if (idx === -1) return base;
-
-  // base is inside .gsd/worktrees/<something> — extract the project root
-  const projectRoot = base.slice(0, idx);
-  try {
-    process.chdir(projectRoot);
-  } catch {
-    // If chdir fails, return the original — caller will handle errors downstream
-    return base;
-  }
-  return projectRoot;
 }
 
 /** Crash recovery prompt — set by startAuto, consumed by first dispatchNextUnit */
@@ -2014,7 +1857,7 @@ async function dispatchNextUnit(
   // once at startup. If resources were re-synced (e.g. /gsd:update, npm update,
   // or dev copy-resources), templates may expect variables the in-memory code
   // doesn't provide. Stop gracefully instead of crashing.
-  const staleMsg = checkResourcesStale();
+  const staleMsg = checkResourcesStale(resourceVersionOnStart);
   if (staleMsg) {
     await stopAuto(ctx, pi, staleMsg);
     return;
