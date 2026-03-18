@@ -8,6 +8,7 @@ import type { PostUnitHookConfig, PreDispatchHookConfig, BudgetEnforcementMode, 
 import type { DynamicRoutingConfig } from "./model-router.js";
 import { defaultRoutingConfig } from "./model-router.js";
 import { VALID_BRANCH_NAME } from "./git-service.js";
+import { normalizeStringArray } from "../shared/format-utils.js";
 
 const GLOBAL_PREFERENCES_PATH = join(homedir(), ".gsd", "preferences.md");
 const LEGACY_GLOBAL_PREFERENCES_PATH = join(homedir(), ".pi", "agent", "gsd-preferences.md");
@@ -869,10 +870,10 @@ export function validatePreferences(preferences: GSDPreferences): {
     }
   }
 
-  validated.always_use_skills = normalizeStringList(preferences.always_use_skills);
-  validated.prefer_skills = normalizeStringList(preferences.prefer_skills);
-  validated.avoid_skills = normalizeStringList(preferences.avoid_skills);
-  validated.custom_instructions = normalizeStringList(preferences.custom_instructions);
+  validated.always_use_skills = normalizeStringArray(preferences.always_use_skills);
+  validated.prefer_skills = normalizeStringArray(preferences.prefer_skills);
+  validated.avoid_skills = normalizeStringArray(preferences.avoid_skills);
+  validated.custom_instructions = normalizeStringArray(preferences.custom_instructions);
 
   if (preferences.skill_rules) {
     const validRules: GSDSkillRule[] = [];
@@ -888,7 +889,7 @@ export function validatePreferences(preferences: GSDPreferences): {
       }
       const validatedRule: GSDSkillRule = { when };
       for (const action of SKILL_ACTIONS) {
-        const values = normalizeStringList((rule as unknown as Record<string, unknown>)[action]);
+        const values = normalizeStringArray((rule as unknown as Record<string, unknown>)[action]);
         if (values.length > 0) {
           validatedRule[action as keyof GSDSkillRule] = values as never;
         }
@@ -1052,7 +1053,7 @@ export function validatePreferences(preferences: GSDPreferences): {
         errors.push(`duplicate post_unit_hooks name: ${name}`);
         continue;
       }
-      const after = normalizeStringList(hook.after);
+      const after = normalizeStringArray(hook.after);
       if (after.length === 0) {
         errors.push(`post_unit_hooks "${name}" missing after`);
         continue;
@@ -1119,7 +1120,7 @@ export function validatePreferences(preferences: GSDPreferences): {
         errors.push(`duplicate pre_dispatch_hooks name: ${name}`);
         continue;
       }
-      const before = normalizeStringList(hook.before);
+      const before = normalizeStringArray(hook.before);
       if (before.length === 0) {
         errors.push(`pre_dispatch_hooks "${name}" missing before`);
         continue;
@@ -1382,21 +1383,14 @@ export function validatePreferences(preferences: GSDPreferences): {
 
 function mergeStringLists(base?: unknown, override?: unknown): string[] | undefined {
   const merged = [
-    ...normalizeStringList(base),
-    ...normalizeStringList(override),
+    ...normalizeStringArray(base),
+    ...normalizeStringArray(override),
   ]
     .map((item) => item.trim())
     .filter(Boolean);
   return merged.length > 0 ? Array.from(new Set(merged)) : undefined;
 }
 
-function normalizeStringList(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value
-    .filter((item): item is string => typeof item === "string")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
 
 function mergePostUnitHooks(
   base?: PostUnitHookConfig[],
