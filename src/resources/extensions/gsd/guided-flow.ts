@@ -788,9 +788,11 @@ export async function showSmartEntry(
   // ── Self-heal stale runtime records from crashed auto-mode sessions ──
   selfHealRuntimeRecords(basePath, ctx);
 
-  // Check for crash from previous auto-mode session
+  // Check for crash from previous auto-mode session.
+  // Skip if the lock was written by the current process — acquireSessionLock()
+  // writes to the same file, so we'd always false-positive (#1398).
   const crashLock = readCrashLock(basePath);
-  if (crashLock) {
+  if (crashLock && crashLock.pid !== process.pid) {
     clearLock(basePath);
 
     // Bootstrap crash with zero completed units = no work was lost.
