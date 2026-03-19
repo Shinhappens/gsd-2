@@ -319,3 +319,6 @@ export function getServersForFile(config: LspConfig, filePath: string): Array<[s
 	});
 }
 
+export function getServerForFile(config: LspConfig, filePath: string): [string, ServerConfig] | null {
+	return getServersForFile(config, filePath)[0] ?? null;
+}
