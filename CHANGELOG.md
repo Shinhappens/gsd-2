@@ -6,6 +6,22 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.34.0] - 2026-03-19
+
+### Added
+- auto-generate OpenRouter model registry from API + add missing models (#1407) (#1426)
+
+### Fixed
+- release stranded bootstrap locks and handle re-entrant reacquire (#1352)
+- add JS fallbacks for wrapTextWithAnsi and visibleWidth when native addon unavailable (#1418) (#1428)
+- emit agent_end after abort during tool execution (#1414) (#1417)
+- auto-discard bootstrap crash locks and clean auto.lock on exit (#1397)
+- harden quick-task branch lifecycle — disk recovery + integration branch guard (#1342)
+- skip verification retry on spawn infra errors (ETIMEDOUT, ENOENT) (#1340)
+- keep external GSD state stable in worktrees (#1334)
+- stop excluding all .gsd/ from commits — only exclude runtime files (#1326) (#1328)
+- handle ECOMPROMISED in uncaughtException guard and align retry onCompromised (#1322) (#1332)
+
 ## [2.33.1] - 2026-03-19
 
 ### Fixed
@@ -1318,7 +1334,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - License updated to MIT
 
-[Unreleased]: https://github.com/gsd-build/gsd-2/compare/v2.33.1...HEAD
+[Unreleased]: https://github.com/gsd-build/gsd-2/compare/v2.34.0...HEAD
+[2.34.0]: https://github.com/gsd-build/gsd-2/compare/v2.33.1...v2.34.0
 [2.33.1]: https://github.com/gsd-build/gsd-2/compare/v2.33.0...v2.33.1
 [2.33.0]: https://github.com/gsd-build/gsd-2/compare/v2.32.0...v2.33.0
 [2.32.0]: https://github.com/gsd-build/gsd-2/compare/v2.31.2...v2.32.0
