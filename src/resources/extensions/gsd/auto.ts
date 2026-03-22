@@ -364,6 +364,22 @@ export function isAutoPaused(): boolean {
   return s.paused;
 }
 
+export function setActiveEngineId(id: string | null): void {
+  s.activeEngineId = id;
+}
+
+export function getActiveEngineId(): string | null {
+  return s.activeEngineId;
+}
+
+export function setActiveRunDir(runDir: string | null): void {
+  s.activeRunDir = runDir;
+}
+
+export function getActiveRunDir(): string | null {
+  return s.activeRunDir;
+}
+
 /**
  * Return the model captured at auto-mode start for this session.
  * Used by error-recovery to fall back to the session's own model
@@ -790,6 +806,8 @@ export async function pauseAuto(
       sessionFile: s.pausedSessionFile,
       unitType: s.currentUnit?.type ?? undefined,
       unitId: s.currentUnit?.id ?? undefined,
+      activeEngineId: s.activeEngineId,
+      activeRunDir: s.activeRunDir,
     };
     const runtimeDir = join(gsdRoot(s.originalBasePath || s.basePath), "runtime");
     mkdirSync(runtimeDir, { recursive: true });
@@ -1043,7 +1061,19 @@ export async function startAuto(
     try {
       const meta = freshStartAssessment.pausedSession ?? readPausedSessionMetadata(base);
       const pausedPath = join(gsdRoot(base), "runtime", "paused-session.json");
-      if (meta?.milestoneId) {
+      if (meta?.activeEngineId && meta.activeEngineId !== "dev") {
+        // Custom workflow resume — restore engine state
+        s.activeEngineId = meta.activeEngineId;
+        s.activeRunDir = meta.activeRunDir ?? null;
+        s.originalBasePath = meta.originalBasePath || base;
+        s.stepMode = meta.stepMode ?? requestedStepMode;
+        s.paused = true;
+        try { unlinkSync(pausedPath); } catch { /* non-fatal */ }
+        ctx.ui.notify(
+          `Resuming paused custom workflow${meta.activeRunDir ? ` (${meta.activeRunDir})` : ""}.`,
+          "info",
+        );
+      } else if (meta?.milestoneId) {
         const shouldResumePausedSession =
           freshStartAssessment.classification === "recoverable"
           && (
