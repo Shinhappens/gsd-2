@@ -377,7 +377,7 @@ const XCODE_SUBDIRS = ["ios", "macos", "app", "apps"] as const;
  * Returns deduplicated, canonical platform list (e.g. ["iphoneos"]).
  *
  * Reading the pbxproj is a lightweight regex scan — no full plist parsing needed.
- * We read at most 256 KB per file to keep detection fast.
+ * We read at most 1 MB per file to keep detection fast.
  * Searches both the project root and common subdirectories (ios/, macos/, app/).
  */
 function detectXcodePlatforms(basePath: string): XcodePlatform[] {
@@ -397,7 +397,7 @@ function detectXcodePlatforms(basePath: string): XcodePlatform[] {
         if (!entry.isDirectory() || !entry.name.endsWith(".xcodeproj")) continue;
         const pbxprojPath = join(dir, entry.name, "project.pbxproj");
         try {
-          const content = readBounded(pbxprojPath, 256 * 1024);
+          const content = readBounded(pbxprojPath, 1024 * 1024);
           // Match SDKROOT = <value>; — both quoted and unquoted forms
           const sdkRe = /SDKROOT\s*=\s*"?([a-z]+)"?\s*;/gi;
           let m: RegExpExecArray | null;

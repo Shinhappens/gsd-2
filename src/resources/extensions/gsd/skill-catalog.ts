@@ -399,7 +399,7 @@ export const GREENFIELD_STACKS: Array<{
 
 /**
  * Match project signals to relevant skill packs.
- * Returns packs ordered by relevance (language match first, then file match).
+ * Returns packs in catalog order (not sorted by match type).
  */
 export function matchPacksForProject(signals: ProjectSignals): SkillPack[] {
   const matched = new Set<SkillPack>();

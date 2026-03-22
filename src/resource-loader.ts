@@ -495,10 +495,12 @@ function migrateSkillsToEcosystemDir(agentDir: string): void {
     // Write migration info to the marker
     try { writeFileSync(markerFd, `Migrated ${migrated} skill(s) to ${ecosystemDir} on ${new Date().toISOString()}\n`) } catch { /* non-fatal */ }
   } catch {
-    // can't create ecosystem dir or read legacy dir — remove marker so we retry next launch
+    // can't create ecosystem dir or read legacy dir — close fd first (required on Windows
+    // where unlinkSync fails on open handles), then remove marker so we retry next launch
+    try { closeSync(markerFd); markerFd = -1 } catch { /* non-fatal */ }
     try { unlinkSync(markerPath) } catch { /* non-fatal */ }
   } finally {
-    try { closeSync(markerFd) } catch { /* non-fatal */ }
+    if (markerFd !== -1) { try { closeSync(markerFd) } catch { /* non-fatal */ } }
   }
 }
 
