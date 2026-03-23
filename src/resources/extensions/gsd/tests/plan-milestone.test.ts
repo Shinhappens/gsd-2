@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 
 import { openDatabase, closeDatabase, getMilestone, getMilestoneSlices } from '../gsd-db.ts';
 import { handlePlanMilestone } from '../tools/plan-milestone.ts';
-import { parseRoadmap } from '../files.ts';
+import { parseRoadmap } from '../parsers-legacy.ts';
 
 function makeTmpBase(): string {
   const base = mkdtempSync(join(tmpdir(), 'gsd-plan-milestone-'));
@@ -94,7 +94,7 @@ test('handlePlanMilestone writes milestone and slice planning state and renders 
     assert.match(roadmap, /# M001: DB-backed planning/);
     assert.match(roadmap, /\*\*Vision:\*\* Make planning write through the database\./);
     assert.match(roadmap, /- \[ \] \*\*S01: Tool wiring\*\* `risk:medium` `depends:\[\]`/);
-    assert.match(roadmap, /- \[ \] \*\*S02: Prompt migration\*\* `risk:low` `depends:\["S01"\]`/);
+    assert.match(roadmap, /- \[ \] \*\*S02: Prompt migration\*\* `risk:low` `depends:\[S01\]`/);
   } finally {
     cleanup(base);
   }
