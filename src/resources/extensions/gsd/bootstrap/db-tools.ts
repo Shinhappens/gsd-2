@@ -4,11 +4,13 @@ import type { ExtensionAPI } from "@gsd/pi-coding-agent";
 import { findMilestoneIds, nextMilestoneId, claimReservedId, getReservedMilestoneIds } from "../guided-flow.js";
 import { loadEffectiveGSDPreferences } from "../preferences.js";
 import { ensureDbOpen } from "./dynamic-tools.js";
+import { StringEnum } from "@gsd/pi-ai";
 
 /**
  * Register an alias tool that shares the same execute function as its canonical counterpart.
  * The alias description and promptGuidelines direct the LLM to prefer the canonical name.
  */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- toolDef shape matches ToolDefinition but typing it fully requires generics
 function registerAlias(pi: ExtensionAPI, toolDef: any, aliasName: string, canonicalName: string): void {
   pi.registerTool({
     ...toolDef,
@@ -21,7 +23,7 @@ function registerAlias(pi: ExtensionAPI, toolDef: any, aliasName: string, canoni
 export function registerDbTools(pi: ExtensionAPI): void {
   // ─── gsd_decision_save (formerly gsd_save_decision) ─────────────────────
 
-  const decisionSaveExecute = async (_toolCallId: any, params: any, _signal: any, _onUpdate: any, _ctx: any) => {
+  const decisionSaveExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
     const dbAvailable = await ensureDbOpen();
     if (!dbAvailable) {
       return {
@@ -92,7 +94,7 @@ export function registerDbTools(pi: ExtensionAPI): void {
 
   // ─── gsd_requirement_update (formerly gsd_update_requirement) ───────────
 
-  const requirementUpdateExecute = async (_toolCallId: any, params: any, _signal: any, _onUpdate: any, _ctx: any) => {
+  const requirementUpdateExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
     const dbAvailable = await ensureDbOpen();
     if (!dbAvailable) {
       return {
@@ -162,7 +164,7 @@ export function registerDbTools(pi: ExtensionAPI): void {
 
   // ─── gsd_summary_save (formerly gsd_save_summary) ──────────────────────
 
-  const summarySaveExecute = async (_toolCallId: any, params: any, _signal: any, _onUpdate: any, _ctx: any) => {
+  const summarySaveExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
     const dbAvailable = await ensureDbOpen();
     if (!dbAvailable) {
       return {
@@ -240,7 +242,7 @@ export function registerDbTools(pi: ExtensionAPI): void {
 
   // ─── gsd_milestone_generate_id (formerly gsd_generate_milestone_id) ────
 
-  const milestoneGenerateIdExecute = async (_toolCallId: any, _params: any, _signal: any, _onUpdate: any, _ctx: any) => {
+  const milestoneGenerateIdExecute = async (_toolCallId: string, _params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
     try {
       // Claim a reserved ID if the guided-flow already previewed one to the user.
       // This guarantees the ID shown in the UI matches the one materialised on disk.
@@ -291,9 +293,247 @@ export function registerDbTools(pi: ExtensionAPI): void {
   pi.registerTool(milestoneGenerateIdTool);
   registerAlias(pi, milestoneGenerateIdTool, "gsd_generate_milestone_id", "gsd_milestone_generate_id");
 
+  // ─── gsd_plan_milestone (gsd_milestone_plan alias) ─────────────────────
+
+  const planMilestoneExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
+    const dbAvailable = await ensureDbOpen();
+    if (!dbAvailable) {
+      return {
+        content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot plan milestone." }],
+        details: { operation: "plan_milestone", error: "db_unavailable" } as any,
+      };
+    }
+    try {
+      const { handlePlanMilestone } = await import("../tools/plan-milestone.js");
+      const result = await handlePlanMilestone(params, process.cwd());
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error planning milestone: ${result.error}` }],
+          details: { operation: "plan_milestone", error: result.error } as any,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Planned milestone ${result.milestoneId}` }],
+        details: {
+          operation: "plan_milestone",
+          milestoneId: result.milestoneId,
+          roadmapPath: result.roadmapPath,
+        } as any,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`gsd-db: plan_milestone tool failed: ${msg}\n`);
+      return {
+        content: [{ type: "text" as const, text: `Error planning milestone: ${msg}` }],
+        details: { operation: "plan_milestone", error: msg } as any,
+      };
+    }
+  };
+
+  const planMilestoneTool = {
+    name: "gsd_plan_milestone",
+    label: "Plan Milestone",
+    description:
+      "Write milestone planning state to the GSD database, render ROADMAP.md from DB, and clear caches after a successful render.",
+    promptSnippet: "Plan a milestone via DB write + roadmap render + cache invalidation",
+    promptGuidelines: [
+      "Use gsd_plan_milestone for milestone planning instead of writing ROADMAP.md directly.",
+      "Keep parameters flat and provide the full milestone planning payload, including slices.",
+      "The tool validates input, writes milestone and slice planning data transactionally, renders ROADMAP.md from DB, and clears both state and parse caches after success.",
+      "Use the canonical name gsd_plan_milestone; gsd_milestone_plan is only an alias.",
+    ],
+    parameters: Type.Object({
+      milestoneId: Type.String({ description: "Milestone ID (e.g. M001)" }),
+      title: Type.String({ description: "Milestone title" }),
+      status: Type.Optional(Type.String({ description: "Milestone status (defaults to active)" })),
+      dependsOn: Type.Optional(Type.Array(Type.String(), { description: "Milestone dependencies" })),
+      vision: Type.String({ description: "Milestone vision" }),
+      successCriteria: Type.Array(Type.String(), { description: "Top-level success criteria bullets" }),
+      keyRisks: Type.Array(Type.Object({
+        risk: Type.String({ description: "Risk statement" }),
+        whyItMatters: Type.String({ description: "Why the risk matters" }),
+      }), { description: "Structured risk entries" }),
+      proofStrategy: Type.Array(Type.Object({
+        riskOrUnknown: Type.String({ description: "Risk or unknown to retire" }),
+        retireIn: Type.String({ description: "Where it will be retired" }),
+        whatWillBeProven: Type.String({ description: "What proof will be produced" }),
+      }), { description: "Structured proof strategy entries" }),
+      verificationContract: Type.String({ description: "Verification contract text" }),
+      verificationIntegration: Type.String({ description: "Integration verification text" }),
+      verificationOperational: Type.String({ description: "Operational verification text" }),
+      verificationUat: Type.String({ description: "UAT verification text" }),
+      definitionOfDone: Type.Array(Type.String(), { description: "Definition of done bullets" }),
+      requirementCoverage: Type.String({ description: "Requirement coverage text" }),
+      boundaryMapMarkdown: Type.String({ description: "Boundary map markdown block" }),
+      slices: Type.Array(Type.Object({
+        sliceId: Type.String({ description: "Slice ID (e.g. S01)" }),
+        title: Type.String({ description: "Slice title" }),
+        risk: Type.String({ description: "Slice risk" }),
+        depends: Type.Array(Type.String(), { description: "Slice dependency IDs" }),
+        demo: Type.String({ description: "Roadmap demo text / After this" }),
+        goal: Type.String({ description: "Slice goal" }),
+        successCriteria: Type.String({ description: "Slice success criteria block" }),
+        proofLevel: Type.String({ description: "Slice proof level" }),
+        integrationClosure: Type.String({ description: "Slice integration closure" }),
+        observabilityImpact: Type.String({ description: "Slice observability impact" }),
+      }), { description: "Planned slices for the milestone" }),
+    }),
+    execute: planMilestoneExecute,
+  };
+
+  pi.registerTool(planMilestoneTool);
+  registerAlias(pi, planMilestoneTool, "gsd_milestone_plan", "gsd_plan_milestone");
+
+  // ─── gsd_plan_slice (gsd_slice_plan alias) ─────────────────────────────
+
+  const planSliceExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
+    const dbAvailable = await ensureDbOpen();
+    if (!dbAvailable) {
+      return {
+        content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot plan slice." }],
+        details: { operation: "plan_slice", error: "db_unavailable" } as any,
+      };
+    }
+    try {
+      const { handlePlanSlice } = await import("../tools/plan-slice.js");
+      const result = await handlePlanSlice(params, process.cwd());
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error planning slice: ${result.error}` }],
+          details: { operation: "plan_slice", error: result.error } as any,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Planned slice ${result.sliceId} (${result.milestoneId})` }],
+        details: {
+          operation: "plan_slice",
+          milestoneId: result.milestoneId,
+          sliceId: result.sliceId,
+          planPath: result.planPath,
+          taskPlanPaths: result.taskPlanPaths,
+        } as any,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`gsd-db: plan_slice tool failed: ${msg}\n`);
+      return {
+        content: [{ type: "text" as const, text: `Error planning slice: ${msg}` }],
+        details: { operation: "plan_slice", error: msg } as any,
+      };
+    }
+  };
+
+  const planSliceTool = {
+    name: "gsd_plan_slice",
+    label: "Plan Slice",
+    description:
+      "Write slice planning state to the GSD database, render S##-PLAN.md plus task PLAN artifacts from DB, and clear caches after a successful render.",
+    promptSnippet: "Plan a slice via DB write + PLAN render + cache invalidation",
+    promptGuidelines: [
+      "Use gsd_plan_slice for slice planning instead of writing S##-PLAN.md or task PLAN files directly.",
+      "Keep parameters flat and provide the full slice planning payload, including tasks.",
+      "The tool validates input, requires an existing parent slice, writes slice/task planning data, renders PLAN.md and task plan files from DB, and clears both state and parse caches after success.",
+      "Use the canonical name gsd_plan_slice; gsd_slice_plan is only an alias.",
+    ],
+    parameters: Type.Object({
+      milestoneId: Type.String({ description: "Milestone ID (e.g. M001)" }),
+      sliceId: Type.String({ description: "Slice ID (e.g. S01)" }),
+      goal: Type.String({ description: "Slice goal" }),
+      successCriteria: Type.String({ description: "Slice success criteria block" }),
+      proofLevel: Type.String({ description: "Slice proof level" }),
+      integrationClosure: Type.String({ description: "Slice integration closure" }),
+      observabilityImpact: Type.String({ description: "Slice observability impact" }),
+      tasks: Type.Array(Type.Object({
+        taskId: Type.String({ description: "Task ID (e.g. T01)" }),
+        title: Type.String({ description: "Task title" }),
+        description: Type.String({ description: "Task description / steps block" }),
+        estimate: Type.String({ description: "Task estimate string" }),
+        files: Type.Array(Type.String(), { description: "Files likely touched" }),
+        verify: Type.String({ description: "Verification command or block" }),
+        inputs: Type.Array(Type.String(), { description: "Input files or references" }),
+        expectedOutput: Type.Array(Type.String(), { description: "Expected output files or artifacts" }),
+        observabilityImpact: Type.Optional(Type.String({ description: "Task observability impact" })),
+      }), { description: "Planned tasks for the slice" }),
+    }),
+    execute: planSliceExecute,
+  };
+
+  pi.registerTool(planSliceTool);
+  registerAlias(pi, planSliceTool, "gsd_slice_plan", "gsd_plan_slice");
+
+  // ─── gsd_plan_task (gsd_task_plan alias) ───────────────────────────────
+
+  const planTaskExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
+    const dbAvailable = await ensureDbOpen();
+    if (!dbAvailable) {
+      return {
+        content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot plan task." }],
+        details: { operation: "plan_task", error: "db_unavailable" } as any,
+      };
+    }
+    try {
+      const { handlePlanTask } = await import("../tools/plan-task.js");
+      const result = await handlePlanTask(params, process.cwd());
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error planning task: ${result.error}` }],
+          details: { operation: "plan_task", error: result.error } as any,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Planned task ${result.taskId} (${result.sliceId}/${result.milestoneId})` }],
+        details: {
+          operation: "plan_task",
+          milestoneId: result.milestoneId,
+          sliceId: result.sliceId,
+          taskId: result.taskId,
+          taskPlanPath: result.taskPlanPath,
+        } as any,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`gsd-db: plan_task tool failed: ${msg}\n`);
+      return {
+        content: [{ type: "text" as const, text: `Error planning task: ${msg}` }],
+        details: { operation: "plan_task", error: msg } as any,
+      };
+    }
+  };
+
+  const planTaskTool = {
+    name: "gsd_plan_task",
+    label: "Plan Task",
+    description:
+      "Write task planning state to the GSD database, render tasks/T##-PLAN.md from DB, and clear caches after a successful render.",
+    promptSnippet: "Plan a task via DB write + task PLAN render + cache invalidation",
+    promptGuidelines: [
+      "Use gsd_plan_task for task planning instead of writing tasks/T##-PLAN.md directly.",
+      "Keep parameters flat and provide the full task planning payload.",
+      "The tool validates input, requires an existing parent slice, writes task planning data, renders the task PLAN file from DB, and clears both state and parse caches after success.",
+      "Use the canonical name gsd_plan_task; gsd_task_plan is only an alias.",
+    ],
+    parameters: Type.Object({
+      milestoneId: Type.String({ description: "Milestone ID (e.g. M001)" }),
+      sliceId: Type.String({ description: "Slice ID (e.g. S01)" }),
+      taskId: Type.String({ description: "Task ID (e.g. T01)" }),
+      title: Type.String({ description: "Task title" }),
+      description: Type.String({ description: "Task description / steps block" }),
+      estimate: Type.String({ description: "Task estimate string" }),
+      files: Type.Array(Type.String(), { description: "Files likely touched" }),
+      verify: Type.String({ description: "Verification command or block" }),
+      inputs: Type.Array(Type.String(), { description: "Input files or references" }),
+      expectedOutput: Type.Array(Type.String(), { description: "Expected output files or artifacts" }),
+      observabilityImpact: Type.Optional(Type.String({ description: "Task observability impact" })),
+    }),
+    execute: planTaskExecute,
+  };
+
+  pi.registerTool(planTaskTool);
+  registerAlias(pi, planTaskTool, "gsd_task_plan", "gsd_plan_task");
+
   // ─── gsd_task_complete (gsd_complete_task alias) ────────────────────────
 
-  const taskCompleteExecute = async (_toolCallId: any, params: any, _signal: any, _onUpdate: any, _ctx: any) => {
+  const taskCompleteExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
     const dbAvailable = await ensureDbOpen();
     if (!dbAvailable) {
       return {
@@ -374,7 +614,7 @@ export function registerDbTools(pi: ExtensionAPI): void {
 
   // ─── gsd_slice_complete (gsd_complete_slice alias) ─────────────────────
 
-  const sliceCompleteExecute = async (_toolCallId: any, params: any, _signal: any, _onUpdate: any, _ctx: any) => {
+  const sliceCompleteExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
     const dbAvailable = await ensureDbOpen();
     if (!dbAvailable) {
       return {
@@ -484,4 +724,172 @@ export function registerDbTools(pi: ExtensionAPI): void {
 
   pi.registerTool(sliceCompleteTool);
   registerAlias(pi, sliceCompleteTool, "gsd_complete_slice", "gsd_slice_complete");
+
+  // ─── gsd_replan_slice (gsd_slice_replan alias) ─────────────────────────
+
+  const replanSliceExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
+    const dbAvailable = await ensureDbOpen();
+    if (!dbAvailable) {
+      return {
+        content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot replan slice." }],
+        details: { operation: "replan_slice", error: "db_unavailable" } as any,
+      };
+    }
+    try {
+      const { handleReplanSlice } = await import("../tools/replan-slice.js");
+      const result = await handleReplanSlice(params, process.cwd());
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error replanning slice: ${result.error}` }],
+          details: { operation: "replan_slice", error: result.error } as any,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Replanned slice ${result.sliceId} (${result.milestoneId})` }],
+        details: {
+          operation: "replan_slice",
+          milestoneId: result.milestoneId,
+          sliceId: result.sliceId,
+          replanPath: result.replanPath,
+          planPath: result.planPath,
+        } as any,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`gsd-db: replan_slice tool failed: ${msg}\n`);
+      return {
+        content: [{ type: "text" as const, text: `Error replanning slice: ${msg}` }],
+        details: { operation: "replan_slice", error: msg } as any,
+      };
+    }
+  };
+
+  const replanSliceTool = {
+    name: "gsd_replan_slice",
+    label: "Replan Slice",
+    description:
+      "Replan a slice after a blocker is discovered. Structurally enforces preservation of completed tasks — " +
+      "mutations to completed task IDs are rejected with actionable error payloads. Writes replan history to DB, " +
+      "applies task mutations, re-renders PLAN.md, and renders REPLAN.md.",
+    promptSnippet: "Replan a GSD slice with structural enforcement of completed tasks",
+    promptGuidelines: [
+      "Use gsd_replan_slice (canonical) or gsd_slice_replan (alias) when a blocker is discovered and the slice plan needs rewriting.",
+      "The tool structurally enforces that completed tasks cannot be updated or removed — violations return specific error payloads naming the blocked task ID.",
+      "Parameters: milestoneId, sliceId, blockerTaskId, blockerDescription, whatChanged, updatedTasks (array), removedTaskIds (array).",
+      "updatedTasks items: taskId, title, description, estimate, files, verify, inputs, expectedOutput.",
+    ],
+    parameters: Type.Object({
+      milestoneId: Type.String({ description: "Milestone ID (e.g. M001)" }),
+      sliceId: Type.String({ description: "Slice ID (e.g. S01)" }),
+      blockerTaskId: Type.String({ description: "Task ID that discovered the blocker" }),
+      blockerDescription: Type.String({ description: "Description of the blocker" }),
+      whatChanged: Type.String({ description: "Summary of what changed in the plan" }),
+      updatedTasks: Type.Array(
+        Type.Object({
+          taskId: Type.String({ description: "Task ID (e.g. T01)" }),
+          title: Type.String({ description: "Task title" }),
+          description: Type.String({ description: "Task description / steps block" }),
+          estimate: Type.String({ description: "Task estimate string" }),
+          files: Type.Array(Type.String(), { description: "Files likely touched" }),
+          verify: Type.String({ description: "Verification command or block" }),
+          inputs: Type.Array(Type.String(), { description: "Input files or references" }),
+          expectedOutput: Type.Array(Type.String(), { description: "Expected output files or artifacts" }),
+        }),
+        { description: "Tasks to upsert (update existing or insert new)" },
+      ),
+      removedTaskIds: Type.Array(Type.String(), { description: "Task IDs to remove from the slice" }),
+    }),
+    execute: replanSliceExecute,
+  };
+
+  pi.registerTool(replanSliceTool);
+  registerAlias(pi, replanSliceTool, "gsd_slice_replan", "gsd_replan_slice");
+
+  // ─── gsd_reassess_roadmap (gsd_roadmap_reassess alias) ─────────────────
+
+  const reassessRoadmapExecute = async (_toolCallId: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, _ctx: unknown) => {
+    const dbAvailable = await ensureDbOpen();
+    if (!dbAvailable) {
+      return {
+        content: [{ type: "text" as const, text: "Error: GSD database is not available. Cannot reassess roadmap." }],
+        details: { operation: "reassess_roadmap", error: "db_unavailable" } as any,
+      };
+    }
+    try {
+      const { handleReassessRoadmap } = await import("../tools/reassess-roadmap.js");
+      const result = await handleReassessRoadmap(params, process.cwd());
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error reassessing roadmap: ${result.error}` }],
+          details: { operation: "reassess_roadmap", error: result.error } as any,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Reassessed roadmap for milestone ${result.milestoneId} after ${result.completedSliceId}` }],
+        details: {
+          operation: "reassess_roadmap",
+          milestoneId: result.milestoneId,
+          completedSliceId: result.completedSliceId,
+          assessmentPath: result.assessmentPath,
+          roadmapPath: result.roadmapPath,
+        } as any,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`gsd-db: reassess_roadmap tool failed: ${msg}\n`);
+      return {
+        content: [{ type: "text" as const, text: `Error reassessing roadmap: ${msg}` }],
+        details: { operation: "reassess_roadmap", error: msg } as any,
+      };
+    }
+  };
+
+  const reassessRoadmapTool = {
+    name: "gsd_reassess_roadmap",
+    label: "Reassess Roadmap",
+    description:
+      "Reassess the milestone roadmap after a slice completes. Structurally enforces preservation of completed slices — " +
+      "mutations to completed slice IDs are rejected with actionable error payloads. Writes assessment to DB, " +
+      "applies slice mutations, re-renders ROADMAP.md, and renders ASSESSMENT.md.",
+    promptSnippet: "Reassess a GSD roadmap with structural enforcement of completed slices",
+    promptGuidelines: [
+      "Use gsd_reassess_roadmap (canonical) or gsd_roadmap_reassess (alias) after a slice completes to reassess the roadmap.",
+      "The tool structurally enforces that completed slices cannot be modified or removed — violations return specific error payloads naming the blocked slice ID.",
+      "Parameters: milestoneId, completedSliceId, verdict, assessment, sliceChanges (object with modified, added, removed arrays).",
+      "sliceChanges.modified items: sliceId, title, risk (optional), depends (optional), demo (optional).",
+    ],
+    parameters: Type.Object({
+      milestoneId: Type.String({ description: "Milestone ID (e.g. M001)" }),
+      completedSliceId: Type.String({ description: "Slice ID that just completed" }),
+      verdict: Type.String({ description: "Assessment verdict (e.g. 'roadmap-confirmed', 'roadmap-adjusted')" }),
+      assessment: Type.String({ description: "Assessment text explaining the decision" }),
+      sliceChanges: Type.Object({
+        modified: Type.Array(
+          Type.Object({
+            sliceId: Type.String({ description: "Slice ID to modify" }),
+            title: Type.String({ description: "Updated slice title" }),
+            risk: Type.Optional(Type.String({ description: "Updated risk level" })),
+            depends: Type.Optional(Type.Array(Type.String(), { description: "Updated dependencies" })),
+            demo: Type.Optional(Type.String({ description: "Updated demo text" })),
+          }),
+          { description: "Slices to modify" },
+        ),
+        added: Type.Array(
+          Type.Object({
+            sliceId: Type.String({ description: "New slice ID" }),
+            title: Type.String({ description: "New slice title" }),
+            risk: Type.Optional(Type.String({ description: "Risk level" })),
+            depends: Type.Optional(Type.Array(Type.String(), { description: "Dependencies" })),
+            demo: Type.Optional(Type.String({ description: "Demo text" })),
+          }),
+          { description: "New slices to add" },
+        ),
+        removed: Type.Array(Type.String(), { description: "Slice IDs to remove" }),
+      }, { description: "Slice changes to apply" }),
+    }),
+    execute: reassessRoadmapExecute,
+  };
+
+  pi.registerTool(reassessRoadmapTool);
+  registerAlias(pi, reassessRoadmapTool, "gsd_roadmap_reassess", "gsd_reassess_roadmap");
 }

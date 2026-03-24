@@ -1,4 +1,5 @@
-import { parseRoadmap, parsePlan, parseTaskPlanFile, parseSummary, parseContinue, parseRequirementCounts, parseSecretsManifest, formatSecretsManifest } from '../files.ts';
+import { parseRoadmap, parsePlan } from '../parsers-legacy.ts';
+import { parseTaskPlanFile, parseSummary, parseContinue, parseRequirementCounts, parseSecretsManifest, formatSecretsManifest } from '../files.ts';
 import { createTestContext } from './test-helpers.ts';
 
 const { assertEq, assertTrue, report } = createTestContext();

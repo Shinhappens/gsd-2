@@ -16,6 +16,9 @@ import {
   insertMilestone,
   insertSlice,
   insertTask,
+  getMilestone,
+  getSlice,
+  getTask,
 } from '../gsd-db.ts';
 import { migrateHierarchyToDb } from '../md-importer.ts';
 import { deriveStateFromDb, invalidateStateCache } from '../state.ts';
@@ -47,6 +50,12 @@ const ROADMAP_M001 = `# M001: Recovery Test
 
 **Vision:** Test recovery round-trip.
 
+## Success Criteria
+
+- All recovery tests pass
+- State matches after round-trip
+
+
 ## Slices
 
 - [x] **S01: Setup** \`risk:low\` \`depends:[]\`
@@ -54,6 +63,12 @@ const ROADMAP_M001 = `# M001: Recovery Test
 
 - [ ] **S02: Core** \`risk:medium\` \`depends:[S01]\`
   > After this: Core done.
+
+## Boundary Map
+
+| From | To | Produces | Consumes |
+|------|-----|----------|----------|
+| S01 | S02 | setup artifacts | setup artifacts |
 `;
 
 const PLAN_S01_COMPLETE = `---
@@ -71,9 +86,13 @@ skills_used: []
 
 - [x] **T01: Init** \`est:15m\`
   Initialize things.
+  - Files: \`init.ts\`, \`config.ts\`
+  - Verify: \`node test-init.ts\`
 
 - [x] **T02: Config** \`est:10m\`
   Configure things.
+  - Files: \`settings.ts\`
+  - Verify: \`node test-config.ts\`
 `;
 
 const PLAN_S02_PARTIAL = `---
@@ -91,12 +110,18 @@ skills_used: []
 
 - [x] **T01: Build** \`est:30m\`
   Build it.
+  - Files: \`core.ts\`
+  - Verify: \`node test-build.ts\`
 
 - [ ] **T02: Test** \`est:20m\`
   Test it.
+  - Files: \`test-core.ts\`, \`helpers.ts\`
+  - Verify: \`npm test\`
 
 - [ ] **T03: Polish** \`est:15m\`
   Polish it.
+  - Files: \`polish.ts\`
+  - Verify: \`node test-polish.ts\`
 `;
 
 const SUMMARY_S01 = `---
@@ -207,6 +232,87 @@ async function main() {
       cleanup(base);
     }
   }
+
+  // ─── Test (a2): v8 planning columns populated after recovery ───────────
+  console.log('\n=== recover: v8 planning columns populated ===');
+  {
+    const base = createFixtureBase();
+    try {
+      writeFile(base, 'milestones/M001/M001-ROADMAP.md', ROADMAP_M001);
+      writeFile(base, 'milestones/M001/slices/S01/S01-PLAN.md', PLAN_S01_COMPLETE);
+      writeFile(base, 'milestones/M001/slices/S01/S01-SUMMARY.md', SUMMARY_S01);
+      writeFile(base, 'milestones/M001/slices/S02/S02-PLAN.md', PLAN_S02_PARTIAL);
+
+      openDatabase(':memory:');
+      migrateHierarchyToDb(base);
+
+      // Milestone planning columns
+      const milestone = getMilestone('M001');
+      assertTrue(milestone !== null, 'v8: milestone exists');
+      assertEq(milestone!.vision, 'Test recovery round-trip.', 'v8: milestone vision populated');
+      assertTrue(milestone!.success_criteria.length >= 2, 'v8: milestone success_criteria has entries');
+      assertEq(milestone!.success_criteria[0], 'All recovery tests pass', 'v8: first success criterion');
+      assertTrue(milestone!.boundary_map_markdown.includes('Boundary Map'), 'v8: boundary_map_markdown populated');
+      assertTrue(milestone!.boundary_map_markdown.includes('S01'), 'v8: boundary_map_markdown has S01');
+
+      // Tool-only fields left empty per D004
+      assertEq(milestone!.key_risks.length, 0, 'v8: key_risks left empty (tool-only per D004)');
+      assertEq(milestone!.requirement_coverage, '', 'v8: requirement_coverage left empty (tool-only per D004)');
+
+      // Slice planning columns
+      const sliceS01 = getSlice('M001', 'S01');
+      assertTrue(sliceS01 !== null, 'v8: slice S01 exists');
+      assertEq(sliceS01!.goal, 'Setup fixtures.', 'v8: S01 goal populated');
+
+      const sliceS02 = getSlice('M001', 'S02');
+      assertTrue(sliceS02 !== null, 'v8: slice S02 exists');
+      assertEq(sliceS02!.goal, 'Build core.', 'v8: S02 goal populated');
+
+      // Slice tool-only fields left empty per D004
+      assertEq(sliceS01!.proof_level, '', 'v8: S01 proof_level left empty (tool-only per D004)');
+
+      // Task planning columns — S01/T01
+      const taskS01T01 = getTask('M001', 'S01', 'T01');
+      assertTrue(taskS01T01 !== null, 'v8: task S01/T01 exists');
+      assertTrue(taskS01T01!.files.length >= 2, 'v8: S01/T01 files populated');
+      assertTrue(taskS01T01!.files.includes('init.ts'), 'v8: S01/T01 files includes init.ts');
+      assertTrue(taskS01T01!.files.includes('config.ts'), 'v8: S01/T01 files includes config.ts');
+      assertEq(taskS01T01!.verify, '`node test-init.ts`', 'v8: S01/T01 verify populated');
+
+      // Task planning columns — S02/T02
+      const taskS02T02 = getTask('M001', 'S02', 'T02');
+      assertTrue(taskS02T02 !== null, 'v8: task S02/T02 exists');
+      assertTrue(taskS02T02!.files.length >= 2, 'v8: S02/T02 files populated');
+      assertTrue(taskS02T02!.files.includes('test-core.ts'), 'v8: S02/T02 files includes test-core.ts');
+      assertEq(taskS02T02!.verify, '`npm test`', 'v8: S02/T02 verify populated');
+
+      // Task with no Files/Verify — not applicable since all fixtures now have them,
+      // but confirm a task from S02 has correct data
+      const taskS02T03 = getTask('M001', 'S02', 'T03');
+      assertTrue(taskS02T03 !== null, 'v8: task S02/T03 exists');
+      assertTrue(taskS02T03!.files.includes('polish.ts'), 'v8: S02/T03 files includes polish.ts');
+      assertEq(taskS02T03!.verify, '`node test-polish.ts`', 'v8: S02/T03 verify populated');
+
+      // Diagnostic: v8 planning columns queryable via SQL
+      const db = _getAdapter()!;
+      const milestoneRow = db.prepare("SELECT vision, success_criteria, boundary_map_markdown FROM milestones WHERE id = 'M001'").get() as any;
+      assertTrue(milestoneRow.vision.length > 0, 'v8-diag: vision column queryable');
+      assertTrue(milestoneRow.boundary_map_markdown.length > 0, 'v8-diag: boundary_map_markdown column queryable');
+
+      const sliceRow = db.prepare("SELECT goal FROM slices WHERE milestone_id = 'M001' AND id = 'S01'").get() as any;
+      assertTrue(sliceRow.goal.length > 0, 'v8-diag: goal column queryable');
+
+      const taskRow = db.prepare("SELECT files, verify FROM tasks WHERE milestone_id = 'M001' AND slice_id = 'S01' AND id = 'T01'").get() as any;
+      assertTrue(taskRow.files.length > 2, 'v8-diag: files column queryable (JSON array)');
+      assertTrue(taskRow.verify.length > 0, 'v8-diag: verify column queryable');
+
+      closeDatabase();
+    } finally {
+      closeDatabase();
+      cleanup(base);
+    }
+  }
+
 
   // ─── Test (b): Idempotent recovery — double recover ────────────────────
   console.log('\n=== recover: idempotent — double recovery produces same state ===');

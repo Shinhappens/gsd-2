@@ -38,7 +38,7 @@ import { writeUnitRuntimeRecord, clearUnitRuntimeRecord } from "./unit-runtime.j
 import { runGSDDoctor, rebuildState, summarizeDoctorIssues } from "./doctor.js";
 import { recordHealthSnapshot, checkHealEscalation } from "./doctor-proactive.js";
 import { syncStateToProjectRoot } from "./auto-worktree-sync.js";
-import { isDbAvailable, getTask, getSlice, updateTaskStatus } from "./gsd-db.js";
+import { isDbAvailable, getTask, getSlice, getMilestone, updateTaskStatus } from "./gsd-db.js";
 import { renderPlanCheckboxes } from "./markdown-renderer.js";
 import { consumeSignal } from "./session-status-io.js";
 import {
@@ -110,6 +110,42 @@ export function detectRogueFileWrites(
     const dbRow = getSlice(mid, sid);
     if (!dbRow || dbRow.status !== "complete") {
       rogues.push({ path: summaryPath, unitType, unitId });
+    }
+  } else if (unitType === "plan-milestone") {
+    const [mid] = parts;
+    if (!mid) return [];
+
+    const roadmapPath = resolveMilestoneFile(basePath, mid, "ROADMAP");
+    if (!roadmapPath || !existsSync(roadmapPath)) return [];
+
+    const dbRow = getMilestone(mid);
+    const hasPlanningState = !!dbRow && (
+      String(dbRow.title || "").trim().length > 0 ||
+      String(dbRow.vision || "").trim().length > 0 ||
+      String(dbRow.requirement_coverage || "").trim().length > 0 ||
+      String(dbRow.boundary_map_markdown || "").trim().length > 0
+    );
+
+    if (!hasPlanningState) {
+      rogues.push({ path: roadmapPath, unitType, unitId });
+    }
+  } else if (unitType === "plan-slice" || unitType === "replan-slice") {
+    const [mid, sid] = parts;
+    if (!mid || !sid) return [];
+
+    const planPath = resolveSliceFile(basePath, mid, sid, "PLAN");
+    if (!planPath || !existsSync(planPath)) return [];
+
+    const dbRow = getSlice(mid, sid);
+    const hasPlanningState = !!dbRow && (
+      String(dbRow.title || "").trim().length > 0 ||
+      String(dbRow.demo || "").trim().length > 0 ||
+      String(dbRow.risk || "").trim().length > 0 ||
+      String(dbRow.depends || "").trim().length > 0
+    );
+
+    if (!hasPlanningState) {
+      rogues.push({ path: planPath, unitType, unitId });
     }
   }
 
@@ -487,16 +523,6 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
  */
 export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"continue" | "step-wizard" | "stopped"> {
   const { s, ctx, pi, buildSnapshotOpts, lockBase, stopAuto, pauseAuto, updateProgressWidget } = pctx;
-
-  // ── DB dual-write ──
-  if (isDbAvailable()) {
-    try {
-      const { migrateFromMarkdown } = await import("./md-importer.js");
-      migrateFromMarkdown(s.basePath);
-    } catch (err) {
-      process.stderr.write(`gsd-db: re-import failed: ${(err as Error).message}\n`);
-    }
-  }
 
   // ── Post-unit hooks ──
   if (s.currentUnit && !s.stepMode) {

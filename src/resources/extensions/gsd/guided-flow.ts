@@ -8,7 +8,8 @@
 
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@gsd/pi-coding-agent";
 import { showNextAction } from "../shared/tui.js";
-import { loadFile, parseRoadmap } from "./files.js";
+import { loadFile } from "./files.js";
+import { isDbAvailable, getMilestoneSlices } from "./gsd-db.js";
 import { loadPrompt, inlineTemplate } from "./prompt-loader.js";
 import { buildSkillActivationBlock } from "./auto-prompts.js";
 import { deriveState } from "./state.js";
@@ -446,9 +447,13 @@ async function buildDiscussSlicePrompt(
   }
 
   // Completed slice summaries — what was already built that this slice builds on
-  if (roadmapContent) {
-    const roadmap = parseRoadmap(roadmapContent);
-    for (const s of roadmap.slices) {
+  {
+    type NormSlice = { id: string; done: boolean };
+    let normSlices: NormSlice[] = [];
+    if (isDbAvailable()) {
+      normSlices = getMilestoneSlices(mid).map(s => ({ id: s.id, done: s.status === "complete" }));
+    }
+    for (const s of normSlices) {
       if (!s.done || s.id === sid) continue;
       const summaryPath = resolveSliceFile(base, mid, s.id, "SUMMARY");
       const summaryRel = relSliceFile(base, mid, s.id, "SUMMARY");
@@ -575,16 +580,23 @@ export async function showDiscuss(
     return;
   }
 
-  // Guard: no roadmap yet
+  // Guard: no roadmap yet (unless DB has slices)
   const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
   const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
-  if (!roadmapContent) {
+  if (!roadmapContent && !isDbAvailable()) {
     ctx.ui.notify("No roadmap yet for this milestone. Run /gsd to plan first.", "warning");
     return;
   }
 
-  const roadmap = parseRoadmap(roadmapContent);
-  const pendingSlices = roadmap.slices.filter(s => !s.done);
+  // Normalize slices: prefer DB, fall back to parser
+  type NormSlice = { id: string; done: boolean; title: string };
+  let normSlices: NormSlice[];
+  if (isDbAvailable()) {
+    normSlices = getMilestoneSlices(mid).map(s => ({ id: s.id, done: s.status === "complete", title: s.title }));
+  } else {
+    normSlices = [];
+  }
+  const pendingSlices = normSlices.filter(s => !s.done);
 
   if (pendingSlices.length === 0) {
     ctx.ui.notify("All slices are complete — nothing to discuss.", "info");

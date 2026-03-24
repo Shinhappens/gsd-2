@@ -11,8 +11,9 @@ import type { ExtensionContext } from "@gsd/pi-coding-agent";
 import { parseUnitId } from "./unit-id.js";
 import { atomicWriteSync } from "./atomic-write.js";
 import { clearUnitRuntimeRecord } from "./unit-runtime.js";
-import { clearParseCache, parseRoadmap, parsePlan } from "./files.js";
-import { isDbAvailable, getTask, getSlice } from "./gsd-db.js";
+import { clearParseCache } from "./files.js";
+import { parseRoadmap as parseLegacyRoadmap, parsePlan as parseLegacyPlan } from "./parsers-legacy.js";
+import { isDbAvailable, getTask, getSlice, getSliceTasks } from "./gsd-db.js";
 import { isValidationTerminal } from "./state.js";
 import {
   nativeConflictFiles,
@@ -366,13 +367,27 @@ export function verifyExpectedArtifact(
     const sid = parts[1];
     if (mid && sid) {
       try {
-        const planContent = readFileSync(absPath, "utf-8");
-        const plan = parsePlan(planContent);
-        const tasksDir = resolveTasksDir(base, mid, sid);
-        if (plan.tasks.length > 0 && tasksDir) {
-          for (const task of plan.tasks) {
-            const taskPlanFile = join(tasksDir, `${task.id}-PLAN.md`);
-            if (!existsSync(taskPlanFile)) return false;
+        // DB primary path — get task IDs to verify task plan files exist
+        let taskIds: string[] | null = null;
+        if (isDbAvailable()) {
+          const tasks = getSliceTasks(mid, sid);
+          if (tasks.length > 0) taskIds = tasks.map(t => t.id);
+        }
+
+        if (!taskIds) {
+          // DB unavailable or no tasks in DB — parse plan file for task IDs
+          const planContent = readFileSync(absPath, "utf-8");
+          const plan = parseLegacyPlan(planContent);
+          if (plan.tasks.length > 0) taskIds = plan.tasks.map((t: { id: string }) => t.id);
+        }
+
+        if (taskIds && taskIds.length > 0) {
+          const tasksDir = resolveTasksDir(base, mid, sid);
+          if (tasksDir) {
+            for (const tid of taskIds) {
+              const taskPlanFile = join(tasksDir, `${tid}-PLAN.md`);
+              if (!existsSync(taskPlanFile)) return false;
+            }
           }
         }
       } catch {
@@ -399,12 +414,12 @@ export function verifyExpectedArtifact(
         // DB available — trust it
         if (dbSlice.status !== "complete") return false;
       } else if (!isDbAvailable()) {
-        // DB unavailable — fall back to roadmap checkbox check
+        // DB unavailable — fall back to roadmap checkbox check via parsers-legacy
         const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
         if (roadmapFile && existsSync(roadmapFile)) {
           try {
             const roadmapContent = readFileSync(roadmapFile, "utf-8");
-            const roadmap = parseRoadmap(roadmapContent);
+            const roadmap = parseLegacyRoadmap(roadmapContent);
             const slice = roadmap.slices.find((s) => s.id === sid);
             if (slice && !slice.done) return false;
           } catch {

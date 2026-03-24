@@ -1,7 +1,7 @@
 // tool-naming — Verifies canonical + alias tool registration for GSD DB tools.
 //
-// Each of the 6 DB tools must register under its canonical gsd_concept_action name
-// AND under the old gsd_action_concept name as a backward-compatible alias.
+// Each DB tool must register under its canonical gsd_concept_action name
+// AND under a backward-compatible alias name.
 // The alias must share the exact same execute function reference as the canonical tool.
 
 import { createTestContext } from './test-helpers.ts';
@@ -28,6 +28,11 @@ const RENAME_MAP: Array<{ canonical: string; alias: string }> = [
   { canonical: "gsd_milestone_generate_id", alias: "gsd_generate_milestone_id" },
   { canonical: "gsd_task_complete", alias: "gsd_complete_task" },
   { canonical: "gsd_slice_complete", alias: "gsd_complete_slice" },
+  { canonical: "gsd_plan_milestone", alias: "gsd_milestone_plan" },
+  { canonical: "gsd_plan_slice", alias: "gsd_slice_plan" },
+  { canonical: "gsd_plan_task", alias: "gsd_task_plan" },
+  { canonical: "gsd_replan_slice", alias: "gsd_slice_replan" },
+  { canonical: "gsd_reassess_roadmap", alias: "gsd_roadmap_reassess" },
 ];
 
 // ─── Registration count ──────────────────────────────────────────────────────
@@ -37,7 +42,7 @@ console.log('\n── Tool naming: registration count ──');
 const pi = makeMockPi();
 registerDbTools(pi);
 
-assertEq(pi.tools.length, 12, 'Should register exactly 12 tools (6 canonical + 6 aliases)');
+assertEq(pi.tools.length, 22, 'Should register exactly 22 tools (11 canonical + 11 aliases)');
 
 // ─── Both names exist for each pair ──────────────────────────────────────────
 

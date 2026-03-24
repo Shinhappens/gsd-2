@@ -158,7 +158,7 @@ async function main(): Promise<void> {
   {
     const { deriveState, isMilestoneComplete } = await import("../state.ts");
     const { invalidateAllCaches: invalidateAllCachesDynamic } = await import("../cache.ts");
-    const { parseRoadmap } = await import("../files.ts");
+    const { parseRoadmap } = await import("../parsers-legacy.ts");
 
     const base = createFixtureBase();
     try {

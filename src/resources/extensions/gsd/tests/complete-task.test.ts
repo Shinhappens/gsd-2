@@ -109,9 +109,9 @@ console.log('\n=== complete-task: schema v5 migration ===');
 
   const adapter = _getAdapter()!;
 
-  // Verify schema version is 7
+  // Verify schema version is current (v10 after M001 planning migrations)
   const versionRow = adapter.prepare('SELECT MAX(version) as v FROM schema_version').get();
-  assertEq(versionRow?.['v'], 7, 'schema version should be 7');
+  assertEq(versionRow?.['v'], 10, 'schema version should be 10');
 
   // Verify all 4 new tables exist
   const tables = adapter.prepare(

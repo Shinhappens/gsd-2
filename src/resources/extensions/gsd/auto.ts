@@ -79,10 +79,6 @@ import {
   getOldestInFlightToolStart,
   clearInFlightTools,
 } from "./auto-tool-tracking.js";
-import {
-  collectObservabilityWarnings as _collectObservabilityWarnings,
-  buildObservabilityRepairBlock,
-} from "./auto-observability.js";
 import { closeoutUnit } from "./auto-unit-closeout.js";
 import { recoverTimedOutUnit } from "./auto-timeout-recovery.js";
 import { selfHealRuntimeRecords } from "./auto-recovery.js";
@@ -961,9 +957,6 @@ function buildLoopDeps(): LoopDeps {
     runPreDispatchHooks,
     getPriorSliceCompletionBlocker,
     getMainBranch,
-    collectObservabilityWarnings: _collectObservabilityWarnings,
-    buildObservabilityRepairBlock,
-
     // Unit closeout + runtime records
     closeoutUnit,
     verifyExpectedArtifact,

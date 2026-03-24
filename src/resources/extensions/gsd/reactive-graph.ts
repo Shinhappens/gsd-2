@@ -10,7 +10,8 @@
  */
 
 import type { TaskIO, DerivedTaskNode, ReactiveExecutionState } from "./types.js";
-import { loadFile, parsePlan, parseTaskPlanIO } from "./files.js";
+import { loadFile, parseTaskPlanIO } from "./files.js";
+import { isDbAvailable, getSliceTasks } from "./gsd-db.js";
 import { resolveTasksDir, resolveTaskFiles } from "./paths.js";
 import { join } from "node:path";
 import { loadJsonFileOrNull, saveJsonFile } from "./json-persistence.js";
@@ -188,13 +189,32 @@ export async function loadSliceTaskIO(
   const planContent = slicePlanPath ? await loadFile(slicePlanPath) : null;
   if (!planContent) return [];
 
-  const plan = parsePlan(planContent);
+  // DB primary path — get task entries
+  let taskEntries: { id: string; title: string; done: boolean }[] | null = null;
+  try {
+    if (isDbAvailable()) {
+      const tasks = getSliceTasks(mid, sid);
+      if (tasks.length > 0) {
+        taskEntries = tasks.map(t => ({
+          id: t.id,
+          title: t.title,
+          done: t.status === "complete" || t.status === "done",
+        }));
+      }
+    }
+  } catch { /* fall through */ }
+
+  if (!taskEntries) {
+    // DB unavailable — cannot determine task graph
+    return [];
+  }
+
   const tDir = resolveTasksDir(basePath, mid, sid);
   if (!tDir) return [];
 
   const results: TaskIO[] = [];
 
-  for (const taskEntry of plan.tasks) {
+  for (const taskEntry of taskEntries) {
     const planFiles = resolveTaskFiles(tDir, "PLAN");
     const taskFileName = planFiles.find((f) =>
       f.toUpperCase().startsWith(taskEntry.id.toUpperCase() + "-"),

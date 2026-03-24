@@ -3,7 +3,8 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { deriveState } from './state.js';
-import { parseRoadmap, parsePlan, parseSummary, loadFile } from './files.js';
+import { parseSummary, loadFile } from './files.js';
+import { isDbAvailable, getMilestoneSlices, getSliceTasks } from './gsd-db.js';
 import { findMilestoneIds } from './milestone-ids.js';
 import { resolveMilestoneFile, resolveSliceFile, resolveGsdRootFile, gsdRoot } from './paths.js';
 import {
@@ -796,10 +797,17 @@ export async function loadVisualizerData(basePath: string): Promise<VisualizerDa
     const roadmapFile = resolveMilestoneFile(basePath, mid, 'ROADMAP');
     const roadmapContent = roadmapFile ? readFileCached(roadmapFile) : null;
 
-    if (roadmapContent) {
-      const roadmap = parseRoadmap(roadmapContent);
+    if (roadmapContent || isDbAvailable()) {
+      // Normalize slices from DB
+      type NormSlice = { id: string; done: boolean; title: string; risk: string; depends: string[]; demo: string };
+      let normSlices: NormSlice[];
+      if (isDbAvailable()) {
+        normSlices = getMilestoneSlices(mid).map(s => ({ id: s.id, done: s.status === 'complete', title: s.title, risk: s.risk || 'medium', depends: s.depends, demo: s.demo }));
+      } else {
+        normSlices = [];
+      }
 
-      for (const s of roadmap.slices) {
+      for (const s of normSlices) {
         const isActiveSlice =
           state.activeMilestone?.id === mid &&
           state.activeSlice?.id === s.id;
@@ -807,16 +815,13 @@ export async function loadVisualizerData(basePath: string): Promise<VisualizerDa
         const tasks: VisualizerTask[] = [];
 
         if (isActiveSlice) {
-          const planFile = resolveSliceFile(basePath, mid, s.id, 'PLAN');
-          const planContent = planFile ? readFileCached(planFile) : null;
-
-          if (planContent) {
-            const plan = parsePlan(planContent);
-            for (const t of plan.tasks) {
+          // Normalize tasks from DB
+          if (isDbAvailable()) {
+            for (const t of getSliceTasks(mid, s.id)) {
               tasks.push({
                 id: t.id,
                 title: t.title,
-                done: t.done,
+                done: t.status === 'complete' || t.status === 'done',
                 active: state.activeTask?.id === t.id,
                 estimate: t.estimate || undefined,
               });

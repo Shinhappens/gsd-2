@@ -194,8 +194,6 @@ function makeMockDeps(overrides?: Partial<LoopDeps>): LoopDeps & { callLog: stri
     runPreDispatchHooks: () => ({ firedHooks: [], action: "proceed" }),
     getPriorSliceCompletionBlocker: () => null,
     getMainBranch: () => "main",
-    collectObservabilityWarnings: async () => [],
-    buildObservabilityRepairBlock: () => null,
     closeoutUnit: async () => {},
     verifyExpectedArtifact: () => true,
     clearUnitRuntimeRecord: () => {},

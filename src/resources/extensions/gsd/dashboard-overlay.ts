@@ -9,7 +9,8 @@
 import type { Theme } from "@gsd/pi-coding-agent";
 import { truncateToWidth, visibleWidth, matchesKey, Key } from "@gsd/pi-tui";
 import { deriveState } from "./state.js";
-import { loadFile, parseRoadmap, parsePlan } from "./files.js";
+import { loadFile } from "./files.js";
+import { isDbAvailable, getMilestoneSlices, getSliceTasks } from "./gsd-db.js";
 import { resolveMilestoneFile, resolveSliceFile } from "./paths.js";
 import { getAutoDashboardData } from "./auto.js";
 import type { AutoDashboardData } from "./auto-dashboard.js";
@@ -159,9 +160,14 @@ export class GSDDashboardOverlay {
 
       const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
       const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
-      if (roadmapContent) {
-        const roadmap = parseRoadmap(roadmapContent);
-        for (const s of roadmap.slices) {
+      // Normalize slices from DB
+      type NormSlice = { id: string; done: boolean; title: string; risk: string };
+      let normSlices: NormSlice[] = [];
+      if (isDbAvailable()) {
+        normSlices = getMilestoneSlices(mid).map(s => ({ id: s.id, done: s.status === "complete", title: s.title, risk: s.risk || "medium" }));
+      }
+
+      for (const s of normSlices) {
           const sliceView: SliceView = {
             id: s.id,
             title: s.title,
@@ -172,19 +178,18 @@ export class GSDDashboardOverlay {
           };
 
           if (sliceView.active) {
-            const planFile = resolveSliceFile(base, mid, s.id, "PLAN");
-            const planContent = planFile ? await loadFile(planFile) : null;
-            if (planContent) {
-              const plan = parsePlan(planContent);
+            // Normalize tasks from DB
+            if (isDbAvailable()) {
+              const dbTasks = getSliceTasks(mid, s.id);
               sliceView.taskProgress = {
-                done: plan.tasks.filter(t => t.done).length,
-                total: plan.tasks.length,
+                done: dbTasks.filter(t => t.status === "complete" || t.status === "done").length,
+                total: dbTasks.length,
               };
-              for (const t of plan.tasks) {
+              for (const t of dbTasks) {
                 sliceView.tasks.push({
                   id: t.id,
                   title: t.title,
-                  done: t.done,
+                  done: t.status === "complete" || t.status === "done",
                   active: state.activeTask?.id === t.id,
                 });
               }
@@ -192,7 +197,6 @@ export class GSDDashboardOverlay {
           }
 
           view.slices.push(sliceView);
-        }
       }
 
       this.milestoneData = view;

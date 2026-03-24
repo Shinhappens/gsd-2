@@ -6,7 +6,7 @@
  * utility.
  */
 
-import { loadFile, parseContinue, parsePlan, parseRoadmap, parseSummary, extractUatType, loadActiveOverrides, formatOverridesSection, parseTaskPlanFile } from "./files.js";
+import { loadFile, parseContinue, parseSummary, extractUatType, loadActiveOverrides, formatOverridesSection, parseTaskPlanFile } from "./files.js";
 import type { Override, UatType } from "./files.js";
 import { loadPrompt, inlineTemplate } from "./prompt-loader.js";
 import {
@@ -177,17 +177,25 @@ export async function inlineFileSmart(
 export async function inlineDependencySummaries(
   mid: string, sid: string, base: string, budgetChars?: number,
 ): Promise<string> {
-  const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
-  const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
-  if (!roadmapContent) return "- (no dependencies)";
+  // DB primary path — get slice depends directly
+  let depends: string[] | null = null;
+  try {
+    const { isDbAvailable, getSlice } = await import("./gsd-db.js");
+    if (isDbAvailable()) {
+      const slice = getSlice(mid, sid);
+      if (!slice || slice.depends.length === 0) return "- (no dependencies)";
+      depends = slice.depends as string[];
+    }
+  } catch { /* fall through */ }
 
-  const roadmap = parseRoadmap(roadmapContent);
-  const sliceEntry = roadmap.slices.find(s => s.id === sid);
-  if (!sliceEntry || sliceEntry.depends.length === 0) return "- (no dependencies)";
+  // If DB didn't provide depends, we can't determine them without parsers
+  if (!depends) {
+    return "- (no dependencies)";
+  }
 
   const sections: string[] = [];
   const seen = new Set<string>();
-  for (const dep of sliceEntry.depends) {
+  for (const dep of depends) {
     if (seen.has(dep)) continue;
     seen.add(dep);
     const summaryFile = resolveSliceFile(base, mid, dep, "SUMMARY");
@@ -676,31 +684,29 @@ export async function getDependencyTaskSummaryPaths(
 export async function checkNeedsReassessment(
   base: string, mid: string, state: GSDState,
 ): Promise<{ sliceId: string } | null> {
-  const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
-  const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
-  if (!roadmapContent) return null;
+  // DB primary path
+  let completedSliceIds: string[] = [];
+  let hasIncomplete = false;
+  try {
+    const { isDbAvailable, getMilestoneSlices } = await import("./gsd-db.js");
+    if (isDbAvailable()) {
+      const slices = getMilestoneSlices(mid);
+      completedSliceIds = slices.filter(s => s.status === "complete").map(s => s.id);
+      hasIncomplete = slices.some(s => s.status !== "complete");
+      if (completedSliceIds.length === 0 || !hasIncomplete) return null;
+      const lastCompleted = completedSliceIds[completedSliceIds.length - 1];
+      const assessmentFile = resolveSliceFile(base, mid, lastCompleted, "ASSESSMENT");
+      const hasAssessment = !!(assessmentFile && await loadFile(assessmentFile));
+      if (hasAssessment) return null;
+      const summaryFile = resolveSliceFile(base, mid, lastCompleted, "SUMMARY");
+      const hasSummary = !!(summaryFile && await loadFile(summaryFile));
+      if (!hasSummary) return null;
+      return { sliceId: lastCompleted };
+    }
+  } catch { /* fall through */ }
 
-  const roadmap = parseRoadmap(roadmapContent);
-  const completedSlices = roadmap.slices.filter(s => s.done);
-  const incompleteSlices = roadmap.slices.filter(s => !s.done);
-
-  // No completed slices or all slices done — skip
-  if (completedSlices.length === 0 || incompleteSlices.length === 0) return null;
-
-  // Check the last completed slice
-  const lastCompleted = completedSlices[completedSlices.length - 1];
-  const assessmentFile = resolveSliceFile(base, mid, lastCompleted.id, "ASSESSMENT");
-  const hasAssessment = !!(assessmentFile && await loadFile(assessmentFile));
-
-  if (hasAssessment) return null;
-
-  // Also need a summary to reassess against
-  const summaryFile = resolveSliceFile(base, mid, lastCompleted.id, "SUMMARY");
-  const hasSummary = !!(summaryFile && await loadFile(summaryFile));
-
-  if (!hasSummary) return null;
-
-  return { sliceId: lastCompleted.id };
+  // DB unavailable — cannot determine assessment needs
+  return null;
 }
 
 /**
@@ -717,44 +723,34 @@ export async function checkNeedsReassessment(
 export async function checkNeedsRunUat(
   base: string, mid: string, state: GSDState, prefs: GSDPreferences | undefined,
 ): Promise<{ sliceId: string; uatType: UatType } | null> {
-  const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
-  const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
-  if (!roadmapContent) return null;
+  // DB primary path
+  try {
+    const { isDbAvailable, getMilestoneSlices } = await import("./gsd-db.js");
+    if (isDbAvailable()) {
+      const slices = getMilestoneSlices(mid);
+      const completedSlices = slices.filter(s => s.status === "complete");
+      const incompleteSlices = slices.filter(s => s.status !== "complete");
+      if (completedSlices.length === 0) return null;
+      if (incompleteSlices.length === 0) return null;
+      if (!prefs?.uat_dispatch) return null;
+      const lastCompleted = completedSlices[completedSlices.length - 1];
+      const sid = lastCompleted.id;
+      const uatFile = resolveSliceFile(base, mid, sid, "UAT");
+      if (!uatFile) return null;
+      const uatContent = await loadFile(uatFile);
+      if (!uatContent) return null;
+      const uatResultFile = resolveSliceFile(base, mid, sid, "UAT-RESULT");
+      if (uatResultFile) {
+        const hasResult = !!(await loadFile(uatResultFile));
+        if (hasResult) return null;
+      }
+      const uatType = extractUatType(uatContent) ?? "artifact-driven";
+      return { sliceId: sid, uatType };
+    }
+  } catch { /* fall through */ }
 
-  const roadmap = parseRoadmap(roadmapContent);
-  const completedSlices = roadmap.slices.filter(s => s.done);
-  const incompleteSlices = roadmap.slices.filter(s => !s.done);
-
-  // No completed slices — nothing to UAT yet
-  if (completedSlices.length === 0) return null;
-
-  // All slices done — milestone complete path, skip (reassessment handles)
-  if (incompleteSlices.length === 0) return null;
-
-  // uat_dispatch must be opted in
-  if (!prefs?.uat_dispatch) return null;
-
-  // Take the last completed slice
-  const lastCompleted = completedSlices[completedSlices.length - 1];
-  const sid = lastCompleted.id;
-
-  // UAT file must exist
-  const uatFile = resolveSliceFile(base, mid, sid, "UAT");
-  if (!uatFile) return null;
-  const uatContent = await loadFile(uatFile);
-  if (!uatContent) return null;
-
-  // If UAT result already exists, skip (idempotent)
-  const uatResultFile = resolveSliceFile(base, mid, sid, "UAT-RESULT");
-  if (uatResultFile) {
-    const hasResult = !!(await loadFile(uatResultFile));
-    if (hasResult) return null;
-  }
-
-  // Classify UAT type; default to artifact-driven (LLM-executed UATs are always artifact-driven)
-  const uatType = extractUatType(uatContent) ?? "artifact-driven";
-
-  return { sliceId: sid, uatType };
+  // DB unavailable — cannot determine UAT needs
+  return null;
 }
 
 // ─── Prompt Builders ──────────────────────────────────────────────────────
@@ -1204,17 +1200,21 @@ export async function buildCompleteMilestonePrompt(
   inlined.push(await inlineFile(roadmapPath, roadmapRel, "Milestone Roadmap"));
 
   // Inline all slice summaries (deduplicated by slice ID)
-  const roadmapContent = roadmapPath ? await loadFile(roadmapPath) : null;
-  if (roadmapContent) {
-    const roadmap = parseRoadmap(roadmapContent);
-    const seenSlices = new Set<string>();
-    for (const slice of roadmap.slices) {
-      if (seenSlices.has(slice.id)) continue;
-      seenSlices.add(slice.id);
-      const summaryPath = resolveSliceFile(base, mid, slice.id, "SUMMARY");
-      const summaryRel = relSliceFile(base, mid, slice.id, "SUMMARY");
-      inlined.push(await inlineFile(summaryPath, summaryRel, `${slice.id} Summary`));
+  let sliceIds: string[] = [];
+  try {
+    const { isDbAvailable, getMilestoneSlices } = await import("./gsd-db.js");
+    if (isDbAvailable()) {
+      sliceIds = getMilestoneSlices(mid).map(s => s.id);
     }
+  } catch { /* fall through */ }
+  // If DB didn't provide slice IDs, sliceIds stays empty — no summaries to inline
+  const seenSlices = new Set<string>();
+  for (const sid of sliceIds) {
+    if (seenSlices.has(sid)) continue;
+    seenSlices.add(sid);
+    const summaryPath = resolveSliceFile(base, mid, sid, "SUMMARY");
+    const summaryRel = relSliceFile(base, mid, sid, "SUMMARY");
+    inlined.push(await inlineFile(summaryPath, summaryRel, `${sid} Summary`));
   }
 
   // Inline root GSD files (skip for minimal — completion can read these if needed)
@@ -1260,22 +1260,26 @@ export async function buildValidateMilestonePrompt(
   inlined.push(await inlineFile(roadmapPath, roadmapRel, "Milestone Roadmap"));
 
   // Inline all slice summaries and UAT results
-  const roadmapContent = roadmapPath ? await loadFile(roadmapPath) : null;
-  if (roadmapContent) {
-    const roadmap = parseRoadmap(roadmapContent);
-    const seenSlices = new Set<string>();
-    for (const slice of roadmap.slices) {
-      if (seenSlices.has(slice.id)) continue;
-      seenSlices.add(slice.id);
-      const summaryPath = resolveSliceFile(base, mid, slice.id, "SUMMARY");
-      const summaryRel = relSliceFile(base, mid, slice.id, "SUMMARY");
-      inlined.push(await inlineFile(summaryPath, summaryRel, `${slice.id} Summary`));
-
-      const uatPath = resolveSliceFile(base, mid, slice.id, "UAT-RESULT");
-      const uatRel = relSliceFile(base, mid, slice.id, "UAT-RESULT");
-      const uatInline = await inlineFileOptional(uatPath, uatRel, `${slice.id} UAT Result`);
-      if (uatInline) inlined.push(uatInline);
+  let valSliceIds: string[] = [];
+  try {
+    const { isDbAvailable, getMilestoneSlices } = await import("./gsd-db.js");
+    if (isDbAvailable()) {
+      valSliceIds = getMilestoneSlices(mid).map(s => s.id);
     }
+  } catch { /* fall through */ }
+  // If DB didn't provide slice IDs, valSliceIds stays empty
+  const seenValSlices = new Set<string>();
+  for (const sid of valSliceIds) {
+    if (seenValSlices.has(sid)) continue;
+    seenValSlices.add(sid);
+    const summaryPath = resolveSliceFile(base, mid, sid, "SUMMARY");
+    const summaryRel = relSliceFile(base, mid, sid, "SUMMARY");
+    inlined.push(await inlineFile(summaryPath, summaryRel, `${sid} Summary`));
+
+    const uatPath = resolveSliceFile(base, mid, sid, "UAT-RESULT");
+    const uatRel = relSliceFile(base, mid, sid, "UAT-RESULT");
+    const uatInline = await inlineFileOptional(uatPath, uatRel, `${sid} UAT Result`);
+    if (uatInline) inlined.push(uatInline);
   }
 
   // Inline existing VALIDATION file if this is a re-validation round
@@ -1582,16 +1586,28 @@ export async function buildRewriteDocsPrompt(
       docList.push(`- Slice plan: \`${slicePlanRel}\``);
       const tDir = resolveTasksDir(base, mid, sid);
       if (tDir) {
-        const planContent = await loadFile(slicePlanPath);
-        if (planContent) {
-          const plan = parsePlan(planContent);
-          for (const task of plan.tasks) {
-            if (!task.done) {
-              const taskPlanPath = resolveTaskFile(base, mid, sid, task.id, "PLAN");
-              if (taskPlanPath) {
-                const taskRelPath = `${relSlicePath(base, mid, sid)}/tasks/${task.id}-PLAN.md`;
-                docList.push(`- Task plan: \`${taskRelPath}\``);
-              }
+        // DB primary path — get incomplete tasks
+        let incompleteTasks: { id: string }[] | null = null;
+        try {
+          const { isDbAvailable, getSliceTasks } = await import("./gsd-db.js");
+          if (isDbAvailable()) {
+            incompleteTasks = getSliceTasks(mid, sid)
+              .filter(t => t.status !== "complete" && t.status !== "done")
+              .map(t => ({ id: t.id }));
+          }
+        } catch { /* fall through */ }
+
+        if (!incompleteTasks) {
+          // DB unavailable — no task data to inline
+          incompleteTasks = [];
+        }
+
+        if (incompleteTasks) {
+          for (const task of incompleteTasks) {
+            const taskPlanPath = resolveTaskFile(base, mid, sid, task.id, "PLAN");
+            if (taskPlanPath) {
+              const taskRelPath = `${relSlicePath(base, mid, sid)}/tasks/${task.id}-PLAN.md`;
+              docList.push(`- Task plan: \`${taskRelPath}\``);
             }
           }
         }

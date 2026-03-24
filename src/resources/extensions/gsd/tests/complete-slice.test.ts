@@ -125,9 +125,9 @@ console.log('\n=== complete-slice: schema v6 migration ===');
 
   const adapter = _getAdapter()!;
 
-  // Verify schema version is 7
+  // Verify schema version is current (v10 after M001 planning migrations)
   const versionRow = adapter.prepare('SELECT MAX(version) as v FROM schema_version').get();
-  assertEq(versionRow?.['v'], 7, 'schema version should be 7');
+  assertEq(versionRow?.['v'], 10, 'schema version should be 10');
 
   // Verify slices table has full_summary_md and full_uat_md columns
   const cols = adapter.prepare("PRAGMA table_info(slices)").all();

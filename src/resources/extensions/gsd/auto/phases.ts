@@ -635,18 +635,11 @@ export async function runDispatch(
     return { action: "break", reason: "prior-slice-blocker" };
   }
 
-  const observabilityIssues = await deps.collectObservabilityWarnings(
-    ctx,
-    s.basePath,
-    unitType,
-    unitId,
-  );
-
   return {
     action: "next",
     data: {
       unitType, unitId, prompt, finalPrompt: prompt,
-      pauseAfterUatDispatch, observabilityIssues,
+      pauseAfterUatDispatch,
       state, mid, midTitle,
       isRetry: false, previousTier: undefined,
       hookModelOverride: preDispatchResult.model,
@@ -807,7 +800,7 @@ export async function runUnitPhase(
   sidecarItem?: SidecarItem,
 ): Promise<PhaseResult<{ unitStartedAt: number }>> {
   const { ctx, pi, s, deps, prefs } = ic;
-  const { unitType, unitId, prompt, observabilityIssues, state, mid } = iterData;
+  const { unitType, unitId, prompt, state, mid } = iterData;
 
   debugLog("autoLoop", {
     phase: "unit-execution",
@@ -835,11 +828,11 @@ export async function runUnitPhase(
     const hasProjectFile = PROJECT_FILES.some((f) => deps.existsSync(join(s.basePath, f)));
     const hasSrcDir = deps.existsSync(join(s.basePath, "src"));
     if (!hasProjectFile && !hasSrcDir) {
-      const msg = `Worktree health check failed: ${s.basePath} has no recognized project files — refusing to dispatch ${unitType} ${unitId}`;
-      debugLog("runUnitPhase", { phase: "worktree-health-fail", basePath: s.basePath, hasProjectFile, hasSrcDir });
-      ctx.ui.notify(msg, "error");
-      await deps.stopAuto(ctx, pi, msg);
-      return { action: "break", reason: "worktree-invalid" };
+      // Greenfield projects won't have project files yet — the first task creates them.
+      // Log a warning but allow execution to proceed. The .git check above is sufficient
+      // to ensure we're in a valid working directory.
+      debugLog("runUnitPhase", { phase: "worktree-health-warn-greenfield", basePath: s.basePath, hasProjectFile, hasSrcDir });
+      ctx.ui.notify(`Warning: ${s.basePath} has no recognized project files — proceeding as greenfield project`, "warning");
     }
   }
 
@@ -910,12 +903,6 @@ export async function runUnitPhase(
           : diagnostic;
       finalPrompt = `**RETRY — your previous attempt did not produce the required artifact.**\n\nDiagnostic from previous attempt:\n${cappedDiag}\n\nFix whatever went wrong and make sure you write the required file this time.\n\n---\n\n${finalPrompt}`;
     }
-  }
-
-  const repairBlock =
-    deps.buildObservabilityRepairBlock(observabilityIssues);
-  if (repairBlock) {
-    finalPrompt = `${finalPrompt}${repairBlock}`;
   }
 
   // Prompt char measurement

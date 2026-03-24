@@ -335,9 +335,9 @@ console.log('\n=== memory-store: schema includes memories table ===');
   const viewCount = adapter.prepare('SELECT count(*) as cnt FROM active_memories').get();
   assertEq(viewCount?.['cnt'], 0, 'active_memories view should exist');
 
-  // Verify schema version is 7
+  // Verify schema version is 10 (after M001 planning migrations)
   const version = adapter.prepare('SELECT MAX(version) as v FROM schema_version').get();
-  assertEq(version?.['v'], 7, 'schema version should be 7');
+  assertEq(version?.['v'], 10, 'schema version should be 10');
 
   closeDatabase();
 }

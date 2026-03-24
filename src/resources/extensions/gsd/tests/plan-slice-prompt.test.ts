@@ -54,6 +54,13 @@ test("plan-slice prompt: all variables substituted", () => {
   assert.ok(result.includes("S01"));
 });
 
+test("plan-slice prompt: DB-backed tool names survive template substitution", () => {
+  const result = loadPrompt("plan-slice", { ...BASE_VARS, commitInstruction: "Do not commit." });
+  assert.ok(result.includes("gsd_plan_slice"), "gsd_plan_slice should appear in rendered prompt");
+  assert.ok(result.includes("gsd_plan_task"), "gsd_plan_task should appear in rendered prompt");
+  assert.ok(result.includes("canonical write path"), "canonical write path language should survive substitution");
+});
+
 test("domain-work prompts use skillActivation placeholder", () => {
   const prompts = [
     "research-milestone",

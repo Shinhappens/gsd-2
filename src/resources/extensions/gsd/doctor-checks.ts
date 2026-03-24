@@ -3,7 +3,9 @@ import { basename, dirname, join, sep } from "node:path";
 
 import type { DoctorIssue, DoctorIssueCode } from "./doctor-types.js";
 import { readRepoMeta, externalProjectsRoot, cleanNumberedGsdVariants } from "./repo-identity.js";
-import { loadFile, parseRoadmap } from "./files.js";
+import { loadFile } from "./files.js";
+import { parseRoadmap as parseLegacyRoadmap } from "./parsers-legacy.js";
+import { isDbAvailable, getMilestoneSlices } from "./gsd-db.js";
 import { resolveMilestoneFile, milestonesDir, gsdRoot, resolveGsdRootFile, relGsdRootFile } from "./paths.js";
 import { deriveState, isMilestoneComplete } from "./state.js";
 import { saveFile } from "./files.js";
@@ -51,12 +53,18 @@ export async function checkGitHealth(
       // Check if milestone is complete via roadmap
       let isComplete = false;
       if (milestoneEntry) {
-        const roadmapPath = resolveMilestoneFile(basePath, milestoneId, "ROADMAP");
-        const roadmapContent = roadmapPath ? await loadFile(roadmapPath) : null;
-        if (roadmapContent) {
-          const roadmap = parseRoadmap(roadmapContent);
-          isComplete = isMilestoneComplete(roadmap);
+        if (isDbAvailable()) {
+          const dbSlices = getMilestoneSlices(milestoneId);
+          isComplete = dbSlices.length > 0 && dbSlices.every(s => s.status === "complete");
+        } else {
+          const roadmapPath = resolveMilestoneFile(basePath, milestoneId, "ROADMAP");
+          const roadmapContent = roadmapPath ? await loadFile(roadmapPath) : null;
+          if (roadmapContent) {
+            const roadmap = parseLegacyRoadmap(roadmapContent);
+            isComplete = isMilestoneComplete(roadmap);
+          }
         }
+        // When DB unavailable and no roadmap, isComplete stays false
       }
 
       if (isComplete) {
@@ -98,11 +106,17 @@ export async function checkGitHealth(
 
           const milestoneId = branch.replace(/^milestone\//, "");
           const roadmapPath = resolveMilestoneFile(basePath, milestoneId, "ROADMAP");
-          const roadmapContent = roadmapPath ? await loadFile(roadmapPath) : null;
-          if (!roadmapContent) continue;
-
-          const roadmap = parseRoadmap(roadmapContent);
-          if (isMilestoneComplete(roadmap)) {
+          let branchMilestoneComplete = false;
+          if (isDbAvailable()) {
+            const dbSlices = getMilestoneSlices(milestoneId);
+            branchMilestoneComplete = dbSlices.length > 0 && dbSlices.every(s => s.status === "complete");
+          } else {
+            const roadmapContent = roadmapPath ? await loadFile(roadmapPath) : null;
+            if (!roadmapContent) continue;
+            const roadmap = parseLegacyRoadmap(roadmapContent);
+            branchMilestoneComplete = isMilestoneComplete(roadmap);
+          }
+          if (branchMilestoneComplete) {
             issues.push({
               severity: "info",
               code: "stale_milestone_branch",

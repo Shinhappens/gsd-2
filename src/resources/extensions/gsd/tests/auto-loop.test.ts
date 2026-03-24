@@ -366,8 +366,6 @@ function makeMockDeps(
     runPreDispatchHooks: () => ({ firedHooks: [], action: "proceed" }),
     getPriorSliceCompletionBlocker: () => null,
     getMainBranch: () => "main",
-    collectObservabilityWarnings: async () => [],
-    buildObservabilityRepairBlock: () => null,
     closeoutUnit: async () => {},
     verifyExpectedArtifact: () => true,
     clearUnitRuntimeRecord: () => {},
@@ -2069,7 +2067,7 @@ test("autoLoop stops when worktree has no .git for execute-task (#1833)", async 
   );
 });
 
-test("autoLoop stops when worktree has no project files for execute-task (#1833)", async () => {
+test("autoLoop warns but proceeds for greenfield project (no project files) (#1833)", async () => {
   _resetPendingResolve();
 
   const ctx = makeMockCtx();
@@ -2078,9 +2076,16 @@ test("autoLoop stops when worktree has no project files for execute-task (#1833)
   const pi = makeMockPi();
 
   const notifications: string[] = [];
-  ctx.ui.notify = (msg: string) => { notifications.push(msg); };
-
   const s = makeLoopSession({ basePath: "/tmp/empty-worktree" });
+
+  ctx.ui.notify = (msg: string) => {
+    notifications.push(msg);
+    // Terminate the loop after the greenfield warning fires,
+    // so we don't hang waiting for dispatch resolution.
+    if (msg.includes("greenfield")) {
+      s.active = false;
+    }
+  };
 
   const deps = makeMockDeps({
     deriveState: async () => {
@@ -2100,15 +2105,19 @@ test("autoLoop stops when worktree has no project files for execute-task (#1833)
 
   await autoLoop(ctx, pi, s, deps);
 
-  assert.ok(
-    deps.callLog.includes("stopAuto"),
-    "should stop auto-mode when worktree has no project files",
-  );
-  const healthNotification = notifications.find(
-    (n) => n.includes("Worktree health check failed") && n.includes("no recognized project files"),
+  // Should NOT have stopped auto-mode due to health check — greenfield is allowed
+  const stoppedForHealth = notifications.find(
+    (n) => n.includes("Worktree health check failed"),
   );
   assert.ok(
-    healthNotification,
-    "should notify about missing project files in worktree",
+    !stoppedForHealth,
+    "should not stop with health check failure for greenfield project",
+  );
+  const greenfieldWarning = notifications.find(
+    (n) => n.includes("no recognized project files") && n.includes("greenfield"),
+  );
+  assert.ok(
+    greenfieldWarning,
+    "should warn about greenfield project (no project files)",
   );
 });

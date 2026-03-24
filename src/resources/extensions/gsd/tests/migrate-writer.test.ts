@@ -18,6 +18,8 @@ import {
 import {
   parseRoadmap,
   parsePlan,
+} from '../parsers-legacy.ts';
+import {
   parseSummary,
   parseRequirementCounts,
 } from '../files.ts';

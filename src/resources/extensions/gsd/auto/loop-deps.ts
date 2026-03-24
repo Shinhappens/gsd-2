@@ -170,14 +170,6 @@ export interface LoopDeps {
     unitId: string,
   ) => string | null;
   getMainBranch: (basePath: string) => string;
-  collectObservabilityWarnings: (
-    ctx: ExtensionContext,
-    basePath: string,
-    unitType: string,
-    unitId: string,
-  ) => Promise<unknown[]>;
-  buildObservabilityRepairBlock: (issues: unknown[]) => string | null;
-
   // Unit closeout + runtime records
   closeoutUnit: (
     ctx: ExtensionContext,

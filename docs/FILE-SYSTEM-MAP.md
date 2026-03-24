@@ -482,7 +482,6 @@
 | gsd/auto-loop.ts | Auto Engine, State Machine | Execution loop state and cycle management |
 | gsd/auto-supervisor.ts | Auto Engine | Supervision and oversight of autonomous runs |
 | gsd/auto-budget.ts | Auto Engine | Token/cost budgeting and tracking |
-| gsd/auto-observability.ts | Auto Engine | Observability hooks and telemetry |
 | gsd/auto-tool-tracking.ts | Auto Engine | Tool usage instrumentation |
 | gsd/doctor.ts | Doctor/Diagnostics | Health check and system diagnostics |
 | gsd/doctor-checks.ts | Doctor/Diagnostics | Individual diagnostic checks |
@@ -978,7 +977,7 @@ Quick lookup: which files are part of each system?
 | **Config** | src/app-paths.ts, src/models-resolver.ts, src/remote-questions-config.ts, src/wizard.ts, core/defaults.ts, core/constants.ts, config.ts |
 | **Context7** | src/resources/extensions/context7/index.ts |
 | **Doctor / Diagnostics** | gsd/doctor*.ts, gsd/collision-diagnostics.ts, core/diagnostics.ts, web/lib/diagnostics-types.ts, web/app/api/doctor/*, forensics/* |
-| **Event System** | pi-coding-agent/src/core/event-bus.ts, gsd/auto-observability.ts |
+| **Event System** | pi-coding-agent/src/core/event-bus.ts |
 | **Extension Registry** | src/extension-discovery.ts, src/extension-registry.ts, src/bundled-extension-paths.ts |
 | **Extensions** | pi-coding-agent/src/core/extensions/*, src/resource-loader.ts |
 | **File Search** | native/crates/engine/src/grep.rs, glob.rs, fd.rs, fs_cache.rs, packages/native/src/grep/*, fd/*, core/tools/grep.ts, find.ts |

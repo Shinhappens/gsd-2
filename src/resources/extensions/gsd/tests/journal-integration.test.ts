@@ -91,8 +91,6 @@ function makeMockDeps(
     runPreDispatchHooks: () => ({ firedHooks: [], action: "proceed" }),
     getPriorSliceCompletionBlocker: () => null,
     getMainBranch: () => "main",
-    collectObservabilityWarnings: async () => [],
-    buildObservabilityRepairBlock: () => null,
     closeoutUnit: async () => {},
     verifyExpectedArtifact: () => true,
     clearUnitRuntimeRecord: () => {},

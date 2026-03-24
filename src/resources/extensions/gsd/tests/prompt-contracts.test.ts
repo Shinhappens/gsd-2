@@ -130,6 +130,66 @@ test("complete-slice prompt still contains template variables for context", () =
   assert.match(prompt, /\{\{roadmapPath\}\}/);
 });
 
+test("plan-milestone prompt references DB-backed planning tool and explicitly forbids manual roadmap writes", () => {
+  const prompt = readPrompt("plan-milestone");
+  assert.match(prompt, /gsd_plan_milestone/);
+  assert.match(prompt, /Do \*\*not\*\* write `?\{\{outputPath\}\}`?, `?ROADMAP\.md`?, or other planning artifacts manually/i);
+});
+
+test("guided-plan-milestone prompt references DB-backed planning tool and explicitly forbids manual roadmap writes", () => {
+  const prompt = readPrompt("guided-plan-milestone");
+  assert.match(prompt, /gsd_plan_milestone/);
+  assert.match(prompt, /Do \*\*not\*\* write `?\{\{milestoneId\}\}-ROADMAP\.md`?, `?ROADMAP\.md`?, or other planning artifacts manually/i);
+});
+
+test("plan-slice prompt no longer frames direct PLAN writes as the source of truth", () => {
+  const prompt = readPrompt("plan-slice");
+  assert.match(prompt, /Do \*\*not\*\* rely on direct `PLAN\.md` writes as the source of truth/i);
+});
+
+test("plan-slice prompt explicitly names gsd_plan_slice and gsd_plan_task as DB-backed planning tools", () => {
+  const prompt = readPrompt("plan-slice");
+  assert.match(prompt, /gsd_plan_slice/);
+  assert.match(prompt, /gsd_plan_task/);
+  // The prompt should describe these as the canonical write path
+  assert.match(prompt, /DB-backed tools are the canonical write path/i);
+});
+
+test("plan-slice prompt does not instruct direct file writes as a primary step", () => {
+  const prompt = readPrompt("plan-slice");
+  // Should not instruct to "Write {{outputPath}}" as a primary step — tools handle rendering
+  assert.doesNotMatch(prompt, /^\d+\.\s+Write `?\{\{outputPath\}\}`?\s*$/m);
+});
+
+test("plan-slice prompt instructs calling gsd_plan_task for each task", () => {
+  const prompt = readPrompt("plan-slice");
+  assert.match(prompt, /call `gsd_plan_task` for each task/i);
+});
+
+test("replan-slice prompt requires DB-backed planning state when available", () => {
+  const prompt = readPrompt("replan-slice");
+  assert.match(prompt, /DB-backed planning tool exists for this phase, use it as the source of truth/i);
+});
+
+test("reassess-roadmap prompt references gsd_reassess_roadmap tool", () => {
+  const prompt = readPrompt("reassess-roadmap");
+  assert.match(prompt, /gsd_reassess_roadmap/);
+});
+
+// ─── Prompt migration: replan-slice → gsd_replan_slice ────────────────
+
+test("replan-slice prompt names gsd_replan_slice as the tool to use", () => {
+  const prompt = readPrompt("replan-slice");
+  assert.match(prompt, /gsd_replan_slice/);
+});
+
+// ─── Prompt migration: reassess-roadmap → gsd_reassess_roadmap ───────
+
+test("reassess-roadmap prompt names gsd_reassess_roadmap as the tool to use", () => {
+  const prompt = readPrompt("reassess-roadmap");
+  assert.match(prompt, /gsd_reassess_roadmap/);
+});
+
 test("reactive-execute prompt references tool calls instead of checkbox updates", () => {
   const prompt = readPrompt("reactive-execute");
   assert.doesNotMatch(prompt, /checkbox updates/);
