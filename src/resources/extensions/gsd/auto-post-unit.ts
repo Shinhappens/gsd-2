@@ -47,6 +47,7 @@ import {
 } from "./post-unit-hooks.js";
 import { hasPendingCaptures, loadPendingCaptures } from "./captures.js";
 import { debugLog } from "./debug-logger.js";
+import { runSafely } from "./auto-utils.js";
 import type { AutoSession } from "./auto/session.js";
 
 /** Unit types that only touch `.gsd/` internal state files (no code changes).
@@ -239,6 +240,7 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
 
   // Auto-commit
   if (s.currentUnit) {
+    const unit = s.currentUnit;
     try {
       let taskContext: TaskCommitContext | undefined;
 
@@ -297,64 +299,52 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
     }
 
     // GitHub sync (non-blocking, opt-in)
-    try {
+    await runSafely("postUnit", "github-sync", async () => {
       const { runGitHubSync } = await import("../github-sync/sync.js");
-      await runGitHubSync(s.basePath, s.currentUnit.type, s.currentUnit.id);
-    } catch (e) {
-      debugLog("postUnit", { phase: "github-sync", error: String(e) });
-    }
+      await runGitHubSync(s.basePath, unit.type, unit.id);
+    });
 
     // Prune dead bg-shell processes
-    try {
+    await runSafely("postUnit", "prune-bg-shell", async () => {
       const { pruneDeadProcesses } = await import("../bg-shell/process-manager.js");
       pruneDeadProcesses();
-    } catch (e) {
-      debugLog("postUnit", { phase: "prune-bg-shell", error: String(e) });
-    }
+    });
 
     // Tear down browser between units to prevent Chrome process accumulation (#1733)
-    try {
+    await runSafely("postUnit", "browser-teardown", async () => {
       const { getBrowser } = await import("../browser-tools/state.js");
       if (getBrowser()) {
         const { closeBrowser } = await import("../browser-tools/lifecycle.js");
         await closeBrowser();
         debugLog("postUnit", { phase: "browser-teardown", status: "closed" });
       }
-    } catch (e) {
-      debugLog("postUnit", { phase: "browser-teardown", error: String(e) });
-    }
+    });
 
     // Sync worktree state back to project root (skipped for lightweight sidecars)
     if (!opts?.skipWorktreeSync && s.originalBasePath && s.originalBasePath !== s.basePath) {
-      try {
-        syncStateToProjectRoot(s.basePath, s.originalBasePath, s.currentMilestoneId);
-      } catch (e) {
-        debugLog("postUnit", { phase: "worktree-sync", error: String(e) });
-      }
+      await runSafely("postUnit", "worktree-sync", () => {
+        syncStateToProjectRoot(s.basePath, s.originalBasePath!, s.currentMilestoneId);
+      });
     }
 
     // Rewrite-docs completion
     if (s.currentUnit.type === "rewrite-docs") {
-      try {
+      await runSafely("postUnit", "rewrite-docs-resolve", async () => {
         await resolveAllOverrides(s.basePath);
         s.rewriteAttemptCount = 0;
         ctx.ui.notify("Override(s) resolved — rewrite-docs completed.", "info");
-      } catch (e) {
-        debugLog("postUnit", { phase: "rewrite-docs-resolve", error: String(e) });
-      }
+      });
     }
 
     // Reactive state cleanup on slice completion
     if (s.currentUnit.type === "complete-slice") {
-      try {
-        const { milestone: mid, slice: sid } = parseUnitId(s.currentUnit.id);
+      await runSafely("postUnit", "reactive-state-cleanup", async () => {
+        const { milestone: mid, slice: sid } = parseUnitId(unit.id);
         if (mid && sid) {
           const { clearReactiveState } = await import("./reactive-graph.js");
           clearReactiveState(s.basePath, mid, sid);
         }
-      } catch (e) {
-        debugLog("postUnit", { phase: "reactive-state-cleanup", error: String(e) });
-      }
+      });
     }
 
     // Post-triage: execute actionable resolutions
