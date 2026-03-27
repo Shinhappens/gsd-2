@@ -6,6 +6,22 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.56.0] - 2026-03-27
+
+### Added
+- **parallel**: /gsd parallel watch — native TUI overlay for worker monitoring (#2806)
+
+### Fixed
+- **ci**: copy web/components to dist-test for xterm-theme test (#2891)
+- **gsd**: prefer PREFERENCES.md in worktrees (#2796)
+- **gsd**: resume auto-mode after transient provider pause (#2822)
+- **parallel**: resolve session lock contention and 3 related parallel-mode bugs (#2184) (#2800)
+- **web**: improve light theme terminal contrast (#2819)
+- **gsd**: preserve auto start model through discuss (#2837)
+
+### Changed
+- **test**: compile unit tests with esbuild, reclassify integration tests, fix node_modules symlink (#2809)
+
 ## [2.55.0] - 2026-03-27
 
 ### Added
@@ -2095,7 +2111,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - License updated to MIT
 
-[Unreleased]: https://github.com/gsd-build/gsd-2/compare/v2.55.0...HEAD
+[Unreleased]: https://github.com/gsd-build/gsd-2/compare/v2.56.0...HEAD
+[2.56.0]: https://github.com/gsd-build/gsd-2/compare/v2.55.0...v2.56.0
 [2.55.0]: https://github.com/gsd-build/gsd-2/compare/v2.54.0...v2.55.0
 [2.54.0]: https://github.com/gsd-build/gsd-2/compare/v2.53.0...v2.54.0
 [2.53.0]: https://github.com/gsd-build/gsd-2/compare/v2.52.0...v2.53.0
