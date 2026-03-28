@@ -40,6 +40,7 @@ import { getUntrustedExtensionPaths } from "./project-trust.js";
 export { isProjectTrusted, trustProject, getUntrustedExtensionPaths } from "./project-trust.js";
 import { registerToolCompatibility } from "../tools/tool-compatibility-registry.js";
 import { mergeExtensionEntryPaths } from "../../../../../src/extension-discovery.js";
+import { sortExtensionPaths } from "../../../../../src/extension-sort.js";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -874,6 +875,7 @@ export async function loadExtensions(paths: string[], cwd: string, eventBus?: Ev
 	return {
 		extensions,
 		errors,
+		warnings: [],
 		runtime,
 	};
 }
@@ -1060,5 +1062,13 @@ export async function discoverAndLoadExtensions(
 		addPaths([resolved]);
 	}
 
-	return loadExtensions(allPaths, cwd, eventBus);
+	// Topological sort: ensure declared dependencies load first (D-06, D-07)
+	const { sortedPaths, warnings: sortWarnings } = sortExtensionPaths(allPaths)
+	// Emit warnings to stderr immediately — loader runs before ctx.ui is ready (D-08)
+	for (const w of sortWarnings) {
+		process.stderr.write(`[gsd] ${w.message}\n`)
+	}
+	const result = await loadExtensions(sortedPaths, cwd, eventBus)
+	result.warnings.push(...sortWarnings)
+	return result
 }
