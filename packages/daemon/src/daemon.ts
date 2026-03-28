@@ -82,7 +82,7 @@ export class Daemon {
               channelManager,
               scanProjects: () => this.scanProjects(),
               config: {
-                model: this.config.discord.orchestrator?.model ?? 'claude-sonnet-4-5-20250929',
+                model: this.config.discord.orchestrator?.model ?? 'claude-haiku-4-5-20251001',
                 max_tokens: this.config.discord.orchestrator?.max_tokens ?? 1024,
                 control_channel_id: this.config.discord.control_channel_id,
               },

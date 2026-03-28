@@ -162,6 +162,10 @@ export class MessageBatcher {
   /**
    * Build a SendPayload from a batch of FormattedEvents and invoke the send callback.
    * Catches and logs errors — never throws.
+   *
+   * For batched messages (2+ events), we send content-only to avoid duplication
+   * between content text and embed descriptions, and to stay under Discord's
+   * 10-embed limit. Single-event sends include the embed for rich formatting.
    */
   private async doSend(batch: FormattedEvent[]): Promise<void> {
     if (batch.length === 0) return;
@@ -169,10 +173,12 @@ export class MessageBatcher {
     // Combine content lines
     const content = batch.map((e) => e.content).join('\n');
 
-    // Collect all embeds (Discord allows up to 10 per message)
+    // For single events, include the embed for rich formatting.
+    // For batches, skip embeds — the content lines are self-descriptive and
+    // embeds would duplicate the information + risk hitting Discord's 10-embed cap.
     const embeds: unknown[] = [];
-    for (const e of batch) {
-      if (e.embed) embeds.push(e.embed);
+    if (batch.length === 1 && batch[0].embed) {
+      embeds.push(batch[0].embed);
     }
 
     // Collect all component rows (only from the last event with components —

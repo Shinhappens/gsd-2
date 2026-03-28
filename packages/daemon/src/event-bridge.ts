@@ -417,17 +417,23 @@ export class EventBridge {
       return;
     }
 
-    // Otherwise, steer the session with the message content
-    if (session.status === 'running') {
-      try {
+    // Otherwise, relay the message to the GSD session
+    // Use steer() when running (injects mid-turn), prompt() otherwise (starts new turn)
+    try {
+      if (session.status === 'running') {
         await session.client.steer(message.content);
-        await message.react('📨').catch(() => {});
-        this.logger.info('bridge: message relayed to session', { sessionId });
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        this.logger.error('bridge: steer failed', { sessionId, error: errMsg });
-        await message.reply(`❌ Failed to relay message: ${errMsg}`).catch(() => {});
+      } else {
+        await session.client.prompt(message.content);
       }
+      await message.react('📨').catch(() => {});
+      this.logger.info('bridge: message relayed to session', {
+        sessionId,
+        method: session.status === 'running' ? 'steer' : 'prompt',
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.logger.error('bridge: relay failed', { sessionId, error: errMsg });
+      await message.reply(`❌ Failed to relay message: ${errMsg}`).catch(() => {});
     }
   }
 

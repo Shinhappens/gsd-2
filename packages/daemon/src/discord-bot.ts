@@ -129,6 +129,17 @@ export class DiscordBot {
       this.handleInteraction(interaction);
     });
 
+    // Debug: log all incoming messages at debug level
+    client.on('messageCreate', (msg) => {
+      this.logger.debug('raw messageCreate', {
+        authorId: msg.author.id,
+        authorBot: msg.author.bot,
+        channelId: msg.channelId,
+        contentLength: msg.content.length,
+        hasContent: msg.content.length > 0,
+      });
+    });
+
     // Reconnection observability — structured logging for all shard lifecycle events (R027)
     client.on('shardError', (error) => {
       this.logger.error('discord shard error', { error: error.message });

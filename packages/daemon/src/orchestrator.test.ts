@@ -201,6 +201,7 @@ function makeMessage(overrides: Partial<{
       send: async (content: string) => {
         sentMessages.push(content);
       },
+      sendTyping: async () => {},
     },
     sentMessages,
   };

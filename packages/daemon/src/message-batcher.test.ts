@@ -65,7 +65,7 @@ describe('MessageBatcher', () => {
       await batcher.destroy();
     });
 
-    it('combines embeds into a single send call', async () => {
+    it('skips embeds for batched messages (only content)', async () => {
       const { fn, calls } = createSend();
       const batcher = new MessageBatcher(fn, undefined, { maxBatchSize: 2, flushIntervalMs: 60_000 });
 
@@ -74,7 +74,7 @@ describe('MessageBatcher', () => {
       await new Promise((r) => setTimeout(r, 10));
 
       assert.equal(calls.length, 1);
-      assert.equal(calls[0].embeds.length, 2);
+      assert.equal(calls[0].embeds.length, 0, 'batched sends skip embeds to avoid duplication');
       assert.equal(calls[0].content, 'a\nb');
 
       await batcher.destroy();

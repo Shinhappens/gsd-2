@@ -102,14 +102,42 @@ export function formatToolEnd(event: SdkAgentEvent): FormattedEvent {
 export function formatMessage(event: SdkAgentEvent): FormattedEvent {
   // Extract text from content blocks or message field
   let text = '';
+
+  // Try content array first (most common for agent messages)
   if (Array.isArray(event.content)) {
     const blocks = event.content as Array<{ type?: string; text?: string }>;
     text = blocks
       .filter((b) => b.type === 'text' && typeof b.text === 'string')
       .map((b) => b.text!)
       .join('\n');
-  } else {
-    text = str(event.message || event.text || event.content);
+  }
+
+  // Try message field — could be string, object with content array, or object with text
+  if (!text && event.message != null) {
+    if (typeof event.message === 'string') {
+      text = event.message;
+    } else if (typeof event.message === 'object') {
+      const msg = event.message as Record<string, unknown>;
+      if (Array.isArray(msg.content)) {
+        const blocks = msg.content as Array<{ type?: string; text?: string }>;
+        text = blocks
+          .filter((b) => b.type === 'text' && typeof b.text === 'string')
+          .map((b) => b.text!)
+          .join('\n');
+      } else if (typeof msg.text === 'string') {
+        text = msg.text;
+      } else if (typeof msg.content === 'string') {
+        text = msg.content;
+      }
+    }
+  }
+
+  // Fallback to text or content as plain strings
+  if (!text) {
+    text = typeof event.text === 'string' ? event.text : '';
+  }
+  if (!text && typeof event.content === 'string') {
+    text = event.content;
   }
 
   if (!text) {
