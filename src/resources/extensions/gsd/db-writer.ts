@@ -355,6 +355,18 @@ export async function saveRequirementToDb(
   }
 }
 
+// ─── Async Mutex for Decision Saves ───────────────────────────────────────
+//
+// Serializes the entire saveDecisionToDb operation (ID generation + DB upsert
+// + file read + markdown regeneration + file write) so that parallel callers
+// cannot interleave and produce a last-writer-wins race on DECISIONS.md.
+let _decisionSaveLock: Promise<unknown> = Promise.resolve();
+
+/** Reset the mutex — only for tests. */
+export function _resetDecisionSaveLock(): void {
+  _decisionSaveLock = Promise.resolve();
+}
+
 // ─── Save Decision to DB + Regenerate Markdown ────────────────────────────
 
 export interface SaveDecisionFields {
@@ -370,12 +382,30 @@ export interface SaveDecisionFields {
 /**
  * Save a new decision to DB and regenerate DECISIONS.md.
  * Auto-assigns the next ID via nextDecisionId().
+ *
+ * Concurrency: uses an async mutex (promise chain) to serialize the entire
+ * operation — ID generation, DB upsert, file read, markdown regeneration,
+ * and file write — preventing parallel callers from overwriting each other's
+ * output (last-writer-wins race condition).
+ *
  * Returns the assigned ID.
  */
 export async function saveDecisionToDb(
   fields: SaveDecisionFields,
   basePath: string,
 ): Promise<{ id: string }> {
+  // Serialize via async mutex: each call waits for the previous one to
+  // complete before starting, preventing interleaved DB + file writes.
+  let release: () => void;
+  const prev = _decisionSaveLock;
+  _decisionSaveLock = new Promise<void>(r => { release = r; });
+
+  try {
+    await prev;
+  } catch {
+    // Previous call failed — proceed regardless; the lock chain must continue.
+  }
+
   try {
     const db = await import('./gsd-db.js');
 
@@ -457,6 +487,8 @@ export async function saveDecisionToDb(
   } catch (err) {
     logError('manifest', 'saveDecisionToDb failed', { fn: 'saveDecisionToDb', error: String((err as Error).message) });
     throw err;
+  } finally {
+    release!();
   }
 }
 
