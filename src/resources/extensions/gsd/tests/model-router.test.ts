@@ -213,9 +213,9 @@ test("#2192: known model is still downgraded normally", () => {
 
 // ─── Capability Scoring (ADR-004 Phase 2) ───────────────────────────────────
 
-test("defaultRoutingConfig includes capability_routing: false", () => {
+test("defaultRoutingConfig includes capability_routing: true", () => {
   const config = defaultRoutingConfig();
-  assert.equal(config.capability_routing, false);
+  assert.equal(config.capability_routing, true);
 });
 
 test("scoreModel computes weighted average of capability × requirement", () => {
