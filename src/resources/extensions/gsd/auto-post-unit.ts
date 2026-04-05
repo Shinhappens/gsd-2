@@ -52,6 +52,13 @@ import { hasPendingCaptures, loadPendingCaptures, revertExecutorResolvedCaptures
 import { debugLog } from "./debug-logger.js";
 import { runSafely } from "./auto-utils.js";
 import type { AutoSession, SidecarItem } from "./auto/session.js";
+import { getEvidence } from "./safety/evidence-collector.js";
+import { validateFileChanges } from "./safety/file-change-validator.js";
+// crossReferenceEvidence available for future use when verification_evidence is stored in DB
+// import { crossReferenceEvidence, type ClaimedEvidence } from "./safety/evidence-cross-ref.js";
+import { validateContent } from "./safety/content-validator.js";
+import { resolveSafetyHarnessConfig } from "./safety/safety-harness.js";
+import { resolveExpectedArtifactPath as resolveArtifactForContent } from "./auto-artifact-paths.js";
 
 /** Maximum verification retry attempts before escalating to blocker placeholder (#2653). */
 const MAX_VERIFICATION_RETRIES = 3;
@@ -435,6 +442,87 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
       }
     } catch (e) {
       debugLog("postUnit", { phase: "rogue-detection", error: String(e) });
+    }
+
+    // ── Safety harness: post-unit validation ──
+    try {
+      const { loadEffectiveGSDPreferences } = await import("./preferences.js");
+      const prefs = loadEffectiveGSDPreferences()?.preferences;
+      const safetyConfig = resolveSafetyHarnessConfig(
+        prefs?.safety_harness as Record<string, unknown> | undefined,
+      );
+
+      if (safetyConfig.enabled) {
+        const { milestone: sMid, slice: sSid, task: sTid } = parseUnitId(s.currentUnit.id);
+
+        // File change validation (execute-task only, after auto-commit)
+        if (safetyConfig.file_change_validation && s.currentUnit.type === "execute-task" && sMid && sSid && sTid && isDbAvailable()) {
+          try {
+            const taskRow = getTask(sMid, sSid, sTid);
+            if (taskRow) {
+              const expectedOutput = taskRow.expected_output ?? [];
+              const plannedFiles = taskRow.files ?? [];
+              const audit = validateFileChanges(s.basePath, expectedOutput, plannedFiles);
+              if (audit && audit.violations.length > 0) {
+                const warnings = audit.violations.filter(v => v.severity === "warning");
+                for (const v of warnings) {
+                  logWarning("safety", `file-change: ${v.file} — ${v.reason}`);
+                }
+                if (warnings.length > 0) {
+                  ctx.ui.notify(
+                    `Safety: ${warnings.length} unexpected file change(s) outside task plan`,
+                    "warning",
+                  );
+                }
+              }
+            }
+          } catch (e) {
+            debugLog("postUnit", { phase: "safety-file-change", error: String(e) });
+          }
+        }
+
+        // Evidence cross-reference (execute-task only)
+        // Verification evidence is passed via the complete-task tool call and
+        // stored in the SUMMARY.md on disk — not available as structured data
+        // in the DB. The evidence collector tracks actual bash tool calls, so
+        // we can still detect units that claimed success but ran no commands.
+        if (safetyConfig.evidence_cross_reference && s.currentUnit.type === "execute-task") {
+          try {
+            const actual = getEvidence();
+            const bashCalls = actual.filter(e => e.kind === "bash");
+            // If the task is marked complete but zero bash commands were run,
+            // it's suspicious — the LLM may have fabricated results.
+            if (sMid && sSid && sTid && isDbAvailable()) {
+              const taskRow = getTask(sMid, sSid, sTid);
+              if (taskRow?.status === "complete" && taskRow.verify && bashCalls.length === 0) {
+                logWarning("safety", "task marked complete with verification commands but no bash calls were executed");
+                ctx.ui.notify(
+                  `Safety: task ${sTid} has verification commands but no bash calls were recorded`,
+                  "warning",
+                );
+              }
+            }
+          } catch (e) {
+            debugLog("postUnit", { phase: "safety-evidence-xref", error: String(e) });
+          }
+        }
+
+        // Content validation (plan-slice, plan-milestone)
+        if (safetyConfig.content_validation) {
+          try {
+            const artifactPath = resolveArtifactForContent(s.currentUnit.type, s.currentUnit.id, s.basePath);
+            const contentViolations = validateContent(s.currentUnit.type, artifactPath);
+            for (const v of contentViolations) {
+              logWarning("safety", `content: ${v.reason}`);
+              ctx.ui.notify(`Content validation: ${v.reason}`, "warning");
+            }
+          } catch (e) {
+            debugLog("postUnit", { phase: "safety-content-validation", error: String(e) });
+          }
+        }
+      }
+    } catch (e) {
+      debugLog("postUnit", { phase: "safety-harness", error: String(e) });
     }
 
     // Artifact verification

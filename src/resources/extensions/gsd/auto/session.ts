@@ -145,6 +145,10 @@ export class AutoSession {
   lastBaselineCharCount: number | undefined;
   pendingQuickTasks: CaptureEntry[] = [];
 
+  // ── Safety harness ───────────────────────────────────────────────────────
+  /** SHA of the pre-unit git checkpoint ref. Cleared on success or rollback. */
+  checkpointSha: string | null = null;
+
   // ── Signal handler ───────────────────────────────────────────────────────
   sigtermHandler: (() => void) | null = null;
 
@@ -223,6 +227,7 @@ export class AutoSession {
     this.lastToolInvocationError = null;
     this.isolationDegraded = false;
     this.milestoneMergedInPhases = false;
+    this.checkpointSha = null;
 
     // Signal handler
     this.sigtermHandler = null;

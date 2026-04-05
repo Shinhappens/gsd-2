@@ -106,8 +106,9 @@ export function startUnitSupervision(sctx: SupervisionContext): void {
     }
   }
   const estimateMinutes = taskEstimate ? parseEstimateMinutes(taskEstimate) : null;
+  const MAX_TIMEOUT_SCALE = 6; // Cap at 6x (60min task). Prevents 2h+ tasks from creating 120min+ timeout windows.
   const timeoutScale = estimateMinutes && estimateMinutes > 0
-    ? Math.max(1, estimateMinutes / 10)  // 10min task = 1x, 30min = 3x, 2h = 12x
+    ? Math.min(MAX_TIMEOUT_SCALE, Math.max(1, estimateMinutes / 10))
     : 1;
 
   const softTimeoutMs = (supervisor.soft_timeout_minutes ?? 0) * 60 * 1000 * timeoutScale;

@@ -18,6 +18,9 @@ import { isParallelActive, shutdownParallel } from "../parallel-orchestrator.js"
 import { checkToolCallLoop, resetToolCallLoopGuard } from "./tool-call-loop-guard.js";
 import { saveActivityLog } from "../activity-log.js";
 import { resetAskUserQuestionsCache } from "../../ask-user-questions.js";
+import { recordToolCall as safetyRecordToolCall, recordToolResult as safetyRecordToolResult } from "../safety/evidence-collector.js";
+import { classifyCommand } from "../safety/destructive-guard.js";
+import { logWarning as safetyLogWarning } from "../workflow-logger.js";
 
 // Skip the welcome screen on the very first session_start — cli.ts already
 // printed it before the TUI launched. Only re-print on /clear (subsequent sessions).
@@ -203,6 +206,26 @@ export function registerHooks(pi: ExtensionAPI): void {
     if (result.block) return result;
   });
 
+  // ── Safety harness: evidence collection + destructive command warnings ──
+  pi.on("tool_call", async (event, ctx) => {
+    if (!isAutoActive()) return;
+    safetyRecordToolCall(event.toolName, event.input as Record<string, unknown>);
+
+    // Destructive command classification (warn only, never block)
+    if (isToolCallEventType("bash", event)) {
+      const classification = classifyCommand(event.input.command);
+      if (classification.destructive) {
+        safetyLogWarning("safety", `destructive command: ${classification.labels.join(", ")}`, {
+          command: String(event.input.command).slice(0, 200),
+        });
+        ctx.ui.notify(
+          `Destructive command detected: ${classification.labels.join(", ")}`,
+          "warning",
+        );
+      }
+    }
+  });
+
   pi.on("tool_result", async (event) => {
     if (event.toolName !== "ask_user_questions") return;
     const milestoneId = getDiscussionMilestoneId();
@@ -267,6 +290,10 @@ export function registerHooks(pi: ExtensionAPI): void {
         ? event.result
         : (typeof event.result?.content?.[0]?.text === "string" ? event.result.content[0].text : String(event.result));
       recordToolInvocationError(event.toolName, errorText);
+    }
+    // Safety harness: record tool execution results for evidence cross-referencing
+    if (isAutoActive()) {
+      safetyRecordToolResult(event.toolCallId, event.toolName, event.result, event.isError);
     }
   });
 
