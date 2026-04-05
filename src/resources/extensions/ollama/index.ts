@@ -105,16 +105,20 @@ export default function ollama(pi: ExtensionAPI) {
 			await registerOllamaTools(pi);
 		}
 
-		// Async probe — don't block startup
-		probeAndRegister(pi)
-			.then((found) => {
-				if (found && ctx.hasUI) {
-					ctx.ui.setStatus("ollama", "Ollama");
-				}
-			})
-			.catch(() => {
-				// Silently ignore probe failures
-			});
+		// In headless/auto mode, await the probe so the fallback resolver can
+		// see Ollama before the first LLM call (#3531 race condition).
+		// In interactive mode, keep it async for fast startup.
+		if (!ctx.hasUI) {
+			try {
+				await probeAndRegister(pi);
+			} catch { /* non-fatal */ }
+		} else {
+			probeAndRegister(pi)
+				.then((found) => {
+					if (found) ctx.ui.setStatus("ollama", "Ollama");
+				})
+				.catch(() => {});
+		}
 	});
 
 	pi.on("session_shutdown", async () => {
