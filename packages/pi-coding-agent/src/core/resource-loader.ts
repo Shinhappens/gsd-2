@@ -9,7 +9,7 @@ import type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.js";
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.js";
 
 import { createEventBus, type EventBus } from "./event-bus.js";
-import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.js";
+import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions, resetExtensionLoaderCache } from "./extensions/loader.js";
 import type { Extension, ExtensionFactory, ExtensionRuntime, LoadExtensionsResult } from "./extensions/types.js";
 import { DefaultPackageManager, type PathMetadata } from "./package-manager.js";
 import type { PromptTemplate } from "./prompt-templates.js";
@@ -320,6 +320,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	async reload(): Promise<void> {
+		// Invalidate the shared jiti module cache so updated extension code
+		// on disk is re-compiled instead of served from the stale cache (#3616).
+		resetExtensionLoaderCache();
+
 		const resolvedPaths = await this.packageManager.resolve();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
 			temporary: true,

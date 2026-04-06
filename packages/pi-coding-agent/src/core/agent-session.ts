@@ -1577,6 +1577,16 @@ export class AgentSession {
 				activeToolNames: this.getActiveToolNames(),
 				includeAllExtensionTools: true,
 			});
+		} else {
+			// Even when cwd hasn't changed, restore the full tool set (#3616).
+			// Extensions (e.g., discuss flows) may narrow the active tool list
+			// via setActiveTools() during a session. Without this refresh, the
+			// narrowed set persists into the next session — causing tools like
+			// gsd_plan_slice to be missing from auto-mode subagent sessions.
+			this._refreshToolRegistry({
+				activeToolNames: this.getActiveToolNames(),
+				includeAllExtensionTools: true,
+			});
 		}
 
 		// Run setup callback if provided (e.g., to append initial messages)

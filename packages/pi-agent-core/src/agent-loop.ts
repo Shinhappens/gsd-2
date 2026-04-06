@@ -293,13 +293,23 @@ async function runLoop(
 					newMessages.push(result);
 				}
 
-				// Schema overload detection (#2783): if EVERY tool result in this turn
-				// is an error (validation failure, missing tool, etc.), increment the
-				// consecutive failure counter. If any tool succeeded, reset to zero.
-				const allToolsFailed = toolResults.length > 0 && toolResults.every((r) => r.isError);
-				if (allToolsFailed) {
+				// Schema overload detection (#2783): count only preparation-phase
+				// errors (schema validation, tool-not-found, tool-blocked) toward the
+				// consecutive failure cap. Tool execution errors — such as bash
+				// commands returning non-zero exit codes (e.g. grep/rg exit 1 for
+				// "no matches") — are valid tool usage and must NOT trigger the cap.
+				// See: #3618
+				const hasPreparationErrors = toolExecution.preparationErrorCount > 0;
+				const allToolsFailedPreparation =
+					toolResults.length > 0 &&
+					toolExecution.preparationErrorCount === toolResults.length;
+				if (allToolsFailedPreparation) {
 					consecutiveAllToolErrorTurns++;
-				} else {
+				} else if (!hasPreparationErrors) {
+					// Reset only when there are zero preparation errors this turn.
+					// Mixed turns (some prep errors, some successes) don't reset,
+					// but they also don't increment — this avoids masking a
+					// pattern of alternating schema failures with one working call.
 					consecutiveAllToolErrorTurns = 0;
 				}
 
@@ -453,6 +463,19 @@ async function streamAssistantResponse(
 }
 
 /**
+ * Result from executing tool calls in a turn. Includes metadata about
+ * error provenance so the schema overload detector can distinguish
+ * preparation failures (schema validation, tool-not-found, tool-blocked)
+ * from execution failures (the tool ran but threw, e.g. bash exit code 1).
+ */
+interface ToolExecutionResult {
+	toolResults: ToolResultMessage[];
+	steeringMessages?: AgentMessage[];
+	/** Number of tool results that failed during preparation (validation/schema). */
+	preparationErrorCount: number;
+}
+
+/**
  * Execute tool calls from an assistant message.
  */
 async function executeToolCalls(
@@ -461,7 +484,7 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
-): Promise<{ toolResults: ToolResultMessage[]; steeringMessages?: AgentMessage[] }> {
+): Promise<ToolExecutionResult> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall") as AgentToolCall[];
 	if (config.toolExecution === "sequential") {
 		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, stream);
@@ -476,9 +499,10 @@ async function executeToolCallsSequential(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
-): Promise<{ toolResults: ToolResultMessage[]; steeringMessages?: AgentMessage[] }> {
+): Promise<ToolExecutionResult> {
 	const results: ToolResultMessage[] = [];
 	let steeringMessages: AgentMessage[] | undefined;
+	let preparationErrorCount = 0;
 
 	for (let index = 0; index < toolCalls.length; index++) {
 		const toolCall = toolCalls[index];
@@ -491,6 +515,9 @@ async function executeToolCallsSequential(
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		if (preparation.kind === "immediate") {
+			if (preparation.isError) {
+				preparationErrorCount++;
+			}
 			results.push(emitToolCallOutcome(toolCall, preparation.result, preparation.isError, stream));
 		} else {
 			const executed = await executePreparedToolCall(preparation, signal, stream);
@@ -520,7 +547,7 @@ async function executeToolCallsSequential(
 		}
 	}
 
-	return { toolResults: results, steeringMessages };
+	return { toolResults: results, steeringMessages, preparationErrorCount };
 }
 
 async function executeToolCallsParallel(
@@ -530,10 +557,11 @@ async function executeToolCallsParallel(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
-): Promise<{ toolResults: ToolResultMessage[]; steeringMessages?: AgentMessage[] }> {
+): Promise<ToolExecutionResult> {
 	const results: ToolResultMessage[] = [];
 	const runnableCalls: PreparedToolCall[] = [];
 	let steeringMessages: AgentMessage[] | undefined;
+	let preparationErrorCount = 0;
 
 	for (let index = 0; index < toolCalls.length; index++) {
 		const toolCall = toolCalls[index];
@@ -546,6 +574,9 @@ async function executeToolCallsParallel(
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		if (preparation.kind === "immediate") {
+			if (preparation.isError) {
+				preparationErrorCount++;
+			}
 			results.push(emitToolCallOutcome(toolCall, preparation.result, preparation.isError, stream));
 		} else {
 			runnableCalls.push(preparation);
@@ -562,7 +593,7 @@ async function executeToolCallsParallel(
 				for (const skipped of remainingCalls) {
 					results.push(skipToolCall(skipped, stream));
 				}
-				return { toolResults: results, steeringMessages };
+				return { toolResults: results, steeringMessages, preparationErrorCount };
 			}
 		}
 	}
@@ -594,7 +625,7 @@ async function executeToolCallsParallel(
 		}
 	}
 
-	return { toolResults: results, steeringMessages };
+	return { toolResults: results, steeringMessages, preparationErrorCount };
 }
 
 type PreparedToolCall = {
