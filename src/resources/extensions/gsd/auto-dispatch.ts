@@ -693,6 +693,10 @@ export const DISPATCH_RULES: DispatchRule[] = [
             if (validationPath) {
               const validationContent = await loadFile(validationPath);
               if (validationContent) {
+                // Allow completion when validation was intentionally skipped by
+                // preference/budget profile (#3399, #3344).
+                const skippedByPreference = /skip(?:ped)?[\s\-]+(?:by|per|due to)\s+(?:preference|budget|profile)/i.test(validationContent);
+
                 // Accept either the structured template format (table with MET/N/A/SATISFIED)
                 // or prose evidence patterns the validation agent may emit.
                 const structuredMatch =
@@ -700,7 +704,7 @@ export const DISPATCH_RULES: DispatchRule[] = [
                   (validationContent.includes("MET") || validationContent.includes("N/A") || validationContent.includes("SATISFIED"));
                 const proseMatch =
                   /[Oo]perational[\s\S]{0,500}?(?:✅|pass|verified|confirmed|met|complete|true|yes|addressed|covered|satisfied|partially|n\/a|not[\s-]+applicable)/i.test(validationContent);
-                const hasOperationalCheck = structuredMatch || proseMatch;
+                const hasOperationalCheck = skippedByPreference || structuredMatch || proseMatch;
                 if (!hasOperationalCheck) {
                   return {
                     action: "stop" as const,
