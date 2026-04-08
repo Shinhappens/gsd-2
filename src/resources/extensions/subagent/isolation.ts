@@ -57,8 +57,10 @@ function encodeCwd(cwd: string): string {
 	return cwd.replace(/\//g, "--");
 }
 
+const gsdHome = process.env.GSD_HOME || path.join(os.homedir(), ".gsd");
+
 function getIsolationBaseDir(cwd: string, taskId: string): string {
-	return path.join(os.homedir(), ".gsd", "wt", encodeCwd(cwd), taskId);
+	return path.join(gsdHome, "wt", encodeCwd(cwd), taskId);
 }
 
 // Track active isolation dirs for cleanup on exit
@@ -273,13 +275,16 @@ export async function createWorktreeIsolation(
 		async cleanup(): Promise<void> {
 			activeIsolations.delete(worktreeDir);
 			try {
-				await git(
-					["worktree", "remove", "--force", worktreeDir],
-					repoRoot,
-				);
+				await Promise.race([
+					git(["worktree", "remove", "--force", worktreeDir], repoRoot),
+					new Promise<never>((_, reject) =>
+						setTimeout(() => reject(new Error("Worktree cleanup timed out")), 10_000),
+					),
+				]);
 			} catch {
-				// Force remove directory if git worktree remove fails
-				fs.rmSync(worktreeDir, { recursive: true, force: true });
+				try {
+					fs.rmSync(worktreeDir, { recursive: true, force: true });
+				} catch { /* best effort */ }
 			}
 		},
 	};

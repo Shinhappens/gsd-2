@@ -11,9 +11,10 @@ import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ModelRegistry } from "./model-registry.js";
 
 /** Default model IDs for each known provider */
-export const defaultModelPerProvider: Record<KnownProvider, string> = {
+const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
-	anthropic: "claude-opus-4-6[1m]",
+	anthropic: "claude-opus-4-6",
+	"anthropic-vertex": "claude-sonnet-4-6",
 	openai: "gpt-5.4",
 	"azure-openai-responses": "gpt-5.2",
 	"openai-codex": "gpt-5.4",
@@ -23,7 +24,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"google-vertex": "gemini-3-pro-preview",
 	"github-copilot": "gpt-4o",
 	openrouter: "openai/gpt-5.1-codex",
-	"vercel-ai-gateway": "anthropic/claude-opus-4-6[1m]",
+	"vercel-ai-gateway": "anthropic/claude-opus-4-6",
 	xai: "grok-4-fast-non-reasoning",
 	groq: "openai/gpt-oss-120b",
 	cerebras: "zai-glm-4.6",
@@ -36,6 +37,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"opencode-go": "kimi-k2.5",
 	"kimi-coding": "kimi-k2-thinking",
 	"alibaba-coding-plan": "qwen3.5-plus",
+	ollama: "llama3.1:8b",
 	"ollama-cloud": "qwen3:32b",
 };
 
@@ -143,9 +145,9 @@ function buildFallbackModel(provider: string, modelId: string, availableModels: 
  *    - If suffix is valid thinking level, use it and recurse on prefix
  *    - If suffix is invalid, warn and recurse on prefix with "off"
  *
- * @internal Exported for testing
+ * @internal
  */
-export function parseModelPattern(
+function parseModelPattern(
 	pattern: string,
 	availableModels: Model<Api>[],
 	options?: { allowInvalidThinkingLevelFallback?: boolean },
@@ -504,6 +506,20 @@ export async function findInitialModel(options: {
 	if (defaultProvider && defaultModelId) {
 		const found = modelRegistry.find(defaultProvider, defaultModelId);
 		if (found) {
+			// Check if the provider's recommended default is a higher-capability variant
+			// of the saved model (e.g. saved "claude-opus-4-6" vs recommended "claude-opus-4-6-extended").
+			// If so, prefer the recommended variant to avoid using a smaller context window (#1125).
+			const recommendedId = defaultModelPerProvider[defaultProvider as KnownProvider];
+			if (recommendedId && recommendedId !== defaultModelId && recommendedId.startsWith(defaultModelId)) {
+				const recommended = modelRegistry.find(defaultProvider, recommendedId);
+				if (recommended) {
+					model = recommended;
+					if (defaultThinkingLevel) {
+						thinkingLevel = defaultThinkingLevel;
+					}
+					return { model, thinkingLevel, fallbackMessage: undefined };
+				}
+			}
 			model = found;
 			if (defaultThinkingLevel) {
 				thinkingLevel = defaultThinkingLevel;
@@ -531,78 +547,4 @@ export async function findInitialModel(options: {
 
 	// 5. No model found
 	return { model: undefined, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
-}
-
-/**
- * Restore model from session, with fallback to available models
- */
-export async function restoreModelFromSession(
-	savedProvider: string,
-	savedModelId: string,
-	currentModel: Model<Api> | undefined,
-	shouldPrintMessages: boolean,
-	modelRegistry: ModelRegistry,
-): Promise<{ model: Model<Api> | undefined; fallbackMessage: string | undefined }> {
-	const restoredModel = modelRegistry.find(savedProvider, savedModelId);
-
-	// Check if restored model exists and has a valid API key
-	const hasApiKey = restoredModel ? !!(await modelRegistry.getApiKey(restoredModel)) : false;
-
-	if (restoredModel && hasApiKey) {
-		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Restored model: ${savedProvider}/${savedModelId}`));
-		}
-		return { model: restoredModel, fallbackMessage: undefined };
-	}
-
-	// Model not found or no API key - fall back
-	const reason = !restoredModel ? "model no longer exists" : "no API key available";
-
-	if (shouldPrintMessages) {
-		console.error(chalk.yellow(`Warning: Could not restore model ${savedProvider}/${savedModelId} (${reason}).`));
-	}
-
-	// If we already have a model, use it as fallback
-	if (currentModel) {
-		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Falling back to: ${currentModel.provider}/${currentModel.id}`));
-		}
-		return {
-			model: currentModel,
-			fallbackMessage: `Could not restore model ${savedProvider}/${savedModelId} (${reason}). Using ${currentModel.provider}/${currentModel.id}.`,
-		};
-	}
-
-	// Try to find any available model
-	const availableModels = await modelRegistry.getAvailable();
-
-	if (availableModels.length > 0) {
-		// Try to find a default model from known providers
-		let fallbackModel: Model<Api> | undefined;
-		for (const provider of Object.keys(defaultModelPerProvider) as KnownProvider[]) {
-			const defaultId = defaultModelPerProvider[provider];
-			const match = availableModels.find((m) => m.provider === provider && m.id === defaultId);
-			if (match) {
-				fallbackModel = match;
-				break;
-			}
-		}
-
-		// If no default found, use first available
-		if (!fallbackModel) {
-			fallbackModel = availableModels[0];
-		}
-
-		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Falling back to: ${fallbackModel.provider}/${fallbackModel.id}`));
-		}
-
-		return {
-			model: fallbackModel,
-			fallbackMessage: `Could not restore model ${savedProvider}/${savedModelId} (${reason}). Using ${fallbackModel.provider}/${fallbackModel.id}.`,
-		};
-	}
-
-	// No models available
-	return { model: undefined, fallbackMessage: undefined };
 }

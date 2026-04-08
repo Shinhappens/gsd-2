@@ -17,9 +17,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 
 const projectRoot = process.cwd();
 const loaderPath = join(projectRoot, "dist", "loader.js");
@@ -86,6 +87,14 @@ function runGsd(
 function stripAnsi(s: string): string {
   // eslint-disable-next-line no-control-regex
   return s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+}
+
+function createTempGitRepo(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  execFileSync("git", ["init", "-b", "main"], { cwd: dir, stdio: "pipe" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir, stdio: "pipe" });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: dir, stdio: "pipe" });
+  return dir;
 }
 
 // ---------------------------------------------------------------------------
@@ -397,110 +406,144 @@ test("gsd -h is equivalent to --help", async () => {
 // 13. gsd headless without .gsd/ directory exits 1 with clean error
 // ---------------------------------------------------------------------------
 
-test("gsd headless without .gsd/ directory exits 1 with clean error", async () => {
+test("gsd headless without .gsd/ directory exits 1 with clean error", async (t) => {
   const tmpDir = mkdtempSync(join(tmpdir(), "gsd-e2e-no-gsd-"));
 
-  try {
-    const result = await runGsd(["headless"], 10_000, {}, tmpDir);
+  t.after(() => { rmSync(tmpDir, { recursive: true, force: true }); });
 
-    assert.ok(!result.timedOut, "process should not hang");
-    assert.strictEqual(result.code, 1, `expected exit 1, got ${result.code}`);
+  const result = await runGsd(["headless"], 10_000, {}, tmpDir);
 
-    const combined = stripAnsi(result.stdout + result.stderr);
-    assert.ok(
-      combined.includes(".gsd/") || combined.includes("No .gsd"),
-      `expected .gsd/ missing error, got:\n${combined.slice(0, 500)}`,
-    );
+  assert.ok(!result.timedOut, "process should not hang");
+  assert.strictEqual(result.code, 1, `expected exit 1, got ${result.code}`);
 
-    assertNoCrashMarkers(combined);
-  } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
-  }
+  const combined = stripAnsi(result.stdout + result.stderr);
+  assert.ok(
+    combined.includes(".gsd/") || combined.includes("No .gsd"),
+    `expected .gsd/ missing error, got:\n${combined.slice(0, 500)}`,
+  );
+
+  assertNoCrashMarkers(combined);
 });
 
 // ---------------------------------------------------------------------------
 // 14. gsd headless new-milestone without --context exits 1
 // ---------------------------------------------------------------------------
 
-test("gsd headless new-milestone without --context exits 1", async () => {
+test("gsd headless new-milestone without --context exits 1", async (t) => {
   const tmpDir = mkdtempSync(join(tmpdir(), "gsd-e2e-no-ctx-"));
 
-  try {
-    const result = await runGsd(["headless", "new-milestone"], 10_000, {}, tmpDir);
+  t.after(() => { rmSync(tmpDir, { recursive: true, force: true }); });
 
-    assert.ok(!result.timedOut, "process should not hang");
-    assert.strictEqual(result.code, 1, `expected exit 1, got ${result.code}`);
+  const result = await runGsd(["headless", "new-milestone"], 10_000, {}, tmpDir);
 
-    const combined = stripAnsi(result.stdout + result.stderr);
-    assert.ok(
-      combined.includes("context") || combined.includes("--context"),
-      `expected context-required error, got:\n${combined.slice(0, 500)}`,
-    );
+  assert.ok(!result.timedOut, "process should not hang");
+  assert.strictEqual(result.code, 1, `expected exit 1, got ${result.code}`);
 
-    assertNoCrashMarkers(combined);
-  } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
-  }
+  const combined = stripAnsi(result.stdout + result.stderr);
+  assert.ok(
+    combined.includes("context") || combined.includes("--context"),
+    `expected context-required error, got:\n${combined.slice(0, 500)}`,
+  );
+
+  assertNoCrashMarkers(combined);
 });
 
 // ---------------------------------------------------------------------------
 // 15. gsd headless --timeout with invalid value exits 1
 // ---------------------------------------------------------------------------
 
-test("gsd headless --timeout with invalid value exits 1", async () => {
+test("gsd headless --timeout with invalid value exits 1", async (t) => {
   const tmpDir = mkdtempSync(join(tmpdir(), "gsd-e2e-bad-timeout-"));
 
-  try {
-    const result = await runGsd(
-      ["headless", "--timeout", "not-a-number", "auto"],
-      10_000,
-      {},
-      tmpDir,
-    );
+  t.after(() => { rmSync(tmpDir, { recursive: true, force: true }); });
 
-    assert.ok(!result.timedOut, "process should not hang");
-    assert.strictEqual(result.code, 1, `expected exit 1, got ${result.code}`);
+  const result = await runGsd(
+    ["headless", "--timeout", "not-a-number", "auto"],
+    10_000,
+    {},
+    tmpDir,
+  );
 
-    const combined = stripAnsi(result.stdout + result.stderr);
-    assert.ok(
-      combined.includes("timeout") || combined.includes("positive integer"),
-      `expected timeout validation error, got:\n${combined.slice(0, 500)}`,
-    );
+  assert.ok(!result.timedOut, "process should not hang");
+  assert.strictEqual(result.code, 1, `expected exit 1, got ${result.code}`);
 
-    assertNoCrashMarkers(combined);
-  } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
-  }
+  const combined = stripAnsi(result.stdout + result.stderr);
+  assert.ok(
+    combined.includes("timeout") || combined.includes("positive integer"),
+    `expected timeout validation error, got:\n${combined.slice(0, 500)}`,
+  );
+
+  assertNoCrashMarkers(combined);
 });
 
 // ---------------------------------------------------------------------------
 // 16. gsd headless --timeout with negative value exits 1
 // ---------------------------------------------------------------------------
 
-test("gsd headless --timeout with negative value exits 1", async () => {
+test("gsd headless --timeout with negative value exits 1", async (t) => {
   const tmpDir = mkdtempSync(join(tmpdir(), "gsd-e2e-neg-timeout-"));
 
-  try {
-    const result = await runGsd(
-      ["headless", "--timeout", "-5000", "auto"],
-      10_000,
-      {},
-      tmpDir,
-    );
+  t.after(() => { rmSync(tmpDir, { recursive: true, force: true }); });
 
-    assert.ok(!result.timedOut, "process should not hang");
-    assert.strictEqual(result.code, 1, `expected exit 1, got ${result.code}`);
+  const result = await runGsd(
+    ["headless", "--timeout", "-5000", "auto"],
+    10_000,
+    {},
+    tmpDir,
+  );
 
-    const combined = stripAnsi(result.stdout + result.stderr);
-    assert.ok(
-      combined.includes("timeout") || combined.includes("positive integer"),
-      `expected timeout validation error, got:\n${combined.slice(0, 500)}`,
-    );
+  assert.ok(!result.timedOut, "process should not hang");
+  assert.strictEqual(result.code, 1, `expected exit 1, got ${result.code}`);
 
-    assertNoCrashMarkers(combined);
-  } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
-  }
+  const combined = stripAnsi(result.stdout + result.stderr);
+  assert.ok(
+    combined.includes("timeout") || combined.includes("positive integer"),
+    `expected timeout validation error, got:\n${combined.slice(0, 500)}`,
+  );
+
+  assertNoCrashMarkers(combined);
+});
+
+test("gsd headless query returns JSON from the built CLI", async (t) => {
+  const tmpDir = createTempGitRepo("gsd-e2e-query-");
+
+  t.after(() => { rmSync(tmpDir, { recursive: true, force: true }); });
+
+  mkdirSync(join(tmpDir, ".gsd", "milestones"), { recursive: true });
+
+  // Cold packaged startup in a fresh temp repo is now regularly >10s because
+  // the built CLI loads bundled TS resources through jiti before answering.
+  // This command is still healthy; it just needs a realistic timeout budget.
+  const result = await runGsd(["headless", "query"], 30_000, {}, tmpDir);
+
+  assert.ok(!result.timedOut, "process should not hang");
+  assert.strictEqual(result.code, 0, `expected exit 0, got ${result.code}`);
+
+  const combined = stripAnsi(result.stdout + result.stderr);
+  assertNoCrashMarkers(combined);
+
+  const snapshot = JSON.parse(result.stdout);
+  assert.equal(typeof snapshot.state?.phase, "string", "query output should include state.phase");
+});
+
+test("gsd worktree list loads the built worktree CLI without module errors", async (t) => {
+  const tmpDir = createTempGitRepo("gsd-e2e-worktree-");
+
+  t.after(() => { rmSync(tmpDir, { recursive: true, force: true }); });
+
+  // Cold packaged startup in a fresh temp repo is now regularly >10s because
+  // the built CLI loads bundled TS resources through jiti before listing.
+  const result = await runGsd(["worktree", "list"], 30_000, {}, tmpDir);
+
+  assert.ok(!result.timedOut, "process should not hang");
+  assert.strictEqual(result.code, 0, `expected exit 0, got ${result.code}`);
+
+  const combined = stripAnsi(result.stdout + result.stderr);
+  assertNoCrashMarkers(combined);
+  assert.ok(
+    combined.includes("No worktrees") || combined.includes("Worktrees"),
+    `expected worktree CLI output, got:\n${combined.slice(0, 500)}`,
+  );
 });
 
 // ===========================================================================

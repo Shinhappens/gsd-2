@@ -6,9 +6,28 @@
 npm install -g gsd-pi
 ```
 
-Requires Node.js ≥ 20.6.0 (22+ recommended) and Git.
+Requires Node.js ≥ 22.0.0 (24 LTS recommended) and Git.
 
-GSD checks for updates once every 24 hours. When a new version is available, you'll see an interactive prompt at startup with the option to update immediately or skip.
+> **`command not found: gsd`?** Your shell may not have npm's global bin directory in `$PATH`. Run `npm prefix -g` to find it, then add `$(npm prefix -g)/bin` to your PATH. See [Troubleshooting](./troubleshooting.md#command-not-found-gsd-after-install) for details.
+
+GSD checks for updates once every 24 hours. When a new version is available, you'll see an interactive prompt at startup with the option to update immediately or skip. You can also update from within a session with `/gsd update`.
+
+### Set up API keys
+
+If you use a non-Anthropic model, you'll need a search API key for web search. Run `/gsd config` to set keys globally — they're saved to `~/.gsd/agent/auth.json` and apply to all projects:
+
+```bash
+# Inside any GSD session:
+/gsd config
+```
+
+See [Global API Keys](./configuration.md#global-api-keys-gsd-config) for details on supported keys.
+
+### Set up custom MCP servers
+
+If you want GSD to call local or external MCP servers, add project-local config in `.mcp.json` or `.gsd/mcp.json`.
+
+See [Configuration → MCP Servers](./configuration.md#mcp-servers) for examples and verification steps.
 
 ### VS Code Extension
 
@@ -20,6 +39,10 @@ GSD is also available as a VS Code extension. Install from the marketplace (publ
 
 The CLI (`gsd-pi`) must be installed first — the extension connects to it via RPC.
 
+### Web Interface
+
+GSD also has a browser-based interface. Run `gsd --web` to start a local web server with a visual dashboard, real-time progress, and multi-project support. See [Web Interface](./web-interface.md) for details.
+
 ## First Launch
 
 Run `gsd` in any directory:
@@ -28,12 +51,14 @@ Run `gsd` in any directory:
 gsd
 ```
 
-On first launch, GSD runs a setup wizard:
+GSD displays a welcome screen showing your version, active model, and available tool keys. Then on first launch, it runs a setup wizard:
 
 1. **LLM Provider** — select from 20+ providers (Anthropic, OpenAI, Google, OpenRouter, GitHub Copilot, Amazon Bedrock, Azure, and more). OAuth flows handle Claude Max and Copilot subscriptions automatically; otherwise paste an API key.
 2. **Tool API Keys** (optional) — Brave Search, Context7, Jina, Slack, Discord. Press Enter to skip any.
 
 If you have an existing Pi installation, provider credentials are imported automatically.
+
+For detailed setup instructions for specific providers (OpenRouter, Ollama, LM Studio, vLLM, and more), see the [Provider Setup Guide](./providers.md).
 
 Re-run the wizard anytime with:
 
@@ -115,6 +140,8 @@ All state lives on disk in `.gsd/`:
   PROJECT.md          — what the project is right now
   REQUIREMENTS.md     — requirement contract (active/validated/deferred)
   DECISIONS.md        — append-only architectural decisions
+  KNOWLEDGE.md        — cross-session rules, patterns, and lessons
+  RUNTIME.md          — runtime context: API endpoints, env vars, services (v2.39)
   STATE.md            — quick-glance status
   milestones/
     M001/
@@ -151,3 +178,23 @@ Shows each session's date, message count, and first-message preview so you can c
 - [Auto Mode](./auto-mode.md) — deep dive into autonomous execution
 - [Configuration](./configuration.md) — model selection, timeouts, budgets
 - [Commands Reference](./commands.md) — all commands and shortcuts
+
+## Troubleshooting
+
+### `gsd` command runs `git svn dcommit` instead of GSD
+
+The [oh-my-zsh git plugin](https://github.com/ohmyzsh/ohmyzsh/tree/master/plugins/git) defines `alias gsd='git svn dcommit'`, which shadows the GSD binary.
+
+**Option 1** — Remove the alias in your `~/.zshrc` (add after the `source $ZSH/oh-my-zsh.sh` line):
+
+```bash
+unalias gsd 2>/dev/null
+```
+
+**Option 2** — Use the alternative binary name:
+
+```bash
+gsd-cli
+```
+
+Both `gsd` and `gsd-cli` point to the same binary.

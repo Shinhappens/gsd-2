@@ -8,8 +8,8 @@ import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } fr
 const decode = (s: string) => atob(s);
 const CLIENT_ID = decode("OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl");
 const AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
-const TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
-const REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback";
+const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const REDIRECT_URI = "https://platform.claude.com/oauth/code/callback";
 const SCOPES = "org:create_api_key user:profile user:inference";
 
 /**
@@ -61,6 +61,7 @@ export async function loginAnthropic(
 			redirect_uri: REDIRECT_URI,
 			code_verifier: verifier,
 		}),
+		signal: AbortSignal.timeout(30_000),
 	});
 
 	if (!tokenResponse.ok) {
@@ -97,6 +98,7 @@ export async function refreshAnthropicToken(refreshToken: string): Promise<OAuth
 			client_id: CLIENT_ID,
 			refresh_token: refreshToken,
 		}),
+		signal: AbortSignal.timeout(30_000),
 	});
 
 	if (!response.ok) {

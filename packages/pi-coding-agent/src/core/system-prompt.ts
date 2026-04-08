@@ -3,6 +3,7 @@
  */
 
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
+import { toPosixPath } from "../utils/path-display.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
 
 /** Tool descriptions for system prompt */
@@ -48,7 +49,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 	} = options;
-	const resolvedCwd = cwd ?? process.cwd();
+	const resolvedCwd = toPosixPath(cwd ?? process.cwd());
 
 	const now = new Date();
 	const dateTime = now.toLocaleString("en-US", {
@@ -83,15 +84,26 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 			}
 		}
 
-		// Append skills section (only if read tool is available)
-		const customPromptHasRead = !selectedTools || selectedTools.includes("read");
-		if (customPromptHasRead && skills.length > 0) {
+		// Append skills section (if read or Skill tool is available)
+		const customPromptHasSkillAccess = !selectedTools || selectedTools.includes("read") || selectedTools.includes("Skill");
+		if (customPromptHasSkillAccess && skills.length > 0) {
 			prompt += formatSkillsForPrompt(skills);
 		}
 
 		// Add date/time and working directory last
 		prompt += `\nCurrent date and time: ${dateTime}`;
 		prompt += `\nCurrent working directory: ${resolvedCwd}`;
+
+		// Append promptGuidelines from extension-registered tools.
+		// Without this, tools registered via pi.registerTool() with promptGuidelines
+		// have their definitions reach the API but the model has no guidance on when
+		// to use them (#1184).
+		if (promptGuidelines && promptGuidelines.length > 0) {
+			prompt += "\n\n";
+			for (const guideline of promptGuidelines) {
+				prompt += guideline + "\n";
+			}
+		}
 
 		return prompt;
 	}
@@ -220,8 +232,9 @@ Pi documentation (read only when the user asks about pi itself, its SDK, extensi
 		}
 	}
 
-	// Append skills section (only if read tool is available)
-	if (hasRead && skills.length > 0) {
+	// Append skills section (if read or Skill tool is available)
+	const hasSkill = tools.includes("Skill");
+	if ((hasRead || hasSkill) && skills.length > 0) {
 		prompt += formatSkillsForPrompt(skills);
 	}
 

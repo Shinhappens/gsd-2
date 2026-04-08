@@ -1,6 +1,6 @@
 You are interviewing the user to surface behavioural, UX, and usage grey areas for slice **{{sliceId}}: {{sliceTitle}}** of milestone **{{milestoneId}}**.
 
-Your goal is **not** to settle tech stack, naming conventions, or architecture — that happens during research and planning. Your goal is to produce a context file that captures the human decisions: what this slice should feel like, how it should behave, what edge cases matter, where scope begins and ends, and what the user cares about that won't be obvious from the roadmap entry alone.
+Your goal is **not** to center the discussion on tech stack trivia, naming conventions, or speculative architecture. Your goal is to produce a context file that captures the human decisions: what this slice should feel like, how it should behave, what edge cases matter, where scope begins and ends, and what the user cares about that won't be obvious from the roadmap entry alone. If a technical choice materially changes scope, proof, or integration behavior, ask it directly and capture it.
 
 {{inlinedContext}}
 
@@ -13,13 +13,18 @@ Your goal is **not** to settle tech stack, naming conventions, or architecture �
 Do a lightweight targeted investigation so your questions are grounded in reality:
 - Scout the codebase (`rg`, `find`, or `scout` for broad unfamiliar areas) to understand what already exists that this slice touches or builds on
 - Check the roadmap context above to understand what surrounds this slice — what comes before, what depends on it
+- Use `resolve_library` / `get_library_docs` for unfamiliar libraries — prefer this over `search-the-web` for library documentation
 - Identify the 3–5 biggest behavioural unknowns: things where the user's answer will materially change what gets built
+
+**Web search budget:** You have a limited number of web searches per turn (typically 3-5). Prefer `resolve_library` / `get_library_docs` for library documentation and `search_and_read` for one-shot topic research — they are more budget-efficient. Target 2-3 web searches in the investigation pass. Distribute remaining searches across subsequent question rounds rather than clustering them.
 
 Do **not** go deep — just enough that your questions reflect what's actually true rather than what you assume.
 
 ### Question rounds
 
-Ask **1–3 questions per round** using `ask_user_questions`. Keep each question focused on one of:
+**If `{{structuredQuestionsAvailable}}` is `true`:** Ask **1–3 questions per round** using `ask_user_questions`. **Call `ask_user_questions` exactly once per turn — never make multiple calls with the same or overlapping questions. Wait for the user's response before asking the next round.**
+**If `{{structuredQuestionsAvailable}}` is `false`:** Ask **1–3 questions per round** in plain text. Number them and wait for the user's response before asking the next round.
+Keep each question focused on one of:
 - **UX and user-facing behaviour** — what does the user see, click, trigger, or experience?
 - **Edge cases and failure states** — what happens when things go wrong or are in unusual states?
 - **Scope boundaries** — what is explicitly in vs out for this slice? What deferred to later?
@@ -27,17 +32,14 @@ Ask **1–3 questions per round** using `ask_user_questions`. Keep each question
 
 After the user answers, investigate further if any answer opens a new unknown, then ask the next round.
 
-### Check-in after each round
+### Round cadence
 
-After each round of answers, use `ask_user_questions` to ask:
+After each round of answers, decide whether you already have enough signal to write the slice context cleanly.
 
-> "I think I have a solid picture of this slice. Ready to wrap up and write the context file, or is there more to cover?"
-
-Options:
-- "Wrap up — write the context file" *(recommended after ~2–3 rounds)*
-- "Keep going — more to discuss"
-
-If the user wants to keep going, keep asking. Stop when they say wrap up.
+- **Incremental persistence:** After every 2 question rounds, silently save a draft `{{sliceId}}-CONTEXT-DRAFT.md` in `{{sliceDirPath}}` using `gsd_summary_save` with `milestone_id: {{milestoneId}}`, `slice_id: {{sliceId}}`, `artifact_type: "CONTEXT-DRAFT"`. This protects against session crashes losing confirmed work. Do NOT mention this to the user. The final context file will replace it.
+- If not, investigate any new unknowns and continue to the next round immediately. Do **not** ask a meta "ready to wrap up?" question after every round.
+- Ask a single wrap-up question only when you genuinely believe the slice is well understood or the user signals they want to stop.
+- When you do ask it, offer two choices: "Write the context file" *(recommended when the slice is well understood)* or "One more pass". Use `ask_user_questions` if available, otherwise ask in plain text.
 
 ---
 
@@ -47,7 +49,7 @@ Once the user is ready to wrap up:
 
 1. Use the **Slice Context** output template below
 2. `mkdir -p {{sliceDirPath}}`
-3. Write `{{contextPath}}` — use the template structure, filling in:
+3. Call `gsd_summary_save` with `milestone_id: {{milestoneId}}`, `slice_id: {{sliceId}}`, `artifact_type: "CONTEXT"`, and the context as `content` — the tool writes the file to disk and persists to DB. Use the template structure, filling in:
    - **Goal** — one sentence: what this slice delivers
    - **Why this Slice** — why now, what it unblocks
    - **Scope / In Scope** — what was confirmed in scope during the interview

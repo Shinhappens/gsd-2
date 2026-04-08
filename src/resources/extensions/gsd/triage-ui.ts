@@ -10,9 +10,10 @@
  */
 
 import type { ExtensionCommandContext } from "@gsd/pi-coding-agent";
-import { showNextAction } from "../shared/next-action-ui.js";
+import { showNextAction } from "../shared/tui.js";
 import type { CaptureEntry, Classification, TriageResult } from "./captures.js";
 import { markCaptureResolved } from "./captures.js";
+import { ensureDeferMilestoneDir } from "./triage-resolution.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -48,10 +49,18 @@ const CLASSIFICATION_LABELS: Record<Classification, { label: string; description
     label: "Note",
     description: "Informational only — no action needed.",
   },
+  "stop": {
+    label: "Stop",
+    description: "Halt auto-mode immediately — user directive to cease execution.",
+  },
+  "backtrack": {
+    label: "Backtrack",
+    description: "Abandon current milestone and return to a previous one.",
+  },
 };
 
 const ALL_CLASSIFICATIONS: Classification[] = [
-  "quick-task", "inject", "defer", "replan", "note",
+  "quick-task", "inject", "defer", "replan", "note", "stop", "backtrack",
 ];
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -82,8 +91,9 @@ export async function showTriageConfirmation(
     const capture = captureMap.get(result.captureId);
     if (!capture) continue;
 
-    // Auto-confirm note and defer — low-impact, no plan modification
-    if (result.classification === "note" || result.classification === "defer") {
+    // Auto-confirm note, defer, stop, and backtrack — low-impact or urgent directives
+    if (result.classification === "note" || result.classification === "defer"
+      || result.classification === "stop" || result.classification === "backtrack") {
       const resolution = result.classification === "note"
         ? "acknowledged as note"
         : `deferred${result.targetSlice ? ` to ${result.targetSlice}` : ""}`;
@@ -95,6 +105,12 @@ export async function showTriageConfirmation(
         resolution,
         result.rationale,
       );
+
+      // Create the milestone directory when deferring to a milestone that
+      // doesn't exist yet, so deriveState() discovers it.
+      if (result.classification === "defer" && result.targetSlice) {
+        ensureDeferMilestoneDir(basePath, result.targetSlice, [capture]);
+      }
 
       confirmed.push({
         captureId: result.captureId,
@@ -160,6 +176,11 @@ export async function showTriageConfirmation(
       resolution,
       userOverride ? `User override: ${result.rationale}` : result.rationale,
     );
+
+    // Create the milestone directory when user confirms/overrides to defer
+    if (finalClassification === "defer" && result.targetSlice) {
+      ensureDeferMilestoneDir(basePath, result.targetSlice, [capture]);
+    }
 
     confirmed.push({
       captureId: result.captureId,

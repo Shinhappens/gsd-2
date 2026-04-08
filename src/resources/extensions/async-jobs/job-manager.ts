@@ -22,6 +22,8 @@ export interface Job {
 	promise: Promise<void>;
 	resultText?: string;
 	errorText?: string;
+	/** Set by await_job when results are consumed. Suppresses follow-up delivery. */
+	awaited?: boolean;
 }
 
 export interface JobManagerOptions {
@@ -149,13 +151,6 @@ export class AsyncJobManager {
 	}
 
 	/**
-	 * No-op. Retained for API compatibility with await_job tool.
-	 */
-	acknowledgeDeliveries(_jobIds: string[]): void {
-		// Delivery is fire-once; no retries to cancel.
-	}
-
-	/**
 	 * Cleanup all timers and resources.
 	 */
 	shutdown(): void {
@@ -177,7 +172,10 @@ export class AsyncJobManager {
 
 	private deliverResult(job: Job): void {
 		if (!this.onJobComplete) return;
-		this.onJobComplete(job);
+		// Defer delivery by one microtask so await_job's .then() chain runs first
+		// and can set job.awaited = true before onJobComplete checks it (#2762).
+		const cb = this.onJobComplete;
+		queueMicrotask(() => cb(job));
 	}
 
 	private scheduleEviction(id: string): void {

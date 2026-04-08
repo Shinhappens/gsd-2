@@ -19,8 +19,22 @@ import { join } from "node:path";
 import { gsdRoot, resolveGsdRootFile } from "./paths.js";
 import { readCrashLock, isLockProcessAlive, clearLock } from "./crash-recovery.js";
 import { abortAndReset } from "./git-self-heal.js";
+import { rebuildState } from "./doctor.js";
+import { deriveState } from "./state.js";
+import { resolveMilestoneIntegrationBranch } from "./git-service.js";
+import { nativeIsRepo, nativeHasChanges, nativeLastCommitEpoch, nativeGetCurrentBranch, nativeAddTracked, nativeCommit } from "./native-git-bridge.js";
+import { loadEffectiveGSDPreferences } from "./preferences.js";
+import { runEnvironmentChecks } from "./doctor-environment.js";
 
 // ── Health Score Tracking ──────────────────────────────────────────────────
+
+/** Compact issue detail stored per snapshot for real-time visibility. */
+export interface HealthIssueDetail {
+  code: string;
+  message: string;
+  severity: "error" | "warning" | "info";
+  unitId: string;
+}
 
 export interface HealthSnapshot {
   timestamp: number;
@@ -28,6 +42,12 @@ export interface HealthSnapshot {
   warnings: number;
   fixesApplied: number;
   unitIndex: number; // which unit dispatch triggered this snapshot
+  /** Top issues from the doctor run that produced this snapshot. */
+  issues: HealthIssueDetail[];
+  /** Fixes that were auto-applied during this snapshot's doctor run. */
+  fixes: string[];
+  /** Milestone/slice scope this snapshot belongs to (e.g. "M001" or "M001/S02"). */
+  scope?: string;
 }
 
 /** In-memory health history for the current auto-mode session. */
@@ -39,11 +59,33 @@ let consecutiveErrorUnits = 0;
 /** Unit index counter for health tracking. */
 let healthUnitIndex = 0;
 
+/** Previous progress level for state transition detection. */
+let previousProgressLevel: "green" | "yellow" | "red" = "green";
+
+/** Callback for state transition notifications. Set by auto-mode. */
+let onLevelChange: ((from: string, to: string, summary: string) => void) | null = null;
+
+/**
+ * Register a callback for progress level transitions (green→yellow, yellow→red, etc.).
+ * Called once when auto-mode starts. Pass null to unregister.
+ */
+export function setLevelChangeCallback(cb: ((from: string, to: string, summary: string) => void) | null): void {
+  onLevelChange = cb;
+  previousProgressLevel = "green";
+}
+
 /**
  * Record a health snapshot after a doctor run.
- * Called from the post-unit hook in auto.ts.
+ * Called from the post-unit hook in auto-post-unit.ts.
  */
-export function recordHealthSnapshot(errors: number, warnings: number, fixesApplied: number): void {
+export function recordHealthSnapshot(
+  errors: number,
+  warnings: number,
+  fixesApplied: number,
+  issues?: HealthIssueDetail[],
+  fixes?: string[],
+  scope?: string,
+): void {
   healthUnitIndex++;
   healthHistory.push({
     timestamp: Date.now(),
@@ -51,6 +93,9 @@ export function recordHealthSnapshot(errors: number, warnings: number, fixesAppl
     warnings,
     fixesApplied,
     unitIndex: healthUnitIndex,
+    issues: issues ?? [],
+    fixes: fixes ?? [],
+    scope,
   });
 
   // Keep only the last 50 snapshots to bound memory
@@ -62,6 +107,19 @@ export function recordHealthSnapshot(errors: number, warnings: number, fixesAppl
     consecutiveErrorUnits++;
   } else {
     consecutiveErrorUnits = 0;
+  }
+
+  // Detect progress level transitions and notify
+  if (onLevelChange) {
+    const newLevel = consecutiveErrorUnits >= 3 ? "red"
+      : consecutiveErrorUnits >= 1 || getHealthTrend() === "degrading" ? "yellow"
+        : "green";
+    if (newLevel !== previousProgressLevel) {
+      const topIssue = (issues ?? []).find(i => i.severity === "error") ?? (issues ?? [])[0];
+      const detail = topIssue ? `: ${topIssue.message}` : "";
+      onLevelChange(previousProgressLevel, newLevel, `Health ${previousProgressLevel} → ${newLevel}${detail}`);
+      previousProgressLevel = newLevel;
+    }
   }
 }
 
@@ -101,12 +159,34 @@ export function getHealthHistory(): readonly HealthSnapshot[] {
 }
 
 /**
+ * Get the latest health issues from the most recent snapshot.
+ * Returns issues from the last snapshot that had any, for real-time visibility.
+ */
+export function getLatestHealthIssues(): HealthIssueDetail[] {
+  for (let i = healthHistory.length - 1; i >= 0; i--) {
+    if (healthHistory[i]!.issues.length > 0) return healthHistory[i]!.issues;
+  }
+  return [];
+}
+
+/**
+ * Get the latest fixes applied from the most recent snapshot.
+ */
+export function getLatestHealthFixes(): string[] {
+  for (let i = healthHistory.length - 1; i >= 0; i--) {
+    if (healthHistory[i]!.fixes.length > 0) return healthHistory[i]!.fixes;
+  }
+  return [];
+}
+
+/**
  * Reset health tracking state. Called on auto-mode start/stop.
  */
 export function resetHealthTracking(): void {
   healthHistory = [];
   consecutiveErrorUnits = 0;
   healthUnitIndex = 0;
+  previousProgressLevel = "green";
 }
 
 // ── Pre-Dispatch Health Gate ───────────────────────────────────────────────
@@ -131,7 +211,7 @@ export interface PreDispatchHealthResult {
  *
  * Returns { proceed: true } if dispatch should continue.
  */
-export function preDispatchHealthGate(basePath: string): PreDispatchHealthResult {
+export async function preDispatchHealthGate(basePath: string): Promise<PreDispatchHealthResult> {
   const issues: string[] = [];
   const fixesApplied: string[] = [];
 
@@ -172,17 +252,94 @@ export function preDispatchHealthGate(basePath: string): PreDispatchHealthResult
   }
 
   // ── STATE.md existence check ──
-  // If STATE.md is missing, deriveState will still work but the LLM
-  // may get confused. Rebuild it silently.
+  // If STATE.md is missing, attempt to rebuild it for the next unit's context.
+  // Non-blocking — fresh worktrees won't have it until the first unit completes (#889).
   try {
     const stateFile = resolveGsdRootFile(basePath, "STATE");
     const milestonesDir = join(gsdRoot(basePath), "milestones");
     if (existsSync(milestonesDir) && !existsSync(stateFile)) {
-      issues.push("STATE.md missing — will rebuild after this unit");
-      // Don't block dispatch — rebuilding happens in post-hook
+      try {
+        await rebuildState(basePath);
+        fixesApplied.push("rebuilt missing STATE.md before dispatch");
+      } catch {
+        // Rebuild failed — non-blocking, dispatch continues
+        fixesApplied.push("STATE.md missing — will rebuild after first unit completes");
+      }
+    }
+  } catch {
+    // Non-fatal — dispatch continues without STATE.md if rebuild fails
+  }
+
+  // ── Integration branch existence check ──
+  // If the active milestone's recorded integration branch no longer exists in
+  // git, the merge-back at the end of the milestone will fail. Block dispatch
+  // now to surface this before work is lost.
+  try {
+    if (nativeIsRepo(basePath)) {
+      const state = await deriveState(basePath);
+      if (state.activeMilestone) {
+        const gitPrefs = loadEffectiveGSDPreferences()?.preferences?.git ?? {};
+        const resolution = resolveMilestoneIntegrationBranch(basePath, state.activeMilestone.id, gitPrefs);
+        if (resolution.status === "fallback" && resolution.effectiveBranch) {
+          fixesApplied.push(
+            `using fallback integration branch "${resolution.effectiveBranch}" for milestone ${state.activeMilestone.id}; recorded "${resolution.recordedBranch}" no longer exists`,
+          );
+        } else if (resolution.recordedBranch && resolution.status === "missing") {
+          issues.push(
+            `${resolution.reason} Restore the branch or update the integration branch before dispatching. Run /gsd doctor for details.`,
+          );
+        }
+      }
+    }
+  } catch {
+    // Non-fatal — dispatch continues if state/branch check fails
+  }
+
+  // ── Stale uncommitted changes — auto-snapshot before dispatch ──
+  // If the working tree is dirty and no commit has happened recently,
+  // create a safety snapshot so work isn't lost if the next unit crashes.
+  try {
+    if (nativeIsRepo(basePath)) {
+      const prefs = loadEffectiveGSDPreferences()?.preferences ?? {};
+      const thresholdMinutes = prefs.stale_commit_threshold_minutes ?? 30;
+
+      if (thresholdMinutes > 0 && nativeHasChanges(basePath)) {
+        const branch = nativeGetCurrentBranch(basePath);
+        const lastEpoch = nativeLastCommitEpoch(basePath, branch || "HEAD");
+        const nowEpoch = Math.floor(Date.now() / 1000);
+        const minutesSinceCommit = lastEpoch > 0 ? (nowEpoch - lastEpoch) / 60 : Infinity;
+
+        if (minutesSinceCommit >= thresholdMinutes) {
+          const mins = Math.floor(minutesSinceCommit);
+          try {
+            nativeAddTracked(basePath);
+            const commitMsg = `gsd snapshot: pre-dispatch, uncommitted changes after ${mins}m inactivity`;
+            const result = nativeCommit(basePath, commitMsg);
+            if (result) {
+              fixesApplied.push(`pre-dispatch: created gsd snapshot after ${mins}m of uncommitted changes`);
+            }
+          } catch {
+            // Non-blocking — snapshot failed but dispatch can continue
+            fixesApplied.push("pre-dispatch: gsd snapshot failed");
+          }
+        }
+      }
     }
   } catch {
     // Non-fatal
+  }
+
+  // ── Disk space check ──
+  // Catches low-disk conditions before dispatch rather than letting the unit
+  // fail mid-execution with ENOSPC (which wastes a full LLM turn).
+  try {
+    const envResults = runEnvironmentChecks(basePath);
+    const diskError = envResults.find(r => r.name === "disk_space" && r.status === "error");
+    if (diskError) {
+      issues.push(`${diskError.message}${diskError.detail ? ` — ${diskError.detail}` : ""}`);
+    }
+  } catch {
+    // Non-fatal — dispatch continues if env check fails
   }
 
   // If we had critical issues that couldn't be auto-healed, block dispatch
@@ -255,26 +412,48 @@ export function resetEscalation(): void {
 
 /**
  * Format a health summary for display in the auto-mode dashboard.
+ * Human-readable with full words, not abbreviations.
  */
 export function formatHealthSummary(): string {
   if (healthHistory.length === 0) return "No health data yet.";
 
   const latest = healthHistory[healthHistory.length - 1]!;
   const trend = getHealthTrend();
-  const trendIcon = trend === "improving" ? "+" : trend === "degrading" ? "-" : "=";
+  const trendLabel = trend === "improving" ? "improving"
+    : trend === "degrading" ? "degrading"
+      : trend === "stable" ? "stable"
+        : "unknown";
   const totalFixes = healthHistory.reduce((sum, s) => sum + s.fixesApplied, 0);
 
-  const parts = [
-    `Health: ${latest.errors}E/${latest.warnings}W`,
-    `trend:${trendIcon}`,
-    `fixes:${totalFixes}`,
-  ];
+  const parts: string[] = [];
 
-  if (consecutiveErrorUnits > 0) {
-    parts.push(`streak:${consecutiveErrorUnits}/${ESCALATION_THRESHOLD}`);
+  // Error/warning summary
+  if (latest.errors === 0 && latest.warnings === 0) {
+    parts.push("No issues");
+  } else {
+    const counts: string[] = [];
+    if (latest.errors > 0) counts.push(`${latest.errors} error${latest.errors > 1 ? "s" : ""}`);
+    if (latest.warnings > 0) counts.push(`${latest.warnings} warning${latest.warnings > 1 ? "s" : ""}`);
+    parts.push(counts.join(", "));
   }
 
-  return parts.join(" | ");
+  parts.push(`trend ${trendLabel}`);
+
+  if (totalFixes > 0) {
+    parts.push(`${totalFixes} fix${totalFixes > 1 ? "es" : ""} applied`);
+  }
+
+  if (consecutiveErrorUnits > 0) {
+    parts.push(`${consecutiveErrorUnits} of ${ESCALATION_THRESHOLD} consecutive errors before escalation`);
+  }
+
+  // Include top issue from latest snapshot
+  if (latest.issues.length > 0) {
+    const topIssue = latest.issues.find(i => i.severity === "error") ?? latest.issues[0]!;
+    parts.push(`latest: ${topIssue.message}`);
+  }
+
+  return parts.join(" · ");
 }
 
 /**

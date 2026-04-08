@@ -42,6 +42,7 @@ export default function AsyncJobs(pi: ExtensionAPI) {
 
 		manager = new AsyncJobManager({
 			onJobComplete: (job) => {
+				if (job.awaited) return;
 				const statusEmoji = job.status === "completed" ? "done" : "error";
 				const elapsed = ((Date.now() - job.startTime) / 1000).toFixed(1);
 				const output = job.status === "completed"
@@ -54,6 +55,14 @@ export default function AsyncJobs(pi: ExtensionAPI) {
 					? output.slice(0, maxLen) + "\n\n[... truncated, use await_job for full output]"
 					: output;
 
+				// Deliver as follow-up without triggering a new LLM turn (#875).
+				// When the agent is streaming: the message is queued and picked up
+				// by the agent loop's getFollowUpMessages() after the current turn.
+				// When the agent is idle: the message is appended to context so it's
+				// visible on the next user-initiated prompt. Previously triggerTurn:true
+				// caused spurious autonomous turns — the model would interpret completed
+				// job output as requiring action and cascade into unbounded self-reinforcing
+				// loops (running more commands, spawning more jobs, burning context).
 				pi.sendMessage(
 					{
 						customType: "async_job_result",
@@ -64,10 +73,21 @@ export default function AsyncJobs(pi: ExtensionAPI) {
 						].join("\n"),
 						display: true,
 					},
-					{ deliverAs: "followUp", triggerTurn: true },
+					{ deliverAs: "followUp" },
 				);
 			},
 		});
+	});
+
+	pi.on("session_before_switch", async () => {
+		if (manager) {
+			// Cancel all running background jobs — their results are no longer
+			// relevant to the new session and would produce wasteful follow-up
+			// notifications that trigger empty LLM turns (#1642).
+			for (const job of manager.getRunningJobs()) {
+				manager.cancel(job.id);
+			}
+		}
 	});
 
 	pi.on("session_shutdown", async () => {

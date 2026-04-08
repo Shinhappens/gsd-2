@@ -13,9 +13,11 @@ import {
 	statSync,
 	writeFileSync,
 } from "fs";
+import { atomicWriteFileSync } from "./fs-utils.js";
 import { readdir, readFile, stat } from "fs/promises";
 import { join, resolve } from "path";
 import { getAgentDir as getDefaultAgentDir, getBlobsDir, getSessionsDir } from "../config.js";
+import { tryAcquireLockSync } from "./lock-utils.js";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -24,6 +26,25 @@ import {
 	createCustomMessage,
 } from "./messages.js";
 import { BlobStore, externalizeImageData, isBlobRef, resolveImageData } from "./blob-store.js";
+
+/** Inline concurrency limiter to cap parallel async operations. */
+function pLimit(concurrency: number) {
+	const queue: (() => void)[] = [];
+	let active = 0;
+	return <T>(fn: () => Promise<T>): Promise<T> => {
+		return new Promise<T>((resolve, reject) => {
+			const run = () => {
+				active++;
+				fn().then(resolve, reject).finally(() => {
+					active--;
+					if (queue.length > 0) queue.shift()!();
+				});
+			};
+			if (active < concurrency) run();
+			else queue.push(run);
+		});
+	};
+}
 
 const BLOB_EXTERNALIZE_THRESHOLD = 1024; // 1KB minimum to externalize
 const MAX_PERSIST_CHARS = 500_000;
@@ -556,8 +577,7 @@ function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobStore): v
 	}
 }
 
-/** Exported for testing */
-export function loadEntriesFromFile(filePath: string): FileEntry[] {
+function loadEntriesFromFile(filePath: string): FileEntry[] {
 	if (!existsSync(filePath)) return [];
 
 	const content = readFileSync(filePath, "utf8");
@@ -599,8 +619,7 @@ function isValidSessionFile(filePath: string): boolean {
 	}
 }
 
-/** Exported for testing */
-export function findMostRecentSession(sessionDir: string): string | null {
+function findMostRecentSession(sessionDir: string): string | null {
 	try {
 		const files = readdirSync(sessionDir)
 			.filter((f) => f.endsWith(".jsonl"))
@@ -821,6 +840,37 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Check if the last assistant turn in the session appears to have been
+	 * interrupted (e.g., the last message is from the assistant with tool_use
+	 * blocks but no subsequent tool_result message).
+	 */
+	wasInterrupted(): boolean {
+		// Walk backwards to find the last message entry
+		for (let i = this.fileEntries.length - 1; i >= 0; i--) {
+			const entry = this.fileEntries[i];
+			if (entry.type !== "message") continue;
+
+			const msg = entry.message;
+			if (msg.role === "user") return false; // clean user turn boundary
+			if (msg.role === "assistant") {
+				// Check if the assistant message contains tool_use blocks
+				const content = Array.isArray(msg.content) ? msg.content : [];
+				const hasToolUse = content.some(
+					(block) => block.type === "toolCall",
+				);
+				if (hasToolUse) {
+					// If the last message is an assistant tool_use with no following
+					// tool_result message, the turn was likely interrupted
+					return true;
+				}
+				return false; // assistant message without tool_use = completed text response
+			}
+			return false;
+		}
+		return false;
+	}
+
 	/** Switch to a different session file (used for resume and branching) */
 	setSessionFile(sessionFile: string): void {
 		this.sessionFile = resolve(sessionFile);
@@ -906,7 +956,13 @@ export class SessionManager {
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
-		writeFileSync(this.sessionFile, content);
+		let release: (() => void) | undefined;
+		try {
+			release = tryAcquireLockSync(this.sessionFile);
+			atomicWriteFileSync(this.sessionFile, content);
+		} finally {
+			release?.();
+		}
 	}
 
 	isPersisted(): boolean {
@@ -939,15 +995,21 @@ export class SessionManager {
 			return;
 		}
 
-		if (!this.flushed) {
-			for (const e of this.fileEntries) {
-				const prepared = prepareForPersistence(e, this.blobStore) as FileEntry;
+		let release: (() => void) | undefined;
+		try {
+			release = tryAcquireLockSync(this.sessionFile);
+			if (!this.flushed) {
+				for (const e of this.fileEntries) {
+					const prepared = prepareForPersistence(e, this.blobStore) as FileEntry;
+					appendFileSync(this.sessionFile, `${JSON.stringify(prepared)}\n`);
+				}
+				this.flushed = true;
+			} else {
+				const prepared = prepareForPersistence(entry, this.blobStore) as FileEntry;
 				appendFileSync(this.sessionFile, `${JSON.stringify(prepared)}\n`);
 			}
-			this.flushed = true;
-		} else {
-			const prepared = prepareForPersistence(entry, this.blobStore) as FileEntry;
-			appendFileSync(this.sessionFile, `${JSON.stringify(prepared)}\n`);
+		} finally {
+			release?.();
 		}
 	}
 
@@ -1495,14 +1557,14 @@ export class SessionManager {
 			cwd: targetCwd,
 			parentSession: sourcePath,
 		};
-		appendFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`);
-
-		// Copy all non-header entries from source
+		// Build complete fork content and write atomically to prevent partial files on crash
+		const lines = [JSON.stringify(newHeader)];
 		for (const entry of sourceEntries) {
 			if (entry.type !== "session") {
-				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
+				lines.push(JSON.stringify(entry));
 			}
 		}
+		atomicWriteFileSync(newSessionFile, lines.join("\n") + "\n");
 
 		return new SessionManager(targetCwd, dir, newSessionFile, true);
 	}
@@ -1552,13 +1614,17 @@ export class SessionManager {
 			const sessions: SessionInfo[] = [];
 			const allFiles = dirFiles.flat();
 
+			// Limit concurrency to avoid memory spikes with many session files
+			const limit = pLimit(10);
 			const results = await Promise.all(
-				allFiles.map(async (file) => {
-					const info = await buildSessionInfo(file);
-					loaded++;
-					onProgress?.(loaded, totalFiles);
-					return info;
-				}),
+				allFiles.map((file) =>
+					limit(async () => {
+						const info = await buildSessionInfo(file);
+						loaded++;
+						onProgress?.(loaded, totalFiles);
+						return info;
+					}),
+				),
 			);
 
 			for (const info of results) {

@@ -8,6 +8,22 @@
 - {{mustHave}}
 - {{mustHave}}
 
+## Threat Surface
+
+<!-- Q3: How can this be exploited? OMIT ENTIRELY for simple slices with no auth, user input, or data exposure. -->
+
+- **Abuse**: {{abuseScenarios — parameter tampering, replay, privilege escalation, or N/A}}
+- **Data exposure**: {{sensitiveDataAccessible — PII, tokens, secrets, or none}}
+- **Input trust**: {{untrustedInput — user input reaching DB/API/filesystem, or none}}
+
+## Requirement Impact
+
+<!-- Q4: What existing promises does this break? OMIT ENTIRELY if no existing requirements are affected. -->
+
+- **Requirements touched**: {{requirementIds — e.g. R001, R003, or none}}
+- **Re-verify**: {{whatMustBeRetested — e.g. login flow, API contract, or N/A}}
+- **Decisions revisited**: {{decisionIds — e.g. D002, or none}}
+
 ## Proof Level
 
 <!-- Omit this section entirely for simple slices where the answer is trivially obvious. -->
@@ -112,6 +128,14 @@
   - Mark done:     change [ ] to [x]
   - Tasks execute sequentially in order (T01, T02, T03, ...)
   - est: is informational (e.g. 30m, 1h, 2h) and optional
+
+  Verify field rules:
+  - MUST be a mechanically executable command: `npm test`, `grep -q "pattern" file`, `test -f path`
+  - For content/document tasks: verify file existence, section count, YAML validity, or word count
+    NOT exact phrasing, specific formulas, or "zero TBD" aspirational criteria
+  - If no command can verify the output, write: "Manual review — file exists and is non-empty"
+  - BAD: "Sections 3.1 and 3.2 exist with exact formulas. Zero TBD/TODO."
+  - GOOD: `grep -c "^## " doc.md` returns >= 4 (4+ sections), `! grep -q "TBD\|TODO" doc.md`
 
   Integration closure rule:
   - At least one slice in any multi-boundary milestone should perform real composition/wiring, not just contract hardening

@@ -2,11 +2,16 @@
  * Extension system for lifecycle events and custom tools.
  */
 
+export type { ExtensionManifest } from "./extension-manifest.js";
+export { readManifest, readManifestFromEntryPath } from "./extension-manifest.js";
+export type { SortResult, SortWarning } from "./extension-sort.js";
+export { sortExtensionPaths } from "./extension-sort.js";
 export type { SlashCommandInfo, SlashCommandLocation, SlashCommandSource } from "../slash-commands.js";
 export {
 	createExtensionRuntime,
 	discoverAndLoadExtensions,
 	getUntrustedExtensionPaths,
+	importExtensionModule,
 	isProjectTrusted,
 	loadExtensionFromFactory,
 	loadExtensions,
@@ -29,7 +34,6 @@ export type {
 	AgentToolUpdateCallback,
 	// App keybindings (for custom editors)
 	AppAction,
-	AppendEntryHandler,
 	// Events - Tool (ToolCallEvent types)
 	BashToolCallEvent,
 	BashToolResultEvent,
@@ -72,10 +76,6 @@ export type {
 	ExtensionWidgetOptions,
 	FindToolCallEvent,
 	FindToolResultEvent,
-	GetActiveToolsHandler,
-	GetAllToolsHandler,
-	GetCommandsHandler,
-	GetThinkingLevelHandler,
 	GrepToolCallEvent,
 	GrepToolResultEvent,
 	// Events - Input
@@ -98,6 +98,11 @@ export type {
 	// Provider Registration
 	ProviderConfig,
 	ProviderModelConfig,
+	LifecycleHookContext,
+	LifecycleHookHandler,
+	LifecycleHookMap,
+	LifecycleHookPhase,
+	LifecycleHookScope,
 	ReadToolCallEvent,
 	ReadToolResultEvent,
 	// Commands
@@ -106,8 +111,6 @@ export type {
 	// Events - Resources
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
-	SendMessageHandler,
-	SendUserMessageHandler,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,
@@ -127,10 +130,6 @@ export type {
 	SessionStartEvent,
 	SessionSwitchEvent,
 	SessionTreeEvent,
-	SetActiveToolsHandler,
-	SetLabelHandler,
-	SetModelHandler,
-	SetThinkingLevelHandler,
 	TerminalInputHandler,
 	// Events - Tool
 	ToolCallEvent,
@@ -151,21 +150,14 @@ export type {
 	// Events - User Bash
 	UserBashEvent,
 	UserBashEventResult,
+	BashTransformEvent,
+	BashTransformEventResult,
 	WidgetPlacement,
 	WriteToolCallEvent,
 	WriteToolResultEvent,
 } from "./types.js";
 // Type guards
-export {
-	isBashToolResult,
-	isEditToolResult,
-	isFindToolResult,
-	isGrepToolResult,
-	isLsToolResult,
-	isReadToolResult,
-	isToolCallEventType,
-	isWriteToolResult,
-} from "./types.js";
+export { isToolCallEventType, isToolResultEventType } from "./types.js";
 export {
 	wrapRegisteredTool,
 	wrapRegisteredTools,

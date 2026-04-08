@@ -4,29 +4,30 @@
 // Pure functions, zero Pi dependencies - uses only Node built-ins.
 
 import { promises as fs } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { resolve } from 'node:path';
+import { atomicWriteAsync } from './atomic-write.js';
 import { resolveMilestoneFile, relMilestoneFile, resolveGsdRootFile } from './paths.js';
-import { milestoneIdSort, findMilestoneIds } from './guided-flow.js';
+import { milestoneIdSort, findMilestoneIds } from './milestone-ids.js';
 
 import type {
-  Roadmap, BoundaryMapEntry,
-  SlicePlan, TaskPlanEntry,
+  TaskPlanFile, TaskPlanFrontmatter,
   Summary, SummaryFrontmatter, SummaryRequires, FileModified,
   Continue, ContinueFrontmatter, ContinueStatus,
   RequirementCounts,
+  TaskIO,
   SecretsManifest, SecretsManifestEntry, SecretsManifestEntryStatus,
   ManifestStatus,
 } from './types.js';
 
-import { checkExistingEnvKeys } from '../get-secrets-from-user.js';
-import { parseRoadmapSlices } from './roadmap-slices.js';
-import { nativeParseRoadmap, nativeExtractSection, nativeParsePlanFile, nativeParseSummaryFile, NATIVE_UNAVAILABLE } from './native-parser-bridge.js';
-import { debugTime, debugCount } from './debug-logger.js';
+import { checkExistingEnvKeys } from './env-utils.js';
+import { nativeExtractSection, nativeParseSummaryFile, NATIVE_UNAVAILABLE } from './native-parser-bridge.js';
+import { CACHE_MAX } from './constants.js';
+import { splitFrontmatter, parseFrontmatterMap } from '../shared/frontmatter.js';
+
+// Re-export for downstream consumers
+export { splitFrontmatter, parseFrontmatterMap };
 
 // ─── Parse Cache ──────────────────────────────────────────────────────────
-
-const CACHE_MAX = 50;
 
 /** Fast composite key: length + first/mid/last 100 chars. The middle sample
  *  prevents collisions when only a few characters change in the interior of
@@ -51,118 +52,44 @@ function cachedParse<T>(content: string, tag: string, parseFn: (c: string) => T)
   return result;
 }
 
-/** Clear the module-scoped parse cache. Call when files change on disk. */
+// ─── Cross-module cache clear registry ────────────────────────────────────
+// parsers-legacy.ts registers its cache-clear callback here at module init
+// to avoid circular imports. clearParseCache() calls all registered callbacks.
+const _cacheClearCallbacks: (() => void)[] = [];
+
+/** Register a callback to be invoked when clearParseCache() is called.
+ *  Used by parsers-legacy.ts to synchronously clear its own cache. */
+export function registerCacheClearCallback(cb: () => void): void {
+  _cacheClearCallbacks.push(cb);
+}
+
+/** Clear the module-scoped parse cache. Call when files change on disk.
+ *  Also clears any registered external caches (e.g. parsers-legacy.ts). */
 export function clearParseCache(): void {
   _parseCache.clear();
+  for (const cb of _cacheClearCallbacks) cb();
+}
+
+// ─── Platform shortcuts ───────────────────────────────────────────────────
+
+const IS_MAC = process.platform === "darwin";
+
+/**
+ * Format a keyboard shortcut for the current OS.
+ * Input: modifier key combo like "Ctrl+Alt+G"
+ * Output: "⌃⌥G" on macOS, "Ctrl+Alt+G" on Windows/Linux.
+ */
+export function formatShortcut(combo: string): string {
+  if (!IS_MAC) return combo;
+  return combo
+    .replace(/Ctrl\+Alt\+/i, "⌃⌥")
+    .replace(/Ctrl\+/i, "⌃")
+    .replace(/Alt\+/i, "⌥")
+    .replace(/Shift\+/i, "⇧")
+    .replace(/Cmd\+/i, "⌘");
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
-
-/**
- * Split markdown content into frontmatter (YAML-like) and body.
- * Returns [frontmatterLines, body] where frontmatterLines is null if no frontmatter.
- */
-export function splitFrontmatter(content: string): [string[] | null, string] {
-  const trimmed = content.trimStart();
-  if (!trimmed.startsWith('---')) return [null, content];
-
-  const afterFirst = trimmed.indexOf('\n');
-  if (afterFirst === -1) return [null, content];
-
-  const rest = trimmed.slice(afterFirst + 1);
-  const endIdx = rest.indexOf('\n---');
-  if (endIdx === -1) return [null, content];
-
-  const fmLines = rest.slice(0, endIdx).split('\n');
-  const body = rest.slice(endIdx + 4).replace(/^\n+/, '');
-  return [fmLines, body];
-}
-
-/**
- * Parse YAML-like frontmatter lines into a flat key-value map.
- * Handles simple scalars and arrays (lines starting with "  - ").
- * Handles nested objects like requires (lines with "    key: value").
- */
-export function parseFrontmatterMap(lines: string[]): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  let currentKey: string | null = null;
-  let currentArray: unknown[] | null = null;
-  let currentObj: Record<string, string> | null = null;
-
-  for (const line of lines) {
-    // Nested object property (4-space indent with key: value)
-    const nestedMatch = line.match(/^    (\w[\w_]*)\s*:\s*(.*)$/);
-    if (nestedMatch && currentArray && currentObj) {
-      currentObj[nestedMatch[1]] = nestedMatch[2].trim();
-      continue;
-    }
-
-    // Array item (2-space indent)
-    const arrayMatch = line.match(/^  - (.*)$/);
-    if (arrayMatch && currentKey) {
-      // If there's a pending nested object, push it
-      if (currentObj && Object.keys(currentObj).length > 0) {
-        currentArray!.push(currentObj);
-      }
-      currentObj = null;
-
-      const val = arrayMatch[1].trim();
-      if (!currentArray) currentArray = [];
-
-      // Check if this array item starts a nested object (e.g. "- slice: S00")
-      const nestedStart = val.match(/^(\w[\w_]*)\s*:\s*(.*)$/);
-      if (nestedStart) {
-        currentObj = { [nestedStart[1]]: nestedStart[2].trim() };
-      } else {
-        currentArray.push(val);
-      }
-      continue;
-    }
-
-    // Flush previous key
-    if (currentKey) {
-      if (currentObj && Object.keys(currentObj).length > 0 && currentArray) {
-        currentArray.push(currentObj);
-        currentObj = null;
-      }
-      if (currentArray) {
-        result[currentKey] = currentArray;
-      }
-      currentArray = null;
-    }
-
-    // Top-level key: value
-    const kvMatch = line.match(/^(\w[\w_]*)\s*:\s*(.*)$/);
-    if (kvMatch) {
-      currentKey = kvMatch[1];
-      const val = kvMatch[2].trim();
-
-      if (val === '' || val === '[]') {
-        currentArray = [];
-      } else if (val.startsWith('[') && val.endsWith(']')) {
-        const inner = val.slice(1, -1).trim();
-        result[currentKey] = inner ? inner.split(',').map(s => s.trim()) : [];
-        currentKey = null;
-      } else {
-        result[currentKey] = val;
-        currentKey = null;
-      }
-    }
-  }
-
-  // Flush final key
-  if (currentKey) {
-    if (currentObj && Object.keys(currentObj).length > 0 && currentArray) {
-      currentArray.push(currentObj);
-      currentObj = null;
-    }
-    if (currentArray) {
-      result[currentKey] = currentArray;
-    }
-  }
-
-  return result;
-}
 
 /** Extract the text after a heading at a given level, up to the next heading of same or higher level. */
 export function extractSection(body: string, heading: string, level: number = 2): string | null {
@@ -217,95 +144,6 @@ export function extractBoldField(text: string, key: string): string | null {
   const regex = new RegExp(`^\\*\\*${escapeRegex(key)}:\\*\\*\\s*(.+)$`, 'm');
   const match = regex.exec(text);
   return match ? match[1].trim() : null;
-}
-
-// ─── Roadmap Parser ────────────────────────────────────────────────────────
-
-export function parseRoadmap(content: string): Roadmap {
-  return cachedParse(content, 'roadmap', _parseRoadmapImpl);
-}
-
-function _parseRoadmapImpl(content: string): Roadmap {
-  const stopTimer = debugTime("parse-roadmap");
-  // Try native parser first for better performance
-  const nativeResult = nativeParseRoadmap(content);
-  if (nativeResult) {
-    stopTimer({ native: true, slices: nativeResult.slices.length, boundaryEntries: nativeResult.boundaryMap.length });
-    debugCount("parseRoadmapCalls");
-    return nativeResult;
-  }
-
-  const lines = content.split('\n');
-
-  const h1 = lines.find(l => l.startsWith('# '));
-  const title = h1 ? h1.slice(2).trim() : '';
-  const vision = extractBoldField(content, 'Vision') || '';
-
-  const scSection = extractSection(content, 'Success Criteria', 2) ||
-    (() => {
-      const idx = content.indexOf('**Success Criteria:**');
-      if (idx === -1) return '';
-      const rest = content.slice(idx);
-      const nextSection = rest.indexOf('\n---');
-      const block = rest.slice(0, nextSection === -1 ? undefined : nextSection);
-      const firstNewline = block.indexOf('\n');
-      return firstNewline === -1 ? '' : block.slice(firstNewline + 1);
-    })();
-  const successCriteria = scSection ? parseBullets(scSection) : [];
-
-  // Slices
-  const slices = parseRoadmapSlices(content);
-
-  // Boundary map
-  const boundaryMap: BoundaryMapEntry[] = [];
-  const bmSection = extractSection(content, 'Boundary Map');
-
-  if (bmSection) {
-    const h3Sections = extractAllSections(bmSection, 3);
-    for (const [heading, sectionContent] of h3Sections) {
-      const arrowMatch = heading.match(/^(\S+)\s*→\s*(\S+)/);
-      if (!arrowMatch) continue;
-
-      const fromSlice = arrowMatch[1];
-      const toSlice = arrowMatch[2];
-
-      let produces = '';
-      let consumes = '';
-
-      // Use indexOf-based parsing instead of [\s\S]*? regex to avoid
-      // catastrophic backtracking on content with code fences (#468).
-      const prodIdx = sectionContent.search(/^Produces:\s*$/m);
-      if (prodIdx !== -1) {
-        const afterProd = sectionContent.indexOf('\n', prodIdx);
-        if (afterProd !== -1) {
-          const consIdx = sectionContent.search(/^Consumes/m);
-          const endIdx = consIdx !== -1 && consIdx > afterProd ? consIdx : sectionContent.length;
-          produces = sectionContent.slice(afterProd + 1, endIdx).trim();
-        }
-      }
-
-      const consLineMatch = sectionContent.match(/^Consumes[^:]*:\s*(.+)$/m);
-      if (consLineMatch) {
-        consumes = consLineMatch[1].trim();
-      }
-      if (!consumes) {
-        const consIdx = sectionContent.search(/^Consumes[^:]*:\s*$/m);
-        if (consIdx !== -1) {
-          const afterCons = sectionContent.indexOf('\n', consIdx);
-          if (afterCons !== -1) {
-            consumes = sectionContent.slice(afterCons + 1).trim();
-          }
-        }
-      }
-
-      boundaryMap.push({ fromSlice, toSlice, produces, consumes });
-    }
-  }
-
-  const result = { title, vision, successCriteria, slices, boundaryMap };
-  stopTimer({ native: false, slices: slices.length, boundaryEntries: boundaryMap.length });
-  debugCount("parseRoadmapCalls");
-  return result;
 }
 
 // ─── Secrets Manifest Parser ───────────────────────────────────────────────
@@ -379,111 +217,41 @@ export function formatSecretsManifest(manifest: SecretsManifest): string {
 
 // ─── Slice Plan Parser ─────────────────────────────────────────────────────
 
-export function parsePlan(content: string): SlicePlan {
-  return cachedParse(content, 'plan', _parsePlanImpl);
+function normalizeTaskPlanFrontmatter(frontmatter: Record<string, unknown>): TaskPlanFrontmatter {
+  const estimatedStepsRaw = frontmatter.estimated_steps;
+  const estimatedFilesRaw = frontmatter.estimated_files;
+  const skillsUsedRaw = frontmatter.skills_used;
+
+  const parseOptionalNumber = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+      const parsed = parseInt(value, 10);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return undefined;
+  };
+
+  const estimated_steps = parseOptionalNumber(estimatedStepsRaw);
+  const estimated_files = parseOptionalNumber(estimatedFilesRaw);
+  const skills_used = Array.isArray(skillsUsedRaw)
+    ? skillsUsedRaw.map(v => String(v).trim()).filter(Boolean)
+    : typeof skillsUsedRaw === 'string' && skillsUsedRaw.trim()
+      ? [skillsUsedRaw.trim()]
+      : [];
+
+  return {
+    ...(estimated_steps !== undefined ? { estimated_steps } : {}),
+    ...(estimated_files !== undefined ? { estimated_files } : {}),
+    skills_used,
+  };
 }
 
-function _parsePlanImpl(content: string): SlicePlan {
-  const stopTimer = debugTime("parse-plan");
-  // Try native parser first for better performance
-  const nativeResult = nativeParsePlanFile(content);
-  if (nativeResult) {
-    stopTimer({ native: true });
-    return {
-      id: nativeResult.id,
-      title: nativeResult.title,
-      goal: nativeResult.goal,
-      demo: nativeResult.demo,
-      mustHaves: nativeResult.mustHaves,
-      tasks: nativeResult.tasks.map(t => ({
-        id: t.id,
-        title: t.title,
-        description: t.description,
-        done: t.done,
-        estimate: t.estimate,
-        ...(t.files.length > 0 ? { files: t.files } : {}),
-        ...(t.verify ? { verify: t.verify } : {}),
-      })),
-      filesLikelyTouched: nativeResult.filesLikelyTouched,
-    };
-  }
-
-  const lines = content.split('\n');
-
-  const h1 = lines.find(l => l.startsWith('# '));
-  let id = '';
-  let title = '';
-  if (h1) {
-    const match = h1.match(/^#\s+(\w+):\s+(.+)/);
-    if (match) {
-      id = match[1];
-      title = match[2].trim();
-    } else {
-      title = h1.slice(2).trim();
-    }
-  }
-
-  const goal = extractBoldField(content, 'Goal') || '';
-  const demo = extractBoldField(content, 'Demo') || '';
-
-  const mhSection = extractSection(content, 'Must-Haves');
-  const mustHaves = mhSection ? parseBullets(mhSection) : [];
-
-  const tasksSection = extractSection(content, 'Tasks');
-  const tasks: TaskPlanEntry[] = [];
-
-  if (tasksSection) {
-    const taskLines = tasksSection.split('\n');
-    let currentTask: TaskPlanEntry | null = null;
-
-    for (const line of taskLines) {
-      const cbMatch = line.match(/^-\s+\[([ xX])\]\s+\*\*([\w.]+):\s+(.+?)\*\*\s*(.*)/);
-      if (cbMatch) {
-        if (currentTask) tasks.push(currentTask);
-
-        const rest = cbMatch[4] || '';
-        const estMatch = rest.match(/`est:([^`]+)`/);
-        const estimate = estMatch ? estMatch[1] : '';
-
-        currentTask = {
-          id: cbMatch[2],
-          title: cbMatch[3],
-          description: '',
-          done: cbMatch[1].toLowerCase() === 'x',
-          estimate,
-        };
-      } else if (currentTask && line.match(/^\s*-\s+Files:\s*(.*)/)) {
-        const filesMatch = line.match(/^\s*-\s+Files:\s*(.*)/);
-        if (filesMatch) {
-          currentTask.files = filesMatch[1]
-            .split(',')
-            .map(f => f.replace(/`/g, '').trim())
-            .filter(f => f.length > 0);
-        }
-      } else if (currentTask && line.match(/^\s*-\s+Verify:\s*(.*)/)) {
-        const verifyMatch = line.match(/^\s*-\s+Verify:\s*(.*)/);
-        if (verifyMatch) {
-          currentTask.verify = verifyMatch[1].trim();
-        }
-      } else if (currentTask && line.trim() && !line.startsWith('#')) {
-        const desc = line.trim();
-        if (desc) {
-          currentTask.description = currentTask.description
-            ? currentTask.description + ' ' + desc
-            : desc;
-        }
-      }
-    }
-    if (currentTask) tasks.push(currentTask);
-  }
-
-  const filesSection = extractSection(content, 'Files Likely Touched');
-  const filesLikelyTouched = filesSection ? parseBullets(filesSection) : [];
-
-  const result = { id, title, goal, demo, mustHaves, tasks, filesLikelyTouched };
-  stopTimer({ tasks: tasks.length });
-  debugCount("parsePlanCalls");
-  return result;
+export function parseTaskPlanFile(content: string): TaskPlanFile {
+  const [fmLines] = splitFrontmatter(content);
+  const fm = fmLines ? parseFrontmatterMap(fmLines) : {};
+  return {
+    frontmatter: normalizeTaskPlanFrontmatter(fm),
+  };
 }
 
 // ─── Summary Parser ────────────────────────────────────────────────────────
@@ -520,6 +288,8 @@ function _parseSummaryImpl(content: string): Summary {
       whatHappened: nativeResult.whatHappened,
       deviations: nativeResult.deviations,
       filesModified: nativeResult.filesModified,
+      followUps: extractSection(content, 'Follow-ups') ?? '',
+      knownLimitations: extractSection(content, 'Known Limitations') ?? '',
     };
   }
 
@@ -581,7 +351,10 @@ function _parseSummaryImpl(content: string): Summary {
     }
   }
 
-  return { frontmatter, title, oneLiner, whatHappened, deviations, filesModified };
+  const followUps = extractSection(body, 'Follow-ups') ?? '';
+  const knownLimitations = extractSection(body, 'Known Limitations') ?? '';
+
+  return { frontmatter, title, oneLiner, whatHappened, deviations, filesModified, followUps, knownLimitations };
 }
 
 // ─── Continue Parser ───────────────────────────────────────────────────────
@@ -693,7 +466,8 @@ export async function loadFile(path: string): Promise<string | null> {
   try {
     return await fs.readFile(path, 'utf-8');
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'EISDIR') return null;
     throw err;
   }
 }
@@ -703,22 +477,7 @@ export async function loadFile(path: string): Promise<string | null> {
  * Creates parent directories if needed.
  */
 export async function saveFile(path: string, content: string): Promise<void> {
-  const dir = dirname(path);
-  await fs.mkdir(dir, { recursive: true });
-
-  // Use a unique temp path per call to avoid collisions when parallel
-  // tool calls target the same file (e.g. concurrent gsd_save_decision).
-  // rename() is atomic on POSIX, so last-writer-wins is correct for
-  // regenerate-from-DB writes.
-  const tmpPath = path + `.tmp.${randomBytes(4).toString("hex")}`;
-  await fs.writeFile(tmpPath, content, 'utf-8');
-  try {
-    await fs.rename(tmpPath, path);
-  } catch (err) {
-    // Clean up orphaned temp file on rename failure
-    await fs.unlink(tmpPath).catch(() => {});
-    throw err;
-  }
+  await atomicWriteAsync(path, content);
 }
 
 export function parseRequirementCounts(content: string | null): RequirementCounts {
@@ -841,13 +600,57 @@ export function countMustHavesMentionedInSummary(
   return count;
 }
 
+// ─── Task Plan IO Extractor ────────────────────────────────────────────────
+
+/**
+ * Extract input and output file paths from a task plan's `## Inputs` and
+ * `## Expected Output` sections. Looks for backtick-wrapped file paths on
+ * each line (e.g. `` `src/foo.ts` ``).
+ *
+ * Returns empty arrays for missing/empty sections — callers should treat
+ * tasks with no IO as ambiguous (sequential fallback trigger).
+ */
+export function parseTaskPlanIO(content: string): { inputFiles: string[]; outputFiles: string[] } {
+  const backtickPathRegex = /`([^`]+)`/g;
+
+  function extractPaths(sectionText: string | null): string[] {
+    if (!sectionText) return [];
+    const paths: string[] = [];
+    for (const line of sectionText.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      let match: RegExpExecArray | null;
+      backtickPathRegex.lastIndex = 0;
+      while ((match = backtickPathRegex.exec(trimmed)) !== null) {
+        const candidate = match[1];
+        // Filter out things that look like code tokens rather than file paths
+        // (e.g. `true`, `false`, `npm run test`). A file path has at least one
+        // dot or slash.
+        if (candidate.includes("/") || candidate.includes(".")) {
+          paths.push(candidate);
+        }
+      }
+    }
+    return paths;
+  }
+
+  const [, body] = splitFrontmatter(content);
+  const inputSection = extractSection(body, "Inputs");
+  const outputSection = extractSection(body, "Expected Output");
+
+  return {
+    inputFiles: extractPaths(inputSection),
+    outputFiles: extractPaths(outputSection),
+  };
+}
+
 // ─── UAT Type Extractor ────────────────────────────────────────────────────
 
 /**
  * The four UAT classification types recognised by GSD auto-mode.
  * `undefined` is returned (not this union) when no type can be determined.
  */
-export type UatType = 'artifact-driven' | 'live-runtime' | 'human-experience' | 'mixed';
+export type UatType = 'artifact-driven' | 'live-runtime' | 'human-experience' | 'mixed' | 'browser-executable' | 'runtime-executable';
 
 /**
  * Extract the UAT type from a UAT file's raw content.
@@ -871,6 +674,8 @@ export function extractUatType(content: string): UatType | undefined {
   const rawValue = modeBullet.slice('UAT mode:'.length).trim().toLowerCase();
 
   if (rawValue.startsWith('artifact-driven')) return 'artifact-driven';
+  if (rawValue.startsWith('browser-executable')) return 'browser-executable';
+  if (rawValue.startsWith('runtime-executable')) return 'runtime-executable';
   if (rawValue.startsWith('live-runtime')) return 'live-runtime';
   if (rawValue.startsWith('human-experience')) return 'human-experience';
   if (rawValue.startsWith('mixed')) return 'mixed';
@@ -922,7 +727,7 @@ export async function inlinePriorMilestoneSummary(mid: string, base: string): Pr
  * file not on disk) - callers can distinguish "no manifest" from "empty manifest".
  */
 export async function getManifestStatus(
-  base: string, milestoneId: string,
+  base: string, milestoneId: string, projectRoot?: string,
 ): Promise<ManifestStatus | null> {
   const resolvedPath = resolveMilestoneFile(base, milestoneId, 'SECRETS');
   if (!resolvedPath) return null;
@@ -932,8 +737,17 @@ export async function getManifestStatus(
 
   const manifest = parseSecretsManifest(content);
   const keys = manifest.entries.map(e => e.key);
+
+  // Check both the base path .env AND the project root .env (#1387).
+  // In worktree mode, base is the worktree path which may not have .env.
+  // The project root's .env is where the user actually defined their keys.
   const existingKeys = await checkExistingEnvKeys(keys, resolve(base, '.env'));
   const existingSet = new Set(existingKeys);
+
+  if (projectRoot && projectRoot !== base) {
+    const rootKeys = await checkExistingEnvKeys(keys, resolve(projectRoot, '.env'));
+    for (const k of rootKeys) existingSet.add(k);
+  }
 
   const result: ManifestStatus = {
     pending: [],

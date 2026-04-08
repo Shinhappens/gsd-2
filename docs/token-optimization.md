@@ -105,7 +105,11 @@ Explicit `phases` settings always override the profile defaults.
 
 ## Complexity-Based Task Routing
 
-GSD automatically classifies each task by complexity and routes it to an appropriate model tier. This means simple documentation fixes don't burn expensive Opus tokens, while complex architectural work gets the reasoning power it needs.
+GSD classifies each task by complexity and routes it to an appropriate model tier when dynamic routing is enabled. Simple documentation fixes use cheaper models while complex architectural work gets the reasoning power it needs.
+
+> **Prerequisite:** Dynamic routing requires explicit `models` in your preferences. Without a `models` section, routing is skipped and the session's launch model is used for all phases. Token profiles set `models` automatically.
+
+> **Ceiling behavior:** When dynamic routing is active, the model configured for each phase acts as a **ceiling**, not a fixed assignment. The router may downgrade to a cheaper model for simpler tasks but never upgrades beyond the configured model.
 
 ### How Classification Works
 
@@ -172,13 +176,15 @@ GSD tracks the success and failure of each tier assignment over time and adjusts
 
 ### User Feedback
 
-GSD accepts manual feedback to accelerate learning:
+Use `/gsd rate` to submit feedback on the last completed unit's model tier:
 
-- **"over"** — the model was overpowered for this task (encourages downgrading)
-- **"under"** — the model wasn't capable enough (encourages upgrading)
-- **"ok"** — correct assignment (no adjustment)
+```
+/gsd rate over    # model was overpowered — encourage cheaper next time
+/gsd rate ok      # model was appropriate — no adjustment
+/gsd rate under   # model was too weak — encourage stronger next time
+```
 
-Feedback signals are weighted 2× compared to automatic outcomes.
+Feedback signals are weighted 2× compared to automatic outcomes. Requires dynamic routing to be active (the last unit must have tier data).
 
 ### Data Management
 
@@ -251,16 +257,114 @@ models:
 ## How the Pieces Fit Together
 
 ```
-preferences.md
+PREFERENCES.md
   └─ token_profile: balanced
        ├─ resolveProfileDefaults() → model defaults + phase skip defaults
        ├─ resolveInlineLevel() → standard
        │    └─ prompt builders gate context inclusion by level
-       └─ classifyUnitComplexity() → routes to execution/execution_simple model
-            ├─ task plan analysis (steps, files, signals)
-            ├─ unit type defaults
-            ├─ budget pressure adjustment
-            └─ adaptive learning from routing-history.json
+       ├─ classifyUnitComplexity() → routes to execution/execution_simple model
+       │    ├─ task plan analysis (steps, files, signals)
+       │    ├─ unit type defaults
+       │    ├─ budget pressure adjustment
+       │    ├─ adaptive learning from routing-history.json
+       │    └─ capability scoring (when capability_routing: true)
+       │         └─ 7-dimension model profiles × task requirement vectors
+       └─ context_management
+            ├─ observation masking (before_provider_request hook)
+            ├─ tool result truncation (tool_result_max_chars)
+            └─ phase handoff anchors (injected into prompt builders)
 ```
 
 The profile is resolved once and flows through the entire dispatch pipeline. Explicit preferences override profile defaults at every layer.
+
+## Observation Masking
+
+*Introduced in v2.59.0*
+
+During auto-mode sessions, tool results accumulate in the conversation history and consume context window space. Observation masking replaces tool result content older than N user turns with a lightweight placeholder before each LLM call. This reduces token usage with zero LLM overhead — no summarization calls, no latency.
+
+Masking is enabled by default during auto-mode. Configure via preferences:
+
+```yaml
+context_management:
+  observation_masking: true     # default: true (set false to disable)
+  observation_mask_turns: 8     # keep results from last 8 user turns (range: 1-50)
+  tool_result_max_chars: 800    # truncate individual tool results beyond this length
+```
+
+### How It Works
+
+1. Before each provider request, the `before_provider_request` hook inspects the messages array
+2. Tool results (`toolResult`, `bashExecution`) older than the configured turn threshold are replaced with `[result masked — within summarized history]`
+3. Recent tool results (within the keep window) are preserved in full
+4. All assistant and user messages are always preserved — only tool result content is masked
+
+This pairs with the existing compaction system: masking reduces context pressure between compactions, and compaction handles the full context reset when the window fills.
+
+### Tool Result Truncation
+
+Individual tool results that exceed `tool_result_max_chars` (default: 800) are truncated with a `…[truncated]` marker. This prevents a single large tool output from dominating the context window.
+
+## Phase Handoff Anchors
+
+*Introduced in v2.59.0*
+
+When auto-mode transitions between phases (research → planning → execution), structured JSON anchors are written to `.gsd/milestones/<mid>/anchors/<phase>.json`. Downstream prompt builders inject these anchors so the next phase inherits intent, decisions, blockers, and next steps without re-inferring from artifact files.
+
+This reduces context drift — the 65% of enterprise agent failures caused by agents losing track of prior decisions across phase boundaries.
+
+Anchors are written automatically after successful completion of `research-milestone`, `research-slice`, `plan-milestone`, and `plan-slice` units. No configuration needed.
+
+## Prompt Compression
+
+*Introduced in v2.29.0*
+
+GSD can apply deterministic prompt compression before falling back to section-boundary truncation. This preserves more information when context exceeds the budget.
+
+### Compression Strategy
+
+Set via preferences:
+
+```yaml
+---
+version: 1
+compression_strategy: compress
+---
+```
+
+Two strategies are available:
+
+| Strategy | Behavior | Default For |
+|----------|----------|------------|
+| `truncate` | Drop entire sections at boundaries (pre-v2.29 behavior) | `quality` profile |
+| `compress` | Apply heuristic text compression first, then truncate if still over budget | `budget` and `balanced` profiles |
+
+Compression removes redundant whitespace, abbreviates verbose phrases, deduplicates repeated content, and removes low-information boilerplate — all deterministically with no LLM calls.
+
+### Context Selection
+
+Controls how files are inlined into prompts:
+
+```yaml
+---
+version: 1
+context_selection: smart
+---
+```
+
+| Mode | Behavior | Default For |
+|------|----------|------------|
+| `full` | Inline entire files | `balanced` and `quality` profiles |
+| `smart` | Use TF-IDF semantic chunking for large files (>3KB), including only relevant portions | `budget` profile |
+
+### Structured Data Compression
+
+At `budget` and `balanced` inline levels, decisions and requirements are formatted in a compact notation that saves 30-50% tokens compared to full markdown tables.
+
+### Summary Distillation
+
+When a slice has 3+ dependency summaries and the total exceeds the summary budget, GSD extracts essential structured data (provides, requires, key_files, key_decisions) and drops verbose prose sections before falling back to section-boundary truncation.
+
+### Cache Hit Rate Tracking
+
+The metrics ledger now tracks `cacheHitRate` per unit (percentage of input tokens served from cache) and provides `aggregateCacheHitRate()` for session-wide cache performance.

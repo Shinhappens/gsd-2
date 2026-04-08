@@ -11,9 +11,10 @@ import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
 import type { ExtensionAPI, Theme } from "@gsd/pi-coding-agent";
-import { CURSOR_MARKER, Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth, wrapTextWithAnsi } from "@gsd/pi-tui";
+import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth, wrapTextWithAnsi } from "@gsd/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { makeUI, type ProgressStatus } from "./shared/ui.js";
+import { makeUI } from "./shared/tui.js";
+import { maskEditorLine, type ProgressStatus } from "./shared/mod.js";
 import { parseSecretsManifest, formatSecretsManifest } from "./gsd/files.js";
 import { resolveMilestoneFile } from "./gsd/paths.js";
 import type { SecretsManifestEntry } from "./gsd/types.js";
@@ -42,44 +43,20 @@ function maskPreview(value: string): string {
 	return `${value.slice(0, 4)}${"*".repeat(Math.max(4, value.length - 8))}${value.slice(-4)}`;
 }
 
-/**
- * Replace editor visible text with masked characters while preserving ANSI cursor/sequencer codes.
- */
-function maskEditorLine(line: string): string {
-	// Keep border / metadata lines readable.
-	if (line.startsWith("─")) {
-		return line;
-	}
-
-	let output = "";
-	let i = 0;
-	while (i < line.length) {
-		if (line.startsWith(CURSOR_MARKER, i)) {
-			output += CURSOR_MARKER;
-			i += CURSOR_MARKER.length;
-			continue;
-		}
-
-		const ansiMatch = /^\x1b\[[0-9;]*m/.exec(line.slice(i));
-		if (ansiMatch) {
-			output += ansiMatch[0];
-			i += ansiMatch[0].length;
-			continue;
-		}
-
-		const ch = line[i] as string;
-		output += ch === " " ? " " : "*";
-		i += 1;
-	}
-
-	return output;
-}
-
 function shellEscapeSingle(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function hydrateProcessEnv(key: string, value: string): void {
+	// Make newly collected secrets immediately visible to the current session.
+	// Some extensions read process.env directly and do not reload .env on every call.
+	process.env[key] = value;
+}
+
 async function writeEnvKey(filePath: string, key: string, value: string): Promise<void> {
+	if (typeof value !== "string") {
+		throw new TypeError(`writeEnvKey expects a string value for key "${key}", got ${typeof value}`);
+	}
 	let content = "";
 	try {
 		content = await readFile(filePath, "utf8");
@@ -100,30 +77,11 @@ async function writeEnvKey(filePath: string, key: string, value: string): Promis
 
 // ─── Exported utilities ───────────────────────────────────────────────────────
 
-/**
- * Check which keys already exist in the .env file or process.env.
- * Returns the subset of `keys` that are already set.
- * Handles ENOENT gracefully (still checks process.env).
- * Empty-string values count as existing.
- */
-export async function checkExistingEnvKeys(keys: string[], envFilePath: string): Promise<string[]> {
-	let fileContent = "";
-	try {
-		fileContent = await readFile(envFilePath, "utf8");
-	} catch {
-		// ENOENT or other read error — proceed with empty content
-	}
-
-	const existing: string[] = [];
-	for (const key of keys) {
-		const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-		const regex = new RegExp(`^${escaped}\\s*=`, "m");
-		if (regex.test(fileContent) || key in process.env) {
-			existing.push(key);
-		}
-	}
-	return existing;
-}
+// Re-export from env-utils.ts so existing consumers still work.
+// The implementation lives in env-utils.ts to avoid pulling @gsd/pi-tui
+// into modules that only need env-checking (e.g. files.ts during reports).
+import { checkExistingEnvKeys } from "./gsd/env-utils.js";
+export { checkExistingEnvKeys };
 
 /**
  * Detect the write destination based on project files in basePath.
@@ -286,7 +244,7 @@ export async function showSecretsSummary(
 
 	const existingSet = new Set(existingKeys);
 
-	await ctx.ui.custom((tui: any, theme: Theme, _kb: any, done: (r: null) => void) => {
+	await ctx.ui.custom((_tui: any, theme: Theme, _kb: any, done: (r: null) => void) => {
 		let cachedLines: string[] | undefined;
 
 		function handleInput(_data: string) {
@@ -363,6 +321,7 @@ async function applySecrets(
 			try {
 				await writeEnvKey(opts.envFilePath, key, value);
 				applied.push(key);
+				hydrateProcessEnv(key, value);
 			} catch (err: any) {
 				errors.push(`${key}: ${err.message}`);
 			}
@@ -381,6 +340,7 @@ async function applySecrets(
 					errors.push(`${key}: ${result.stderr.slice(0, 200)}`);
 				} else {
 					applied.push(key);
+					hydrateProcessEnv(key, value);
 				}
 			} catch (err: any) {
 				errors.push(`${key}: ${err.message}`);
@@ -462,7 +422,7 @@ export async function collectSecretsFromManifest(
 	for (const { key, value } of collected) {
 		const entry = manifest.entries.find((e) => e.key === key);
 		if (entry) {
-			entry.status = value !== null ? "collected" : "skipped";
+			entry.status = value != null ? "collected" : "skipped";
 		}
 	}
 
@@ -470,14 +430,14 @@ export async function collectSecretsFromManifest(
 	await writeFile(manifestPath, formatSecretsManifest(manifest), "utf8");
 
 	// (j) Apply collected values to destination
-	const provided = collected.filter((c) => c.value !== null) as Array<{ key: string; value: string }>;
+	const provided = collected.filter((c) => c.value != null) as Array<{ key: string; value: string }>;
 	const { applied } = await applySecrets(provided, destination, {
 		envFilePath: resolve(ctx.cwd, ".env"),
 	});
 
 	const skipped = [
 		...alreadySkipped,
-		...collected.filter((c) => c.value === null).map((c) => c.key),
+		...collected.filter((c) => c.value == null).map((c) => c.key),
 	];
 
 	return { applied, skipped, existingSkipped };
@@ -548,8 +508,8 @@ export default function secureEnv(pi: ExtensionAPI) {
 				collected.push({ key: item.key, value });
 			}
 
-			const provided = collected.filter((c) => c.value !== null) as Array<{ key: string; value: string }>;
-			const skipped = collected.filter((c) => c.value === null).map((c) => c.key);
+			const provided = collected.filter((c) => c.value != null) as Array<{ key: string; value: string }>;
+			const skipped = collected.filter((c) => c.value == null).map((c) => c.key);
 
 			// Apply to destination via shared helper
 			const { applied, errors } = await applySecrets(provided, destination, {

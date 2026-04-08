@@ -21,7 +21,9 @@ You are executing a GSD quick task — a lightweight, focused unit of work outsi
    - Use conventional commit messages (feat:, fix:, refactor:, etc.)
    - Stage only relevant files — never commit secrets or runtime files.
    - Commit logical units separately if the task involves distinct changes.
+   - Quick tasks run outside the auto-mode lifecycle — there is no system auto-commit, so commit directly here.
 7. Write a brief summary to `{{summaryPath}}`:
+   - Quick tasks operate outside the milestone/slice/task DB structure, so `gsd_summary_save` (which requires a `milestone_id`) cannot be used here. Write the file directly.
 
 ```markdown
 # Quick Task: {{description}}
@@ -38,11 +40,5 @@ You are executing a GSD quick task — a lightweight, focused unit of work outsi
 ## Verification
 - <what was tested/verified>
 ```
-
-8. Update `.gsd/STATE.md` — add or update the "Quick Tasks Completed" table:
-   - If the section doesn't exist, create it after "### Blockers/Concerns"
-   - Table format: `| # | Description | Date | Commit | Directory |`
-   - Add a row: `| {{taskNum}} | {{description}} | {{date}} | <commit-hash> | [{{taskNum}}-{{slug}}](./quick/{{taskNum}}-{{slug}}/) |`
-   - Update the "Last activity" line
 
 When done, say: "Quick task {{taskNum}} complete."

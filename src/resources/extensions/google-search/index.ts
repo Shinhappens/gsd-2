@@ -79,7 +79,7 @@ async function searchWithOAuth(
 	signal?: AbortSignal,
 ): Promise<SearchResult> {
 	const model = process.env.GEMINI_SEARCH_MODEL || "gemini-2.5-flash";
-	const url = `https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent`;
+	const url = `https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse`;
 
 	const GEMINI_CLI_HEADERS = {
 	        ideType: "IDE_UNSPECIFIED",
@@ -104,6 +104,7 @@ async function searchWithOAuth(
 	                                contents: [{ parts: [{ text: query }] }],
 	                                tools: [{ googleSearch: {} }],
 	                        },
+	                        userAgent: "pi-coding-agent",
 	                }),
 	                signal,
 	        });
@@ -265,14 +266,27 @@ export default function (pi: ExtensionAPI) {
 			try {
 				if (process.env.GEMINI_API_KEY) {
 					const ai = await getClient();
-					const response = await ai.models.generateContent({
-						model: process.env.GEMINI_SEARCH_MODEL || "gemini-2.5-flash",
-						contents: params.query,
-						config: {
-							tools: [{ googleSearch: {} }],
-							abortSignal: signal,
-						},
-					});
+
+					// Add a 30-second timeout to prevent hanging (#1100)
+					const timeoutController = new AbortController();
+					const timeoutId = setTimeout(() => timeoutController.abort(), 30_000);
+					const combinedSignal = signal
+						? AbortSignal.any([signal, timeoutController.signal])
+						: timeoutController.signal;
+
+					let response;
+					try {
+						response = await ai.models.generateContent({
+							model: process.env.GEMINI_SEARCH_MODEL || "gemini-2.5-flash",
+							contents: params.query,
+							config: {
+								tools: [{ googleSearch: {} }],
+								abortSignal: combinedSignal,
+							},
+						});
+					} finally {
+						clearTimeout(timeoutId);
+					}
 
 					// Extract answer text
 					const answer = response.text ?? "";
@@ -396,6 +410,13 @@ export default function (pi: ExtensionAPI) {
 
 			return new Text(text, 0, 0);
 		},
+	});
+
+	// ── Session cleanup ─────────────────────────────────────────────────────
+
+	pi.on("session_shutdown", async () => {
+		resultCache.clear();
+		client = null;
 	});
 
 	// ── Startup notification ─────────────────────────────────────────────────

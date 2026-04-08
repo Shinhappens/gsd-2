@@ -8,12 +8,20 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  writeFileSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  mkdirSync,
+} from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gsdRoot } from "./paths.js";
 import { createWorktree, worktreePath } from "./worktree-manager.js";
-import { autoWorktreeBranch, runWorktreePostCreateHook } from "./auto-worktree.js";
+import { autoWorktreeBranch, runWorktreePostCreateHook, syncGsdStateToWorktree } from "./auto-worktree.js";
 import { nativeBranchExists } from "./native-git-bridge.js";
 import { readIntegrationBranch } from "./git-service.js";
 import { resolveParallelConfig } from "./preferences.js";
@@ -22,6 +30,7 @@ import type { ParallelConfig } from "./types.js";
 import {
   writeSessionStatus,
   readAllSessionStatuses,
+  readSessionStatus,
   removeSessionStatus,
   sendSignal,
   cleanupStaleSessions,
@@ -31,6 +40,8 @@ import {
   analyzeParallelEligibility,
   type ParallelCandidates,
 } from "./parallel-eligibility.js";
+import { getErrorMessage } from "./error-utils.js";
+import { logWarning } from "./workflow-logger.js";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -42,8 +53,8 @@ export interface WorkerInfo {
   worktreePath: string;
   startedAt: number;
   state: "running" | "paused" | "stopped" | "error";
-  completedUnits: number;
   cost: number;
+  cleanup?: () => void;
 }
 
 export interface OrchestratorState {
@@ -58,6 +69,237 @@ export interface OrchestratorState {
 
 let state: OrchestratorState | null = null;
 
+// ─── Persistence ──────────────────────────────────────────────────────────
+
+const ORCHESTRATOR_STATE_FILE = "orchestrator.json";
+const TMP_SUFFIX = ".tmp";
+
+export interface PersistedState {
+  active: boolean;
+  workers: Array<{
+    milestoneId: string;
+    title: string;
+    pid: number;
+    worktreePath: string;
+    startedAt: number;
+    state: "running" | "paused" | "stopped" | "error";
+    cost: number;
+  }>;
+  totalCost: number;
+  startedAt: number;
+  configSnapshot: { max_workers: number; budget_ceiling?: number };
+}
+
+function stateFilePath(basePath: string): string {
+  return join(gsdRoot(basePath), ORCHESTRATOR_STATE_FILE);
+}
+
+/**
+ * Persist the current orchestrator state to .gsd/orchestrator.json.
+ * Uses atomic write (tmp + rename) to prevent partial reads.
+ */
+export function persistState(basePath: string): void {
+  if (!state) return;
+  try {
+    const dir = gsdRoot(basePath);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+    const persisted: PersistedState = {
+      active: state.active,
+      workers: [...state.workers.values()].map((w) => ({
+        milestoneId: w.milestoneId,
+        title: w.title,
+        pid: w.pid,
+        worktreePath: w.worktreePath,
+        startedAt: w.startedAt,
+        state: w.state,
+        cost: w.cost,
+      })),
+      totalCost: state.totalCost,
+      startedAt: state.startedAt,
+      configSnapshot: {
+        max_workers: state.config.max_workers,
+        budget_ceiling: state.config.budget_ceiling,
+      },
+    };
+
+    const dest = stateFilePath(basePath);
+    const tmp = dest + TMP_SUFFIX;
+    writeFileSync(tmp, JSON.stringify(persisted, null, 2), "utf-8");
+    renameSync(tmp, dest);
+  } catch (e) { logWarning("parallel", `persist parallel state failed: ${(e as Error).message}`); }
+}
+
+/**
+ * Remove the persisted state file.
+ */
+function removeStateFile(basePath: string): void {
+  try {
+    const p = stateFilePath(basePath);
+    if (existsSync(p)) unlinkSync(p);
+  } catch (e) { logWarning("parallel", `clear parallel state file failed: ${(e as Error).message}`); }
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    logWarning("parallel", `pid alive check failed for pid ${pid}: ${(e as Error).message}`);
+    return false;
+  }
+}
+
+/**
+ * Restore orchestrator state from .gsd/orchestrator.json.
+ * Checks PID liveness for each worker:
+ * - Living PID → state "running", process stays null (no handle)
+ * - Dead PID → removed from restored state
+ * Returns null if no state file exists or no workers survive.
+ */
+export function restoreState(basePath: string): PersistedState | null {
+  try {
+    const p = stateFilePath(basePath);
+    if (!existsSync(p)) return null;
+    const raw = readFileSync(p, "utf-8");
+    const persisted = JSON.parse(raw) as PersistedState;
+
+    // Filter to only workers with living PIDs
+    persisted.workers = persisted.workers.filter((w) => {
+      if (w.state === "stopped" || w.state === "error") return false;
+      return isPidAlive(w.pid);
+    });
+
+    if (persisted.workers.length === 0) {
+      // No surviving workers — clean up and return null
+      removeStateFile(basePath);
+      return null;
+    }
+
+    return persisted;
+  } catch (e) {
+    logWarning("parallel", `readParallelState JSON parse failed: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+function workerLogPath(basePath: string, milestoneId: string): string {
+  return join(gsdRoot(basePath), "parallel", `${milestoneId}.stderr.log`);
+}
+
+function appendWorkerLog(basePath: string, milestoneId: string, chunk: string): void {
+  try {
+    const dir = join(gsdRoot(basePath), "parallel");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    appendFileSync(workerLogPath(basePath, milestoneId), chunk, "utf-8");
+  } catch (e) {
+    logWarning("parallel", `appendFileSync worker log failed for ${milestoneId}: ${(e as Error).message}`);
+  }
+}
+
+function restoreRuntimeState(basePath: string): boolean {
+  if (state?.active) {
+    // Verify at least one worker is alive — if all are in terminal states,
+    // the cached state is stale and we should fall through to cleanup.
+    const hasLiveWorker = [...state.workers.values()].some(
+      (w) => w.state !== "error" && w.state !== "stopped",
+    );
+    if (hasLiveWorker) return true;
+
+    // All workers dead — clear stale state so restoreState() can clean up.
+    state = null;
+  }
+
+  const restored = restoreState(basePath);
+  if (restored && restored.workers.length > 0) {
+    const config = resolveParallelConfig(undefined);
+    state = {
+      active: restored.active,
+      workers: new Map(),
+      config: {
+        ...config,
+        max_workers: restored.configSnapshot.max_workers,
+        budget_ceiling: restored.configSnapshot.budget_ceiling,
+      },
+      totalCost: restored.totalCost,
+      startedAt: restored.startedAt,
+    };
+
+    for (const w of restored.workers) {
+      const diskStatus = readSessionStatus(basePath, w.milestoneId);
+      state.workers.set(w.milestoneId, {
+        milestoneId: w.milestoneId,
+        title: w.title,
+        pid: diskStatus?.pid ?? w.pid,
+        process: null,
+        worktreePath: diskStatus?.worktreePath ?? w.worktreePath,
+        startedAt: w.startedAt,
+        state: diskStatus?.state ?? w.state,
+        cost: diskStatus?.cost ?? w.cost,
+      });
+    }
+
+    return true;
+  }
+
+  // Fallback: rebuild coordinator state from live session status files.
+  // This covers cases where orchestrator.json is missing/corrupt but workers are
+  // still running and writing heartbeats under .gsd/parallel/.
+  cleanupStaleSessions(basePath);
+  const statuses = readAllSessionStatuses(basePath);
+  if (statuses.length === 0) {
+    return false;
+  }
+
+  const config = resolveParallelConfig(undefined);
+  state = {
+    active: true,
+    workers: new Map(),
+    config,
+    totalCost: 0,
+    startedAt: Math.min(...statuses.map((status) => status.startedAt)),
+  };
+
+  for (const status of statuses) {
+    state.workers.set(status.milestoneId, {
+      milestoneId: status.milestoneId,
+      title: status.milestoneId,
+      pid: status.pid,
+      process: null,
+      worktreePath: status.worktreePath,
+      startedAt: status.startedAt,
+      state: status.state,
+      cost: status.cost,
+    });
+    state.totalCost += status.cost;
+  }
+
+  return true;
+}
+
+async function waitForWorkerExit(worker: WorkerInfo, timeoutMs: number): Promise<boolean> {
+  if (worker.process) {
+    await new Promise<void>((resolve) => {
+      const done = () => resolve();
+      const timer = setTimeout(done, timeoutMs);
+      worker.process!.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    return worker.process === null || !isPidAlive(worker.pid);
+  }
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (!isPidAlive(worker.pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return !isPidAlive(worker.pid);
+}
+
+
 // ─── Accessors ─────────────────────────────────────────────────────────────
 
 /** Returns true if the orchestrator is active and has been initialized. */
@@ -71,7 +313,10 @@ export function getOrchestratorState(): OrchestratorState | null {
 }
 
 /** Returns a snapshot of all tracked workers as an array. */
-export function getWorkerStatuses(): WorkerInfo[] {
+export function getWorkerStatuses(basePath?: string): WorkerInfo[] {
+  if (basePath) {
+    refreshWorkerStatuses(basePath, { restoreIfNeeded: true });
+  }
   if (!state) return [];
   return [...state.workers.values()];
 }
@@ -81,12 +326,26 @@ export function getWorkerStatuses(): WorkerInfo[] {
 /**
  * Analyze eligibility and prepare for parallel start.
  * Returns the candidates report without actually starting workers.
+ * Also detects orphaned sessions from prior crashes.
  */
 export async function prepareParallelStart(
   basePath: string,
   _prefs: GSDPreferences | undefined,
-): Promise<ParallelCandidates> {
-  return analyzeParallelEligibility(basePath);
+): Promise<ParallelCandidates & { orphans?: Array<{ milestoneId: string; pid: number; alive: boolean }> }> {
+  // Detect orphaned sessions before eligibility analysis
+  const sessions = readAllSessionStatuses(basePath);
+  const orphans: Array<{ milestoneId: string; pid: number; alive: boolean }> = [];
+  for (const session of sessions) {
+    const alive = isPidAlive(session.pid);
+    orphans.push({ milestoneId: session.milestoneId, pid: session.pid, alive });
+    if (!alive) {
+      // Clean up dead session
+      removeSessionStatus(basePath, session.milestoneId);
+    }
+  }
+
+  const candidates = await analyzeParallelEligibility(basePath);
+  return orphans.length > 0 ? { ...candidates, orphans } : candidates;
 }
 
 // ─── Start ─────────────────────────────────────────────────────────────────
@@ -106,6 +365,45 @@ export async function startParallel(
   }
 
   const config = resolveParallelConfig(prefs);
+
+  // Release any leftover state from a previous session before reassigning
+  if (state) {
+    for (const w of state.workers.values()) {
+      w.cleanup?.();
+      w.cleanup = undefined;
+      w.process = null;
+    }
+    state.workers.clear();
+  }
+
+  // Try to restore from a previous crash
+  const restored = restoreState(basePath);
+  if (restored && restored.workers.length > 0) {
+    // Adopt surviving workers instead of starting new ones
+    state = {
+      active: true,
+      workers: new Map(),
+      config,
+      totalCost: restored.totalCost,
+      startedAt: restored.startedAt,
+    };
+    const adopted: string[] = [];
+    for (const w of restored.workers) {
+      state.workers.set(w.milestoneId, {
+        milestoneId: w.milestoneId,
+        title: w.title,
+        pid: w.pid,
+        process: null, // no handle for adopted workers
+        worktreePath: w.worktreePath,
+        startedAt: w.startedAt,
+        state: "running",
+        cost: w.cost,
+      });
+      adopted.push(w.milestoneId);
+    }
+    return { started: adopted, errors: [] };
+  }
+
   const now = Date.now();
 
   // Initialize orchestrator state
@@ -135,52 +433,46 @@ export async function startParallel(
       let wtPath: string;
       try {
         wtPath = createMilestoneWorktree(basePath, mid);
-      } catch {
-        // Worktree creation may fail in test environments or when git
-        // is not available. Fall back to a placeholder path.
+      } catch (e) {
+        logWarning("parallel", `createMilestoneWorktree fallback for ${mid}: ${(e as Error).message}`);
         wtPath = worktreePath(basePath, mid);
       }
 
       const worker: WorkerInfo = {
         milestoneId: mid,
         title: mid,
-        pid: process.pid,
+        pid: 0,  // placeholder — real PID set by spawnWorker()
         process: null,
         worktreePath: wtPath,
         startedAt: now,
         state: "running",
-        completedUnits: 0,
         cost: 0,
       };
 
       state.workers.set(mid, worker);
 
-      // Write initial session status
-      const sessionStatus: SessionStatus = {
+      // Spawn BEFORE writing session status so the file gets the real worker PID.
+      const spawned = spawnWorker(basePath, mid);
+      if (!spawned) {
+        worker.state = "error";
+      }
+
+      // Write session status with real PID (or 0 if spawn failed)
+      writeSessionStatus(basePath, {
         milestoneId: mid,
         pid: worker.pid,
-        state: "running",
+        state: worker.state,
         currentUnit: null,
         completedUnits: 0,
         cost: 0,
         lastHeartbeat: now,
         startedAt: now,
         worktreePath: wtPath,
-      };
-      writeSessionStatus(basePath, sessionStatus);
-
-      // Attempt to spawn the worker process.
-      // Spawning may fail if the CLI binary is not available (e.g., in tests).
-      // The worker is still tracked and can be spawned later via spawnWorker().
-      const spawned = spawnWorker(basePath, mid);
-      if (!spawned) {
-        // Worker tracked but not yet running a process.
-        // State stays "running" so coordinator can retry or user can investigate.
-      }
+      });
 
       started.push(mid);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = getErrorMessage(err);
       errors.push({ mid, error: message });
     }
   }
@@ -189,6 +481,9 @@ export async function startParallel(
   if (started.length === 0) {
     state.active = false;
   }
+
+  // Persist state for crash recovery
+  persistState(basePath);
 
   return { started, errors };
 }
@@ -214,6 +509,11 @@ function createMilestoneWorktree(basePath: string, milestoneId: string): string 
   // Run post-create hook if configured
   runWorktreePostCreateHook(basePath, info.path);
 
+  // Copy .gsd/ planning artifacts (milestones, CONTEXT, ROADMAP, etc.) from the
+  // project root into the worktree. Without this, workers for newly-planned
+  // milestones can't find their roadmap and exit immediately (#2184 Bug 4).
+  syncGsdStateToWorktree(basePath, info.path);
+
   return info.path;
 }
 
@@ -221,8 +521,19 @@ function createMilestoneWorktree(basePath: string, milestoneId: string): string 
 
 /**
  * Spawn a worker process for a milestone.
- * The worker runs `gsd --print "/gsd auto"` in the milestone's worktree
+ * The worker runs `gsd headless --json auto` in the milestone's worktree
  * with GSD_MILESTONE_LOCK set to isolate state derivation.
+ *
+ * IMPORTANT: We use `headless --json auto` instead of `--print "/gsd auto"`.
+ * --print mode calls session.prompt() which returns immediately after the
+ * extension command handler fires, because auto-mode's ctx.newSession()
+ * resets the session and unblocks the outer prompt() await. This causes
+ * process.exit(0) to fire before any LLM work happens. See #2792.
+ *
+ * The headless subcommand uses an RPC client that keeps the process alive
+ * until auto-mode emits a terminal notification or the idle timer fires.
+ * It outputs NDJSON events to stdout (with --json), which our
+ * processWorkerLine() parser already understands.
  */
 export function spawnWorker(
   basePath: string,
@@ -239,18 +550,32 @@ export function spawnWorker(
 
   let child: ChildProcess;
   try {
-    child = spawn(process.execPath, [binPath, "--mode", "json", "--print", "/gsd auto"], {
+    const workerEnv: Record<string, string | undefined> = {
+      ...process.env,
+      GSD_MILESTONE_LOCK: milestoneId,
+      // Pass the real project root so workers don't need to re-derive it.
+      // Without this, process.cwd() resolves symlinks and the worktree
+      // path heuristic can match the user-level ~/.gsd instead of the
+      // project .gsd, causing writes to ~ and corrupting user config.
+      GSD_PROJECT_ROOT: basePath,
+      // Prevent workers from spawning their own parallel sessions
+      GSD_PARALLEL_WORKER: "1",
+    };
+
+    // Apply worker model override if configured, so workers use a cheaper
+    // model (e.g. Haiku) rather than inheriting the coordinator's model.
+    if (state.config.worker_model) {
+      workerEnv.GSD_WORKER_MODEL = state.config.worker_model;
+    }
+
+    child = spawn(process.execPath, [binPath, "headless", "--json", "auto"], {
       cwd: worker.worktreePath,
-      env: {
-        ...process.env,
-        GSD_MILESTONE_LOCK: milestoneId,
-        // Prevent workers from spawning their own parallel sessions
-        GSD_PARALLEL_WORKER: "1",
-      },
+      env: workerEnv,
       stdio: ["ignore", "pipe", "pipe"],
       detached: false,
     });
-  } catch {
+  } catch (e) {
+    logWarning("parallel", `spawnSync worker failed for ${milestoneId}: ${(e as Error).message}`);
     return false;
   }
 
@@ -274,9 +599,10 @@ export function spawnWorker(
   }
 
   // ── NDJSON stdout monitoring ────────────────────────────────────────
-  // Workers run with --mode json, emitting one JSON event per line.
-  // We parse message_end events to extract cost/token usage, keeping
-  // the coordinator's cost tracking in sync with actual API spend.
+  // Workers run via `headless --json`, which forwards all RPC events
+  // as NDJSON to stdout. We parse message_end events to extract
+  // cost/token usage, keeping the coordinator's cost tracking in sync
+  // with actual API spend.
   if (child.stdout) {
     let stdoutBuffer = "";
     child.stdout.on("data", (data: Buffer) => {
@@ -295,24 +621,44 @@ export function spawnWorker(
     });
   }
 
+  if (child.stderr) {
+    child.stderr.on("data", (data: Buffer) => {
+      appendWorkerLog(basePath, milestoneId, data.toString());
+    });
+  }
+
   // Update session status with real PID
   writeSessionStatus(basePath, {
     milestoneId,
     pid: worker.pid,
     state: "running",
     currentUnit: null,
-    completedUnits: worker.completedUnits,
+    completedUnits: 0,
     cost: worker.cost,
     lastHeartbeat: Date.now(),
     startedAt: worker.startedAt,
     worktreePath: worker.worktreePath,
   });
 
+  // Store cleanup function to remove all listeners from the child process.
+  // This prevents listener accumulation when workers are respawned, since
+  // handler closures capture milestoneId and other data that would otherwise
+  // be retained indefinitely.
+  worker.cleanup = () => {
+    child.stdout?.removeAllListeners();
+    child.stderr?.removeAllListeners();
+    child.removeAllListeners();
+  };
+
   // Handle worker exit
   child.on("exit", (code) => {
     if (!state) return;
     const w = state.workers.get(milestoneId);
     if (!w) return;
+
+    // Remove all stream listeners to release closure references
+    w.cleanup?.();
+    w.cleanup = undefined;
 
     w.process = null;
     if (w.state === "stopped") return; // graceful stop, already handled
@@ -321,20 +667,22 @@ export function spawnWorker(
       w.state = "stopped";
     } else {
       w.state = "error";
+      appendWorkerLog(basePath, milestoneId, `\n[orchestrator] worker exited with code ${code ?? "null"}\n`);
     }
 
-    // Update session status
+    // Update session status and persist orchestrator state for crash recovery
     writeSessionStatus(basePath, {
       milestoneId,
       pid: w.pid,
       state: w.state,
       currentUnit: null,
-      completedUnits: w.completedUnits,
+      completedUnits: 0,
       cost: w.cost,
       lastHeartbeat: Date.now(),
       startedAt: w.startedAt,
       worktreePath: w.worktreePath,
     });
+    persistState(basePath);
   });
 
   return true;
@@ -357,7 +705,8 @@ function resolveGsdBin(): string | null {
   let thisDir: string;
   try {
     thisDir = dirname(fileURLToPath(import.meta.url));
-  } catch {
+  } catch (e) {
+    logWarning("parallel", `dirname(fileURLToPath) failed: ${(e as Error).message}`);
     thisDir = process.cwd();
   }
   const candidates = [
@@ -385,7 +734,7 @@ function processWorkerLine(basePath: string, milestoneId: string, line: string):
   try {
     event = JSON.parse(line);
   } catch {
-    return; // Not valid JSON — skip (stderr leakage, debug output, etc.)
+    return; // Non-NDJSON lines (progress text, tool output) are expected — silent drop
   }
 
   const type = String(event.type ?? "");
@@ -410,14 +759,6 @@ function processWorkerLine(basePath: string, milestoneId: string, line: string):
       }
     }
 
-    // Track completed units (each message_end from assistant = progress)
-    if (msg.role === "assistant") {
-      const worker = state.workers.get(milestoneId);
-      if (worker) {
-        worker.completedUnits++;
-      }
-    }
-
     // Update session status file so dashboard sees live cost
     const worker = state.workers.get(milestoneId);
     if (worker) {
@@ -426,7 +767,7 @@ function processWorkerLine(basePath: string, milestoneId: string, line: string):
         pid: worker.pid,
         state: worker.state,
         currentUnit: null,
-        completedUnits: worker.completedUnits,
+        completedUnits: 0,
         cost: worker.cost,
         lastHeartbeat: Date.now(),
         startedAt: worker.startedAt,
@@ -445,7 +786,7 @@ function processWorkerLine(basePath: string, milestoneId: string, line: string):
         pid: worker.pid,
         state: worker.state,
         currentUnit: null,
-        completedUnits: worker.completedUnits,
+        completedUnits: 0,
         cost: worker.cost,
         lastHeartbeat: Date.now(),
         startedAt: worker.startedAt,
@@ -485,11 +826,32 @@ export async function stopParallel(
       try {
         if (worker.process) {
           worker.process.kill("SIGTERM");
-        } else {
+        } else if (worker.pid !== process.pid) {
           process.kill(worker.pid, "SIGTERM");
         }
-      } catch { /* process may already be dead */ }
+      } catch (e) { logWarning("parallel", `process.kill SIGTERM failed for pid ${worker.pid}: ${(e as Error).message}`); }
     }
+
+    // Wait for the headless process to cascade SIGTERM to its RPC child.
+    // The headless signal handler calls client.stop() which sends SIGTERM
+    // to the RPC child and waits up to 1000ms. The previous 750ms window
+    // was insufficient — the parent got SIGKILL before the child died,
+    // leaving orphaned RPC processes holding auto.lock. See #2798.
+    const exitedAfterTerm = await waitForWorkerExit(worker, 3000);
+    if (!exitedAfterTerm && worker.pid > 0) {
+      try {
+        if (worker.process) {
+          worker.process.kill("SIGKILL");
+        } else if (worker.pid !== process.pid) {
+          process.kill(worker.pid, "SIGKILL");
+        }
+      } catch (e) { logWarning("parallel", `process.kill SIGKILL failed for pid ${worker.pid}: ${(e as Error).message}`); }
+      await waitForWorkerExit(worker, 250);
+    }
+
+    // Remove stream listeners before releasing the process handle
+    worker.cleanup?.();
+    worker.cleanup = undefined;
 
     // Update in-memory state
     worker.state = "stopped";
@@ -503,6 +865,15 @@ export async function stopParallel(
   if (!milestoneId) {
     state.active = false;
   }
+
+  // Persist final state and clean up state file
+  removeStateFile(basePath);
+}
+
+export async function shutdownParallel(basePath: string): Promise<void> {
+  if (!state) return;
+  await stopParallel(basePath);
+  resetOrchestrator();
 }
 
 // ─── Pause / Resume ────────────────────────────────────────────────────────
@@ -553,7 +924,13 @@ export function resumeWorker(
  * Poll worker statuses from disk and update orchestrator state.
  * Call this periodically from the dashboard refresh cycle.
  */
-export function refreshWorkerStatuses(basePath: string): void {
+export function refreshWorkerStatuses(
+  basePath: string,
+  options: { restoreIfNeeded?: boolean } = {},
+): void {
+  if (!state && options.restoreIfNeeded) {
+    restoreRuntimeState(basePath);
+  }
   if (!state) return;
 
   // Clean up stale sessions first
@@ -561,6 +938,8 @@ export function refreshWorkerStatuses(basePath: string): void {
   for (const mid of staleIds) {
     const worker = state.workers.get(mid);
     if (worker) {
+      worker.cleanup?.();
+      worker.cleanup = undefined;
       worker.state = "error";
       worker.process = null;
     }
@@ -576,10 +955,17 @@ export function refreshWorkerStatuses(basePath: string): void {
   // Update in-memory worker state from disk data
   for (const [mid, worker] of state.workers) {
     const diskStatus = statusMap.get(mid);
-    if (!diskStatus) continue;
+    if (!diskStatus) {
+      if (!isPidAlive(worker.pid)) {
+        worker.cleanup?.();
+        worker.cleanup = undefined;
+        worker.state = "error";
+        worker.process = null;
+      }
+      continue;
+    }
 
     worker.state = diskStatus.state;
-    worker.completedUnits = diskStatus.completedUnits;
     worker.cost = diskStatus.cost;
     worker.pid = diskStatus.pid;
   }
@@ -589,6 +975,21 @@ export function refreshWorkerStatuses(basePath: string): void {
   for (const worker of state.workers.values()) {
     state.totalCost += worker.cost;
   }
+
+  // If all workers are in a terminal state (error/stopped), the orchestration
+  // is finished — deactivate and clean up so zombie workers don't persist.
+  const allDead = [...state.workers.values()].every(
+    (w) => w.state === "error" || w.state === "stopped",
+  );
+  if (allDead) {
+    state.active = false;
+    removeStateFile(basePath);
+    state = null;
+    return;
+  }
+
+  // Persist updated state for crash recovery
+  persistState(basePath);
 }
 
 // ─── Budget ────────────────────────────────────────────────────────────────
@@ -610,5 +1011,15 @@ export function isBudgetExceeded(): boolean {
 
 /** Reset orchestrator state. Called on clean shutdown. */
 export function resetOrchestrator(): void {
+  if (state) {
+    // Explicitly release all WorkerInfo references and run any pending
+    // cleanup callbacks so child process stream closures are freed.
+    for (const w of state.workers.values()) {
+      w.cleanup?.();
+      w.cleanup = undefined;
+      w.process = null;
+    }
+    state.workers.clear();
+  }
   state = null;
 }

@@ -12,6 +12,11 @@ import type { ServerConfig } from "./types.js";
 const require = createRequire(import.meta.url);
 const DEFAULTS = require("./defaults.json") as Record<string, Partial<ServerConfig>>;
 
+/** Map legacy server keys to their current names so user overrides still merge. */
+const LEGACY_ALIASES: Record<string, string> = {
+	"kotlin-language-server": "kotlin-lsp",
+};
+
 export interface LspConfig {
 	servers: Record<string, ServerConfig>;
 	/** Idle timeout in milliseconds. If set, LSP clients will be shutdown after this period of inactivity. Disabled by default. */
@@ -109,7 +114,8 @@ function mergeServers(
 	overrides: Record<string, Partial<ServerConfig>>,
 ): Record<string, ServerConfig> {
 	const merged: Record<string, ServerConfig> = { ...base };
-	for (const [name, config] of Object.entries(overrides)) {
+	for (const [rawName, config] of Object.entries(overrides)) {
+		const name = LEGACY_ALIASES[rawName] ?? rawName;
 		if (merged[name]) {
 			const candidate = { ...merged[name], ...config };
 			const normalized = normalizeServerConfig(name, candidate);
@@ -176,10 +182,17 @@ const LOCAL_BIN_PATHS: Array<{ markers: string[]; binDir: string }> = [
 	{ markers: ["go.mod", "go.sum"], binDir: "bin" },
 ];
 
-function which(command: string): string | null {
-	const result = spawnSync("which", [command], { encoding: "utf-8" });
+export function which(command: string): string | null {
+	// On Windows, prefer `where.exe` over `which` — MSYS/Git Bash's `which`
+	// returns POSIX paths (/c/Users/...) that Node's spawn() can't execute.
+	// `where.exe` returns native Windows paths (C:\Users\...).
+	const isWindows = process.platform === "win32";
+	const cmd = isWindows ? "where.exe" : "which";
+	const result = spawnSync(cmd, [command], { encoding: "utf-8", shell: isWindows });
 	if (result.status !== 0) return null;
-	return result.stdout.trim() || null;
+	// `where.exe` may return multiple lines — take the first
+	const resolved = result.stdout.trim().split(/\r?\n/)[0]?.trim();
+	return resolved || null;
 }
 
 export function resolveCommand(command: string, cwd: string): string | null {
@@ -313,13 +326,5 @@ export function getServersForFile(config: LspConfig, filePath: string): Array<[s
 }
 
 export function getServerForFile(config: LspConfig, filePath: string): [string, ServerConfig] | null {
-	const servers = getServersForFile(config, filePath);
-	return servers.length > 0 ? servers[0] : null;
-}
-
-export function hasCapability(
-	config: ServerConfig,
-	capability: keyof NonNullable<ServerConfig["capabilities"]>,
-): boolean {
-	return config.capabilities?.[capability] === true;
+	return getServersForFile(config, filePath)[0] ?? null;
 }

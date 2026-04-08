@@ -235,6 +235,33 @@ export function validateTaskPlanContent(file: string, content: string): Validati
     }
   }
 
+  // Rule: Inputs and Expected Output should contain backtick-wrapped file paths
+  const inputsSection = getSection(content, "Inputs", 2);
+  const outputSection = getSection(content, "Expected Output", 2);
+  const backtickPathPattern = /`[^`]*[./][^`]*`/;
+
+  if (outputSection === null || !backtickPathPattern.test(outputSection)) {
+    issues.push({
+      severity: "warning",
+      scope: "task-plan",
+      file,
+      ruleId: "missing_output_file_paths",
+      message: "Task plan `## Expected Output` is missing or has no backtick-wrapped file paths.",
+      suggestion: "List concrete output file paths in backticks (e.g. `src/types.ts`). These are machine-parsed to derive task dependencies.",
+    });
+  }
+
+  if (inputsSection !== null && inputsSection.trim().length > 0 && !backtickPathPattern.test(inputsSection)) {
+    issues.push({
+      severity: "info",
+      scope: "task-plan",
+      file,
+      ruleId: "missing_input_file_paths",
+      message: "Task plan `## Inputs` has content but no backtick-wrapped file paths.",
+      suggestion: "List input file paths in backticks (e.g. `src/config.json`). These are machine-parsed to derive task dependencies.",
+    });
+  }
+
   // ── Observability rules (gated by runtime relevance) ──
 
   const relevant = textSuggestsObservabilityRelevant(content);
@@ -295,6 +322,27 @@ export function validateTaskSummaryContent(file: string, content: string): Valid
       ruleId: "diagnostics_placeholder_only",
       message: "Task summary diagnostics section still looks like placeholder text.",
       suggestion: "Replace placeholders with concrete commands, endpoints, logs, error shapes, or failure artifacts.",
+    });
+  }
+
+  const evidence = getSection(content, "Verification Evidence", 2);
+  if (!evidence) {
+    issues.push({
+      severity: "warning",
+      scope: "task-summary",
+      file,
+      ruleId: "evidence_block_missing",
+      message: "Task summary is missing `## Verification Evidence`.",
+      suggestion: "Add a verification evidence table showing gate check results (command, exit code, verdict, duration).",
+    });
+  } else if (sectionLooksPlaceholderOnly(evidence)) {
+    issues.push({
+      severity: "warning",
+      scope: "task-summary",
+      file,
+      ruleId: "evidence_block_placeholder",
+      message: "Task summary verification evidence section still looks like placeholder text.",
+      suggestion: "Replace placeholders with actual gate results or note that no verification commands were discovered.",
     });
   }
 

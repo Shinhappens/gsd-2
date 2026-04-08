@@ -1,83 +1,55 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
-import { join, sep } from "node:path";
+import { existsSync, mkdirSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
-import { loadFile, parsePlan, parseRoadmap, parseSummary, saveFile, parseTaskPlanMustHaves, countMustHavesMentionedInSummary } from "./files.js";
-import { resolveMilestoneFile, resolveMilestonePath, resolveSliceFile, resolveSlicePath, resolveTaskFile, resolveTaskFiles, resolveTasksDir, milestonesDir, gsdRoot, relMilestoneFile, relSliceFile, relTaskFile, relSlicePath, relGsdRootFile, resolveGsdRootFile } from "./paths.js";
+import { loadFile, parseSummary, saveFile, parseTaskPlanMustHaves, countMustHavesMentionedInSummary } from "./files.js";
+import { parseRoadmap as parseLegacyRoadmap, parsePlan as parseLegacyPlan } from "./parsers-legacy.js";
+import { isDbAvailable, getMilestoneSlices, getSliceTasks } from "./gsd-db.js";
+import { resolveMilestoneFile, resolveMilestonePath, resolveSliceFile, resolveSlicePath, resolveTaskFile, resolveTasksDir, milestonesDir, gsdRoot, relMilestoneFile, relSliceFile, relTaskFile, relSlicePath, relGsdRootFile, resolveGsdRootFile, relMilestonePath } from "./paths.js";
 import { deriveState, isMilestoneComplete } from "./state.js";
 import { invalidateAllCaches } from "./cache.js";
 import { loadEffectiveGSDPreferences, type GSDPreferences } from "./preferences.js";
-import { listWorktrees, resolveGitDir } from "./worktree-manager.js";
-import { abortAndReset } from "./git-self-heal.js";
-import { RUNTIME_EXCLUSION_PATHS } from "./git-service.js";
-import { nativeIsRepo, nativeWorktreeRemove, nativeBranchList, nativeBranchDelete, nativeLsFiles, nativeRmCached } from "./native-git-bridge.js";
-import { readCrashLock, isLockProcessAlive, clearLock } from "./crash-recovery.js";
-import { ensureGitignore } from "./gitignore.js";
-import { readAllSessionStatuses, isSessionStale, removeSessionStatus } from "./session-status-io.js";
 
-export type DoctorSeverity = "info" | "warning" | "error";
-export type DoctorIssueCode =
-  | "invalid_preferences"
-  | "missing_tasks_dir"
-  | "missing_slice_plan"
-  | "task_done_missing_summary"
-  | "task_summary_without_done_checkbox"
-  | "all_tasks_done_missing_slice_summary"
-  | "all_tasks_done_missing_slice_uat"
-  | "all_tasks_done_roadmap_not_checked"
-  | "slice_checked_missing_summary"
-  | "slice_checked_missing_uat"
-  | "all_slices_done_missing_milestone_validation"
-  | "all_slices_done_missing_milestone_summary"
-  | "task_done_must_haves_not_verified"
-  | "active_requirement_missing_owner"
-  | "blocked_requirement_missing_reason"
-  | "blocker_discovered_no_replan"
-  | "delimiter_in_title"
-  | "orphaned_auto_worktree"
-  | "stale_milestone_branch"
-  | "corrupt_merge_state"
-  | "tracked_runtime_files"
-  | "legacy_slice_branches"
-  | "stale_crash_lock"
-  | "stale_parallel_session"
-  | "orphaned_completed_units"
-  | "stale_hook_state"
-  | "activity_log_bloat"
-  | "state_file_stale"
-  | "state_file_missing"
-  | "gitignore_missing_patterns"
-  | "unresolvable_dependency";
+import type { DoctorIssue, DoctorIssueCode, DoctorReport } from "./doctor-types.js";
+import { GLOBAL_STATE_CODES } from "./doctor-types.js";
+import type { RoadmapSliceEntry } from "./types.js";
+import { checkGitHealth, checkRuntimeHealth, checkGlobalHealth, checkEngineHealth } from "./doctor-checks.js";
+import { checkEnvironmentHealth } from "./doctor-environment.js";
+import { runProviderChecks } from "./doctor-providers.js";
 
-export interface DoctorIssue {
-  severity: DoctorSeverity;
-  code: DoctorIssueCode;
-  scope: "project" | "milestone" | "slice" | "task";
-  unitId: string;
-  message: string;
-  file?: string;
-  fixable: boolean;
-}
+// ── Re-exports ─────────────────────────────────────────────────────────────
+// All public types and functions from extracted modules are re-exported here
+// so that existing imports from "./doctor.js" continue to work unchanged.
+export type { DoctorSeverity, DoctorIssueCode, DoctorIssue, DoctorReport, DoctorSummary } from "./doctor-types.js";
+export { summarizeDoctorIssues, filterDoctorIssues, formatDoctorReport, formatDoctorIssuesForPrompt, formatDoctorReportJson } from "./doctor-format.js";
+export { runEnvironmentChecks, runFullEnvironmentChecks, formatEnvironmentReport, type EnvironmentCheckResult } from "./doctor-environment.js";
+export { computeProgressScore, computeProgressScoreWithContext, formatProgressLine, formatProgressReport, type ProgressScore, type ProgressLevel } from "./progress-score.js";
 
-export interface DoctorReport {
-  ok: boolean;
-  basePath: string;
-  issues: DoctorIssue[];
-  fixesApplied: string[];
-}
+/**
+ * Characters that are used as delimiters in GSD state management documents
+ * and should not appear in milestone or slice titles.
+ *
+ * - "\u2014" (em dash, U+2014): used as a display separator in STATE.md and other docs.
+ *   A title containing "\u2014" makes the separator ambiguous, corrupting state display
+ *   and confusing the LLM agent that reads and writes these files.
+ * - "\u2013" (en dash, U+2013): visually similar to em dash; same ambiguity risk.
+ * - "/" (forward slash, U+002F): used as the path separator in unit IDs (M001/S01)
+ *   and git branch names (gsd/M001/S01). A slash in a title can break path resolution.
+ */
+const TITLE_DELIMITER_RE = /[\u2014\u2013\/]/; // em dash, en dash, forward slash
 
-export interface DoctorSummary {
-  total: number;
-  errors: number;
-  warnings: number;
-  infos: number;
-  fixable: number;
-  byCode: Array<{ code: DoctorIssueCode; count: number }>;
-}
-
-function normalizeStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const items = value.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean);
-  return items.length > 0 ? Array.from(new Set(items)) : undefined;
+/**
+ * Check whether a milestone or slice title contains characters that conflict
+ * with GSD's state document delimiter conventions.
+ * Returns a human-readable description of the problem, or null if the title is safe.
+ */
+export function validateTitle(title: string): string | null {
+  if (TITLE_DELIMITER_RE.test(title)) {
+    const found: string[] = [];
+    if (/[\u2014\u2013]/.test(title)) found.push("em/en dash (\u2014 or \u2013)");
+    if (/\//.test(title)) found.push("forward slash (/)");
+    return `title contains ${found.join(" and ")}, which conflict with GSD state document delimiters`;
+  }
+  return null;
 }
 
 function validatePreferenceShape(preferences: GSDPreferences): string[] {
@@ -115,35 +87,8 @@ function validatePreferenceShape(preferences: GSDPreferences): string[] {
   return issues;
 }
 
-/**
- * Characters that are used as delimiters in GSD state management documents
- * and should not appear in milestone or slice titles.
- *
- * - "—" (em dash, U+2014): used as a display separator in STATE.md and other docs.
- *   A title containing "—" makes the separator ambiguous, corrupting state display
- *   and confusing the LLM agent that reads and writes these files.
- * - "–" (en dash, U+2013): visually similar to em dash; same ambiguity risk.
- * - "/" (forward slash, U+002F): used as the path separator in unit IDs (M001/S01)
- *   and git branch names (gsd/M001/S01). A slash in a title can break path resolution.
- */
-const TITLE_DELIMITER_RE = /[\u2014\u2013\/]/; // em dash, en dash, forward slash
-
-/**
- * Check whether a milestone or slice title contains characters that conflict
- * with GSD's state document delimiter conventions.
- * Returns a human-readable description of the problem, or null if the title is safe.
- */
-export function validateTitle(title: string): string | null {
-  if (TITLE_DELIMITER_RE.test(title)) {
-    const found: string[] = [];
-    if (/[\u2014\u2013]/.test(title)) found.push("em/en dash (\u2014 or \u2013)");
-    if (/\//.test(title)) found.push("forward slash (/)");
-    return `title contains ${found.join(" and ")}, which conflict with GSD state document delimiters`;
-  }
-  return null;
-}
-
-function buildStateMarkdown(state: Awaited<ReturnType<typeof deriveState>>): string {
+/** Build STATE.md content from derived state. Exported for guided-flow pre-dispatch rebuild (#3475). */
+export function buildStateMarkdown(state: Awaited<ReturnType<typeof deriveState>>): string {
   const lines: string[] = [];
   lines.push("# GSD State", "");
 
@@ -158,13 +103,13 @@ function buildStateMarkdown(state: Awaited<ReturnType<typeof deriveState>>): str
   lines.push(`**Active Slice:** ${activeSlice}`);
   lines.push(`**Phase:** ${state.phase}`);
   if (state.requirements) {
-    lines.push(`**Requirements Status:** ${state.requirements.active} active · ${state.requirements.validated} validated · ${state.requirements.deferred} deferred · ${state.requirements.outOfScope} out of scope`);
+    lines.push(`**Requirements Status:** ${state.requirements.active} active \u00b7 ${state.requirements.validated} validated \u00b7 ${state.requirements.deferred} deferred \u00b7 ${state.requirements.outOfScope} out of scope`);
   }
   lines.push("");
   lines.push("## Milestone Registry");
 
   for (const entry of state.registry) {
-    const glyph = entry.status === "complete" ? "✅" : entry.status === "active" ? "🔄" : "⬜";
+    const glyph = entry.status === "complete" ? "\u2705" : entry.status === "active" ? "\uD83D\uDD04" : entry.status === "parked" ? "\u23F8\uFE0F" : "\u2B1C";
     lines.push(`- ${glyph} **${entry.id}:** ${entry.title}`);
   }
 
@@ -207,134 +152,9 @@ export async function rebuildState(basePath: string): Promise<void> {
   await saveFile(path, buildStateMarkdown(state));
 }
 
-async function ensureSliceSummaryStub(basePath: string, milestoneId: string, sliceId: string, fixesApplied: string[]): Promise<void> {
-  const path = join(resolveSlicePath(basePath, milestoneId, sliceId) ?? relSlicePath(basePath, milestoneId, sliceId), `${sliceId}-SUMMARY.md`);
-  const absolute = resolveSliceFile(basePath, milestoneId, sliceId, "SUMMARY") ?? join(resolveSlicePath(basePath, milestoneId, sliceId)!, `${sliceId}-SUMMARY.md`);
-  const content = [
-    "---",
-    `id: ${sliceId}`,
-    `parent: ${milestoneId}`,
-    `milestone: ${milestoneId}`,
-    "provides: []",
-    "requires: []",
-    "affects: []",
-    "key_files: []",
-    "key_decisions: []",
-    "patterns_established: []",
-    "observability_surfaces:",
-    "  - none yet — doctor created placeholder summary; replace with real diagnostics before treating as complete",
-    "drill_down_paths: []",
-    "duration: unknown",
-    "verification_result: unknown",
-    `completed_at: ${new Date().toISOString()}`,
-    "---",
-    "",
-    `# ${sliceId}: Recovery placeholder summary`,
-    "",
-    "**Doctor-created placeholder.**",
-    "",
-    "## What Happened",
-    "Doctor detected that all tasks were complete but the slice summary was missing. Replace this with a real compressed slice summary before relying on it.",
-    "",
-    "## Verification",
-    "Not re-run by doctor.",
-    "",
-    "## Deviations",
-    "Recovery placeholder created to restore required artifact shape.",
-    "",
-    "## Known Limitations",
-    "This file is intentionally incomplete and should be replaced by a real summary.",
-    "",
-    "## Follow-ups",
-    "- Regenerate this summary from task summaries.",
-    "",
-    "## Files Created/Modified",
-    `- \`${relSliceFile(basePath, milestoneId, sliceId, "SUMMARY")}\` — doctor-created placeholder summary`,
-    "",
-    "## Forward Intelligence",
-    "",
-    "### What the next slice should know",
-    "- Doctor had to reconstruct completion artifacts; inspect task summaries before continuing.",
-    "",
-    "### What's fragile",
-    "- Placeholder summary exists solely to unblock invariant checks.",
-    "",
-    "### Authoritative diagnostics",
-    "- Task summaries in the slice tasks/ directory — they are the actual authoritative source until this summary is rewritten.",
-    "",
-    "### What assumptions changed",
-    "- The system assumed completion would always write a slice summary; in practice doctor may need to restore missing artifacts.",
-    "",
-  ].join("\n");
-  await saveFile(absolute, content);
-  fixesApplied.push(`created placeholder ${absolute}`);
-}
-
-async function ensureSliceUatStub(basePath: string, milestoneId: string, sliceId: string, fixesApplied: string[]): Promise<void> {
-  const sDir = resolveSlicePath(basePath, milestoneId, sliceId);
-  if (!sDir) return;
-  const absolute = join(sDir, `${sliceId}-UAT.md`);
-  const content = [
-    `# ${sliceId}: Recovery placeholder UAT`,
-    "",
-    `**Milestone:** ${milestoneId}`,
-    `**Written:** ${new Date().toISOString()}`,
-    "",
-    "## Preconditions",
-    "- Doctor created this placeholder because the expected UAT file was missing.",
-    "",
-    "## Smoke Test",
-    "- Re-run the slice verification from the slice plan before shipping.",
-    "",
-    "## Test Cases",
-    "### 1. Replace this placeholder",
-    "1. Read the slice plan and task summaries.",
-    "2. Write a real UAT script.",
-    "3. **Expected:** This placeholder is replaced with meaningful human checks.",
-    "",
-    "## Edge Cases",
-    "### Missing completion artifacts",
-    "1. Confirm the summary, roadmap checkbox, and state file are coherent.",
-    "2. **Expected:** GSD doctor reports no remaining completion drift for this slice.",
-    "",
-    "## Failure Signals",
-    "- Placeholder content still present when treating the slice as done",
-    "",
-    "## Notes for Tester",
-    "Doctor created this file only to restore the required artifact shape. Replace it with a real UAT script.",
-    "",
-  ].join("\n");
-  await saveFile(absolute, content);
-  fixesApplied.push(`created placeholder ${absolute}`);
-}
-
-async function markTaskDoneInPlan(basePath: string, milestoneId: string, sliceId: string, taskId: string, fixesApplied: string[]): Promise<void> {
-  const planPath = resolveSliceFile(basePath, milestoneId, sliceId, "PLAN");
-  if (!planPath) return;
-  const content = await loadFile(planPath);
-  if (!content) return;
-  const updated = content.replace(new RegExp(`^-\\s+\\[ \\]\\s+\\*\\*${taskId}:`, "m"), `- [x] **${taskId}:`);
-  if (updated !== content) {
-    await saveFile(planPath, updated);
-    fixesApplied.push(`marked ${taskId} done in ${planPath}`);
-  }
-}
-
-async function markSliceDoneInRoadmap(basePath: string, milestoneId: string, sliceId: string, fixesApplied: string[]): Promise<void> {
-  const roadmapPath = resolveMilestoneFile(basePath, milestoneId, "ROADMAP");
-  if (!roadmapPath) return;
-  const content = await loadFile(roadmapPath);
-  if (!content) return;
-  const updated = content.replace(new RegExp(`^-\\s+\\[ \\]\\s+\\*\\*${sliceId}:`, "m"), `- [x] **${sliceId}:`);
-  if (updated !== content) {
-    await saveFile(roadmapPath, updated);
-    fixesApplied.push(`marked ${sliceId} done in ${roadmapPath}`);
-  }
-}
-
 function matchesScope(unitId: string, scope?: string): boolean {
   if (!scope) return true;
-  return unitId === scope || unitId.startsWith(`${scope}/`) || unitId.startsWith(`${scope}`);
+  return unitId === scope || unitId.startsWith(`${scope}/`);
 }
 
 function auditRequirements(content: string | null): DoctorIssue[] {
@@ -378,21 +198,6 @@ function auditRequirements(content: string | null): DoctorIssue[] {
   return issues;
 }
 
-export function summarizeDoctorIssues(issues: DoctorIssue[]): DoctorSummary {
-  const errors = issues.filter(issue => issue.severity === "error").length;
-  const warnings = issues.filter(issue => issue.severity === "warning").length;
-  const infos = issues.filter(issue => issue.severity === "info").length;
-  const fixable = issues.filter(issue => issue.fixable).length;
-  const byCodeMap = new Map<DoctorIssueCode, number>();
-  for (const issue of issues) {
-    byCodeMap.set(issue.code, (byCodeMap.get(issue.code) ?? 0) + 1);
-  }
-  const byCode = [...byCodeMap.entries()]
-    .map(([code, count]) => ({ code, count }))
-    .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code));
-  return { total: issues.length, errors, warnings, infos, fixable, byCode };
-}
-
 export async function selectDoctorScope(basePath: string, requestedScope?: string): Promise<string | undefined> {
   if (requestedScope) return requestedScope;
 
@@ -411,570 +216,117 @@ export async function selectDoctorScope(basePath: string, requestedScope?: strin
     const roadmapPath = resolveMilestoneFile(basePath, milestone.id, "ROADMAP");
     const roadmapContent = roadmapPath ? await loadFile(roadmapPath) : null;
     if (!roadmapContent) continue;
-    const roadmap = parseRoadmap(roadmapContent);
-    if (!isMilestoneComplete(roadmap)) return milestone.id;
+    if (isDbAvailable()) {
+      const dbSlices = getMilestoneSlices(milestone.id);
+      const allDone = dbSlices.length > 0 && dbSlices.every(s => s.status === "complete");
+      if (!allDone) return milestone.id;
+    } else {
+      const roadmap = parseLegacyRoadmap(roadmapContent);
+      if (!isMilestoneComplete(roadmap)) return milestone.id;
+    }
   }
 
   return state.registry[0]?.id;
 }
 
-export function filterDoctorIssues(issues: DoctorIssue[], options?: { scope?: string; includeWarnings?: boolean; includeHistorical?: boolean }): DoctorIssue[] {
-  let filtered = issues;
-  if (options?.scope) filtered = filtered.filter(issue => matchesScope(issue.unitId, options.scope));
-  if (!options?.includeWarnings) filtered = filtered.filter(issue => issue.severity === "error");
-  return filtered;
+// ── Helper: circular dependency detection ──────────────────────────────────
+function detectCircularDependencies(slices: RoadmapSliceEntry[]): string[][] {
+  const known = new Set(slices.map(s => s.id));
+  const adj = new Map<string, string[]>();
+  for (const s of slices) adj.set(s.id, s.depends.filter(d => known.has(d)));
+  const state = new Map<string, "unvisited" | "visiting" | "done">();
+  for (const s of slices) state.set(s.id, "unvisited");
+  const cycles: string[][] = [];
+  function dfs(id: string, path: string[]): void {
+    const st = state.get(id);
+    if (st === "done") return;
+    if (st === "visiting") { cycles.push([...path.slice(path.indexOf(id)), id]); return; }
+    state.set(id, "visiting");
+    for (const dep of adj.get(id) ?? []) dfs(dep, [...path, id]);
+    state.set(id, "done");
+  }
+  for (const s of slices) if (state.get(s.id) === "unvisited") dfs(s.id, []);
+  return cycles;
 }
 
-export function formatDoctorReport(
-  report: DoctorReport,
-  options?: { scope?: string; includeWarnings?: boolean; maxIssues?: number; title?: string },
-): string {
-  const scopedIssues = filterDoctorIssues(report.issues, {
-    scope: options?.scope,
-    includeWarnings: options?.includeWarnings ?? true,
-  });
-  const summary = summarizeDoctorIssues(scopedIssues);
-  const maxIssues = options?.maxIssues ?? 12;
-  const lines: string[] = [];
-  lines.push(options?.title ?? (summary.errors > 0 ? "GSD doctor found blocking issues." : "GSD doctor report."));
-  lines.push(`Scope: ${options?.scope ?? "all milestones"}`);
-  lines.push(`Issues: ${summary.total} total · ${summary.errors} error(s) · ${summary.warnings} warning(s) · ${summary.fixable} fixable`);
-
-  if (summary.byCode.length > 0) {
-    lines.push("Top issue types:");
-    for (const item of summary.byCode.slice(0, 5)) {
-      lines.push(`- ${item.code}: ${item.count}`);
-    }
-  }
-
-  if (scopedIssues.length > 0) {
-    lines.push("Priority issues:");
-    for (const issue of scopedIssues.slice(0, maxIssues)) {
-      const prefix = issue.severity === "error" ? "ERROR" : issue.severity === "warning" ? "WARN" : "INFO";
-      lines.push(`- [${prefix}] ${issue.unitId}: ${issue.message}${issue.file ? ` (${issue.file})` : ""}`);
-    }
-    if (scopedIssues.length > maxIssues) {
-      lines.push(`- ...and ${scopedIssues.length - maxIssues} more in scope`);
-    }
-  }
-
-  if (report.fixesApplied.length > 0) {
-    lines.push("Fixes applied:");
-    for (const fix of report.fixesApplied.slice(0, maxIssues)) lines.push(`- ${fix}`);
-    if (report.fixesApplied.length > maxIssues) lines.push(`- ...and ${report.fixesApplied.length - maxIssues} more`);
-  }
-
-  return lines.join("\n");
+// ── Helper: doctor run history ──────────────────────────────────────────────
+export interface DoctorHistoryEntry {
+  ts: string;
+  ok: boolean;
+  errors: number;
+  warnings: number;
+  fixes: number;
+  codes: string[];
+  /** Issue messages with severity and scope (added in Phase 2). */
+  issues?: Array<{ severity: string; code: string; message: string; unitId: string }>;
+  /** Fix descriptions applied during this run (added in Phase 2). */
+  fixDescriptions?: string[];
+  /** Milestone/slice scope this doctor run was scoped to (e.g. "M001/S02"). */
+  scope?: string;
+  /** Human-readable one-line summary of this doctor run. */
+  summary?: string;
 }
 
-export function formatDoctorIssuesForPrompt(issues: DoctorIssue[]): string {
-  if (issues.length === 0) return "- No remaining issues in scope.";
-  return issues.map(issue => {
-    const prefix = issue.severity === "error" ? "ERROR" : issue.severity === "warning" ? "WARN" : "INFO";
-    return `- [${prefix}] ${issue.unitId} | ${issue.code} | ${issue.message}${issue.file ? ` | file: ${issue.file}` : ""} | fixable: ${issue.fixable ? "yes" : "no"}`;
-  }).join("\n");
+async function appendDoctorHistory(basePath: string, report: DoctorReport): Promise<void> {
+  try {
+    const historyPath = join(gsdRoot(basePath), "doctor-history.jsonl");
+    const errorCount = report.issues.filter(i => i.severity === "error").length;
+    const warningCount = report.issues.filter(i => i.severity === "warning").length;
+    const issueDetails = report.issues
+      .filter(i => i.severity === "error" || i.severity === "warning")
+      .slice(0, 10) // cap to keep JSONL lines bounded
+      .map(i => ({ severity: i.severity, code: i.code, message: i.message, unitId: i.unitId }));
+
+    // Human-readable one-line summary
+    const summaryParts: string[] = [];
+    if (report.ok) {
+      summaryParts.push("Clean");
+    } else {
+      const counts: string[] = [];
+      if (errorCount > 0) counts.push(`${errorCount} error${errorCount > 1 ? "s" : ""}`);
+      if (warningCount > 0) counts.push(`${warningCount} warning${warningCount > 1 ? "s" : ""}`);
+      summaryParts.push(counts.join(", "));
+    }
+    if (report.fixesApplied.length > 0) {
+      summaryParts.push(`${report.fixesApplied.length} fixed`);
+    }
+    if (issueDetails.length > 0) {
+      const topIssue = issueDetails.find(i => i.severity === "error") ?? issueDetails[0]!;
+      summaryParts.push(topIssue.message);
+    }
+
+    const entry = JSON.stringify({
+      ts: new Date().toISOString(),
+      ok: report.ok,
+      errors: errorCount,
+      warnings: warningCount,
+      fixes: report.fixesApplied.length,
+      codes: [...new Set(report.issues.map(i => i.code))],
+      issues: issueDetails.length > 0 ? issueDetails : undefined,
+      fixDescriptions: report.fixesApplied.length > 0 ? report.fixesApplied : undefined,
+      scope: (report as any).scope as string | undefined,
+      summary: summaryParts.join(" · "),
+    } satisfies DoctorHistoryEntry);
+    const existing = existsSync(historyPath) ? readFileSync(historyPath, "utf-8") : "";
+    await saveFile(historyPath, existing + entry + "\n");
+  } catch { /* non-fatal */ }
 }
 
-async function checkGitHealth(
-  basePath: string,
-  issues: DoctorIssue[],
-  fixesApplied: string[],
-  shouldFix: (code: DoctorIssueCode) => boolean,
-  isolationMode: "none" | "worktree" | "branch" = "worktree",
-): Promise<void> {
-  // Degrade gracefully if not a git repo
-  if (!nativeIsRepo(basePath)) {
-    return; // Not a git repo — skip all git health checks
-  }
-
-  const gitDir = resolveGitDir(basePath);
-
-  // ── Orphaned auto-worktrees & Stale milestone branches ────────────────
-  // These checks only apply in worktree/branch modes — skip in none mode
-  // where no milestone worktrees or branches are created.
-  if (isolationMode !== "none") {
+/** Read the last N doctor history entries. Returns most-recent-first. */
+export async function readDoctorHistory(basePath: string, lastN = 50): Promise<DoctorHistoryEntry[]> {
   try {
-    const worktrees = listWorktrees(basePath);
-    const milestoneWorktrees = worktrees.filter(wt => wt.branch.startsWith("milestone/"));
-
-    // Load roadmap state once for cross-referencing
-    const state = await deriveState(basePath);
-
-    for (const wt of milestoneWorktrees) {
-      // Extract milestone ID from branch name "milestone/M001" → "M001"
-      const milestoneId = wt.branch.replace(/^milestone\//, "");
-      const milestoneEntry = state.registry.find(m => m.id === milestoneId);
-
-      // Check if milestone is complete via roadmap
-      let isComplete = false;
-      if (milestoneEntry) {
-        const roadmapPath = resolveMilestoneFile(basePath, milestoneId, "ROADMAP");
-        const roadmapContent = roadmapPath ? await loadFile(roadmapPath) : null;
-        if (roadmapContent) {
-          const roadmap = parseRoadmap(roadmapContent);
-          isComplete = isMilestoneComplete(roadmap);
-        }
-      }
-
-      if (isComplete) {
-        issues.push({
-          severity: "warning",
-          code: "orphaned_auto_worktree",
-          scope: "milestone",
-          unitId: milestoneId,
-          message: `Worktree for completed milestone ${milestoneId} still exists at ${wt.path}`,
-          fixable: true,
-        });
-
-        if (shouldFix("orphaned_auto_worktree")) {
-          // Never remove a worktree matching current working directory
-          const cwd = process.cwd();
-          if (wt.path === cwd || cwd.startsWith(wt.path + sep)) {
-            fixesApplied.push(`skipped removing worktree at ${wt.path} (is cwd)`);
-          } else {
-            try {
-              nativeWorktreeRemove(basePath, wt.path, true);
-              fixesApplied.push(`removed orphaned worktree ${wt.path}`);
-            } catch {
-              fixesApplied.push(`failed to remove worktree ${wt.path}`);
-            }
-          }
-        }
-      }
-    }
-
-    // ── Stale milestone branches ─────────────────────────────────────────
-    try {
-      const branches = nativeBranchList(basePath, "milestone/*");
-      if (branches.length > 0) {
-        const worktreeBranches = new Set(milestoneWorktrees.map(wt => wt.branch));
-
-        for (const branch of branches) {
-          // Skip branches that have a worktree (handled above)
-          if (worktreeBranches.has(branch)) continue;
-
-          const milestoneId = branch.replace(/^milestone\//, "");
-          const roadmapPath = resolveMilestoneFile(basePath, milestoneId, "ROADMAP");
-          const roadmapContent = roadmapPath ? await loadFile(roadmapPath) : null;
-          if (!roadmapContent) continue;
-
-          const roadmap = parseRoadmap(roadmapContent);
-          if (isMilestoneComplete(roadmap)) {
-            issues.push({
-              severity: "info",
-              code: "stale_milestone_branch",
-              scope: "milestone",
-              unitId: milestoneId,
-              message: `Branch ${branch} exists for completed milestone ${milestoneId}`,
-              fixable: true,
-            });
-
-            if (shouldFix("stale_milestone_branch")) {
-              try {
-                nativeBranchDelete(basePath, branch, true);
-                fixesApplied.push(`deleted stale branch ${branch}`);
-              } catch {
-                fixesApplied.push(`failed to delete branch ${branch}`);
-              }
-            }
-          }
-        }
-      }
-    } catch {
-      // git branch list failed — skip stale branch check
-    }
-  } catch {
-    // listWorktrees or deriveState failed — skip worktree/branch checks
-  }
-  } // end isolationMode !== "none"
-
-  // ── Corrupt merge state ────────────────────────────────────────────────
-  try {
-    const mergeStateFiles = ["MERGE_HEAD", "SQUASH_MSG"];
-    const mergeStateDirs = ["rebase-apply", "rebase-merge"];
-    const found: string[] = [];
-
-    for (const f of mergeStateFiles) {
-      if (existsSync(join(gitDir, f))) found.push(f);
-    }
-    for (const d of mergeStateDirs) {
-      if (existsSync(join(gitDir, d))) found.push(d);
-    }
-
-    if (found.length > 0) {
-      issues.push({
-        severity: "error",
-        code: "corrupt_merge_state",
-        scope: "project",
-        unitId: "project",
-        message: `Corrupt merge/rebase state detected: ${found.join(", ")}`,
-        fixable: true,
-      });
-
-      if (shouldFix("corrupt_merge_state")) {
-        const result = abortAndReset(basePath);
-        fixesApplied.push(`cleaned merge state: ${result.cleaned.join(", ")}`);
-      }
-    }
-  } catch {
-    // Can't check .git dir — skip
-  }
-
-  // ── Tracked runtime files ──────────────────────────────────────────────
-  try {
-    const trackedPaths: string[] = [];
-    for (const exclusion of RUNTIME_EXCLUSION_PATHS) {
-      try {
-        const files = nativeLsFiles(basePath, exclusion);
-        if (files.length > 0) {
-          trackedPaths.push(...files);
-        }
-      } catch {
-        // Individual ls-files can fail — continue
-      }
-    }
-
-    if (trackedPaths.length > 0) {
-      issues.push({
-        severity: "warning",
-        code: "tracked_runtime_files",
-        scope: "project",
-        unitId: "project",
-        message: `${trackedPaths.length} runtime file(s) are tracked by git: ${trackedPaths.slice(0, 5).join(", ")}${trackedPaths.length > 5 ? "..." : ""}`,
-        fixable: true,
-      });
-
-      if (shouldFix("tracked_runtime_files")) {
-        try {
-          for (const exclusion of RUNTIME_EXCLUSION_PATHS) {
-            nativeRmCached(basePath, [exclusion]);
-          }
-          fixesApplied.push(`untracked ${trackedPaths.length} runtime file(s)`);
-        } catch {
-          fixesApplied.push("failed to untrack runtime files");
-        }
-      }
-    }
-  } catch {
-    // git ls-files failed — skip
-  }
-
-  // ── Legacy slice branches ──────────────────────────────────────────────
-  try {
-    const branchList = nativeBranchList(basePath, "gsd/*/*");
-    if (branchList.length > 0) {
-      issues.push({
-        severity: "info",
-        code: "legacy_slice_branches",
-        scope: "project",
-        unitId: "project",
-        message: `${branchList.length} legacy slice branch(es) found: ${branchList.slice(0, 3).join(", ")}${branchList.length > 3 ? "..." : ""}. These are no longer used (branchless architecture). Delete with: git branch -D ${branchList.join(" ")}`,
-        fixable: false,
-      });
-    }
-  } catch {
-    // git branch list failed — skip
-  }
+    const historyPath = join(gsdRoot(basePath), "doctor-history.jsonl");
+    if (!existsSync(historyPath)) return [];
+    const lines = readFileSync(historyPath, "utf-8").split("\n").filter(l => l.trim());
+    return lines.slice(-lastN).reverse().map(l => JSON.parse(l) as DoctorHistoryEntry);
+  } catch { return []; }
 }
 
-// ── Runtime Health Checks ──────────────────────────────────────────────────
-// Checks for stale crash locks, orphaned completed-units, stale hook state,
-// activity log bloat, STATE.md drift, and gitignore drift.
-
-async function checkRuntimeHealth(
-  basePath: string,
-  issues: DoctorIssue[],
-  fixesApplied: string[],
-  shouldFix: (code: DoctorIssueCode) => boolean,
-): Promise<void> {
-  const root = gsdRoot(basePath);
-
-  // ── Stale crash lock ──────────────────────────────────────────────────
-  try {
-    const lock = readCrashLock(basePath);
-    if (lock) {
-      const alive = isLockProcessAlive(lock);
-      if (!alive) {
-        issues.push({
-          severity: "error",
-          code: "stale_crash_lock",
-          scope: "project",
-          unitId: "project",
-          message: `Stale auto.lock from PID ${lock.pid} (started ${lock.startedAt}, was executing ${lock.unitType} ${lock.unitId}) — process is no longer running`,
-          file: ".gsd/auto.lock",
-          fixable: true,
-        });
-
-        if (shouldFix("stale_crash_lock")) {
-          clearLock(basePath);
-          fixesApplied.push("cleared stale auto.lock");
-        }
-      }
-    }
-  } catch {
-    // Non-fatal — crash lock check failed
-  }
-
-  // ── Stale parallel sessions ────────────────────────────────────────────
-  try {
-    const parallelStatuses = readAllSessionStatuses(basePath);
-    for (const status of parallelStatuses) {
-      if (isSessionStale(status)) {
-        issues.push({
-          severity: "warning",
-          code: "stale_parallel_session",
-          scope: "project",
-          unitId: status.milestoneId,
-          message: `Stale parallel session for ${status.milestoneId} (PID ${status.pid}, started ${new Date(status.startedAt).toISOString()}, last heartbeat ${new Date(status.lastHeartbeat).toISOString()}) — process is no longer running`,
-          file: `.gsd/parallel/${status.milestoneId}.status.json`,
-          fixable: true,
-        });
-
-        if (shouldFix("stale_parallel_session")) {
-          removeSessionStatus(basePath, status.milestoneId);
-          fixesApplied.push(`cleaned up stale parallel session for ${status.milestoneId}`);
-        }
-      }
-    }
-  } catch {
-    // Non-fatal — parallel session check failed
-  }
-
-  // ── Orphaned completed-units keys ─────────────────────────────────────
-  try {
-    const completedKeysFile = join(root, "completed-units.json");
-    if (existsSync(completedKeysFile)) {
-      const raw = readFileSync(completedKeysFile, "utf-8");
-      const keys: string[] = JSON.parse(raw);
-      const orphaned: string[] = [];
-
-      for (const key of keys) {
-        // Key format: "unitType/unitId" e.g. "execute-task/M001/S01/T01"
-        const slashIdx = key.indexOf("/");
-        if (slashIdx === -1) continue;
-        const unitType = key.slice(0, slashIdx);
-        const unitId = key.slice(slashIdx + 1);
-
-        // Only validate artifact-producing unit types
-        const { verifyExpectedArtifact } = await import("./auto-recovery.js");
-        if (!verifyExpectedArtifact(unitType, unitId, basePath)) {
-          orphaned.push(key);
-        }
-      }
-
-      if (orphaned.length > 0) {
-        issues.push({
-          severity: "warning",
-          code: "orphaned_completed_units",
-          scope: "project",
-          unitId: "project",
-          message: `${orphaned.length} completed-unit key(s) reference missing artifacts: ${orphaned.slice(0, 3).join(", ")}${orphaned.length > 3 ? "..." : ""}`,
-          file: ".gsd/completed-units.json",
-          fixable: true,
-        });
-
-        if (shouldFix("orphaned_completed_units")) {
-          const { removePersistedKey } = await import("./auto-recovery.js");
-          for (const key of orphaned) {
-            removePersistedKey(basePath, key);
-          }
-          fixesApplied.push(`removed ${orphaned.length} orphaned completed-unit key(s)`);
-        }
-      }
-    }
-  } catch {
-    // Non-fatal — completed-units check failed
-  }
-
-  // ── Stale hook state ──────────────────────────────────────────────────
-  try {
-    const hookStateFile = join(root, "hook-state.json");
-    if (existsSync(hookStateFile)) {
-      const raw = readFileSync(hookStateFile, "utf-8");
-      const state = JSON.parse(raw);
-      const hasCycleCounts = state.cycleCounts && typeof state.cycleCounts === "object"
-        && Object.keys(state.cycleCounts).length > 0;
-
-      // Only flag if there are actual cycle counts AND no auto-mode is running
-      if (hasCycleCounts) {
-        const lock = readCrashLock(basePath);
-        const autoRunning = lock ? isLockProcessAlive(lock) : false;
-
-        if (!autoRunning) {
-          issues.push({
-            severity: "info",
-            code: "stale_hook_state",
-            scope: "project",
-            unitId: "project",
-            message: `hook-state.json has ${Object.keys(state.cycleCounts).length} residual cycle count(s) from a previous session`,
-            file: ".gsd/hook-state.json",
-            fixable: true,
-          });
-
-          if (shouldFix("stale_hook_state")) {
-            const { clearPersistedHookState } = await import("./post-unit-hooks.js");
-            clearPersistedHookState(basePath);
-            fixesApplied.push("cleared stale hook-state.json");
-          }
-        }
-      }
-    }
-  } catch {
-    // Non-fatal — hook state check failed
-  }
-
-  // ── Activity log bloat ────────────────────────────────────────────────
-  try {
-    const activityDir = join(root, "activity");
-    if (existsSync(activityDir)) {
-      const files = readdirSync(activityDir);
-      let totalSize = 0;
-      for (const f of files) {
-        try {
-          totalSize += statSync(join(activityDir, f)).size;
-        } catch {
-          // stat failed — skip
-        }
-      }
-
-      const totalMB = totalSize / (1024 * 1024);
-      const BLOAT_FILE_THRESHOLD = 500;
-      const BLOAT_SIZE_MB = 100;
-
-      if (files.length > BLOAT_FILE_THRESHOLD || totalMB > BLOAT_SIZE_MB) {
-        issues.push({
-          severity: "warning",
-          code: "activity_log_bloat",
-          scope: "project",
-          unitId: "project",
-          message: `Activity logs: ${files.length} files, ${totalMB.toFixed(1)}MB (thresholds: ${BLOAT_FILE_THRESHOLD} files / ${BLOAT_SIZE_MB}MB)`,
-          file: ".gsd/activity/",
-          fixable: true,
-        });
-
-        if (shouldFix("activity_log_bloat")) {
-          const { pruneActivityLogs } = await import("./activity-log.js");
-          pruneActivityLogs(activityDir, 7); // 7-day retention
-          fixesApplied.push("pruned activity logs (7-day retention)");
-        }
-      }
-    }
-  } catch {
-    // Non-fatal — activity log check failed
-  }
-
-  // ── STATE.md health ───────────────────────────────────────────────────
-  try {
-    const stateFilePath = resolveGsdRootFile(basePath, "STATE");
-    const milestonesPath = milestonesDir(basePath);
-
-    if (existsSync(milestonesPath)) {
-      if (!existsSync(stateFilePath)) {
-        issues.push({
-          severity: "warning",
-          code: "state_file_missing",
-          scope: "project",
-          unitId: "project",
-          message: "STATE.md is missing — state display will not work",
-          file: ".gsd/STATE.md",
-          fixable: true,
-        });
-
-        if (shouldFix("state_file_missing")) {
-          const state = await deriveState(basePath);
-          await saveFile(stateFilePath, buildStateMarkdown(state));
-          fixesApplied.push("created STATE.md from derived state");
-        }
-      } else {
-        // Check if STATE.md is stale by comparing active milestone/slice/phase
-        const currentContent = readFileSync(stateFilePath, "utf-8");
-        const state = await deriveState(basePath);
-        const freshContent = buildStateMarkdown(state);
-
-        // Extract key fields for comparison — don't compare full content
-        // since timestamp/formatting differences are normal
-        const extractFields = (content: string) => {
-          const milestone = content.match(/\*\*Active Milestone:\*\*\s*(.+)/)?.[1]?.trim() ?? "";
-          const slice = content.match(/\*\*Active Slice:\*\*\s*(.+)/)?.[1]?.trim() ?? "";
-          const phase = content.match(/\*\*Phase:\*\*\s*(.+)/)?.[1]?.trim() ?? "";
-          return { milestone, slice, phase };
-        };
-
-        const current = extractFields(currentContent);
-        const fresh = extractFields(freshContent);
-
-        if (current.milestone !== fresh.milestone || current.slice !== fresh.slice || current.phase !== fresh.phase) {
-          issues.push({
-            severity: "warning",
-            code: "state_file_stale",
-            scope: "project",
-            unitId: "project",
-            message: `STATE.md is stale — shows "${current.phase}" but derived state is "${fresh.phase}"`,
-            file: ".gsd/STATE.md",
-            fixable: true,
-          });
-
-          if (shouldFix("state_file_stale")) {
-            await saveFile(stateFilePath, freshContent);
-            fixesApplied.push("rebuilt STATE.md from derived state");
-          }
-        }
-      }
-    }
-  } catch {
-    // Non-fatal — STATE.md check failed
-  }
-
-  // ── Gitignore drift ───────────────────────────────────────────────────
-  try {
-    const gitignorePath = join(basePath, ".gitignore");
-    if (existsSync(gitignorePath) && nativeIsRepo(basePath)) {
-      const content = readFileSync(gitignorePath, "utf-8");
-      const existingLines = new Set(
-        content.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#")),
-      );
-
-      // Check for critical runtime patterns that must be present
-      const criticalPatterns = [
-        ".gsd/activity/",
-        ".gsd/runtime/",
-        ".gsd/auto.lock",
-        ".gsd/gsd.db",
-        ".gsd/completed-units.json",
-      ];
-
-      // If blanket .gsd/ or .gsd is present, all patterns are covered
-      const hasBlanketIgnore = existingLines.has(".gsd/") || existingLines.has(".gsd");
-
-      if (!hasBlanketIgnore) {
-        const missing = criticalPatterns.filter(p => !existingLines.has(p));
-        if (missing.length > 0) {
-          issues.push({
-            severity: "warning",
-            code: "gitignore_missing_patterns",
-            scope: "project",
-            unitId: "project",
-            message: `${missing.length} critical GSD runtime pattern(s) missing from .gitignore: ${missing.join(", ")}`,
-            file: ".gitignore",
-            fixable: true,
-          });
-
-          if (shouldFix("gitignore_missing_patterns")) {
-            ensureGitignore(basePath);
-            fixesApplied.push("added missing GSD runtime patterns to .gitignore");
-          }
-        }
-      }
-    }
-  } catch {
-    // Non-fatal — gitignore check failed
-  }
-}
-
-export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; scope?: string; fixLevel?: "task" | "all" }): Promise<DoctorReport> {
+export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; dryRun?: boolean; scope?: string; fixLevel?: "task" | "all"; isolationMode?: "none" | "worktree" | "branch"; includeBuild?: boolean; includeTests?: boolean }): Promise<DoctorReport> {
   const issues: DoctorIssue[] = [];
   const fixesApplied: string[] = [];
   const fix = options?.fix === true;
+  const dryRun = options?.dryRun === true;
   const fixLevel = options?.fixLevel ?? "all";
 
   // Issue codes that represent completion state transitions — creating summary
@@ -982,16 +334,11 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
   // dispatch lifecycle (complete-slice, complete-milestone units), not to
   // mechanical post-hook bookkeeping. When fixLevel is "task", these are
   // detected and reported but never auto-fixed.
-  const completionTransitionCodes = new Set<DoctorIssueCode>([
-    "all_tasks_done_missing_slice_summary",
-    "all_tasks_done_missing_slice_uat",
-    "all_tasks_done_roadmap_not_checked",
-  ]);
 
   /** Whether a given issue code should be auto-fixed at the current fixLevel. */
   const shouldFix = (code: DoctorIssueCode): boolean => {
-    if (!fix) return false;
-    if (fixLevel === "task" && completionTransitionCodes.has(code)) return false;
+    if (!fix || dryRun) return false;
+    if (fixLevel === "task" && GLOBAL_STATE_CODES.has(code)) return false;
     return true;
   };
 
@@ -1011,18 +358,39 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
     }
   }
 
-  // Git health checks (orphaned worktrees, stale branches, corrupt merge state, tracked runtime files)
-  const isolationMode: "none" | "worktree" | "branch" =
-    prefs?.preferences?.git?.isolation === "none" ? "none" :
-    prefs?.preferences?.git?.isolation === "branch" ? "branch" : "worktree";
+  // Git health checks — timed
+  const t0git = Date.now();
+  const isolationMode: "none" | "worktree" | "branch" = options?.isolationMode ??
+    (prefs?.preferences?.git?.isolation === "worktree" ? "worktree" :
+    prefs?.preferences?.git?.isolation === "branch" ? "branch" : "none");
   await checkGitHealth(basePath, issues, fixesApplied, shouldFix, isolationMode);
+  const gitMs = Date.now() - t0git;
 
-  // Runtime health checks (crash locks, completed-units, hook state, activity logs, STATE.md, gitignore)
+  // Runtime health checks — timed
+  const t0runtime = Date.now();
   await checkRuntimeHealth(basePath, issues, fixesApplied, shouldFix);
+  const runtimeMs = Date.now() - t0runtime;
+
+  // Global health checks — cross-project state (e.g. orphaned project state dirs)
+  await checkGlobalHealth(issues, fixesApplied, shouldFix);
+
+  // Environment health checks — timed
+  const t0env = Date.now();
+  await checkEnvironmentHealth(basePath, issues, {
+    includeRemote: !options?.scope,
+    includeBuild: options?.includeBuild,
+    includeTests: options?.includeTests,
+  });
+  const envMs = Date.now() - t0env;
+
+  // Engine health checks — DB constraints and projection drift
+  await checkEngineHealth(basePath, issues, fixesApplied);
 
   const milestonesPath = milestonesDir(basePath);
   if (!existsSync(milestonesPath)) {
-    return { ok: issues.every(issue => issue.severity !== "error"), basePath, issues, fixesApplied };
+    const report: DoctorReport = { ok: issues.every(i => i.severity !== "error"), basePath, issues, fixesApplied, timing: { git: gitMs, runtime: runtimeMs, environment: envMs, gsdState: 0 } };
+    await appendDoctorHistory(basePath, report);
+    return report;
   }
 
   const requirementsPath = resolveGsdRootFile(basePath, "REQUIREMENTS");
@@ -1030,6 +398,40 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
   issues.push(...auditRequirements(requirementsContent));
 
   const state = await deriveState(basePath);
+
+  // Provider / auth health checks — only relevant when there is active work to dispatch.
+  // Skipped for idle projects (no active milestone) to avoid noise in environments
+  // where CI/test runners have no API key configured.
+  if (state.activeMilestone) {
+    try {
+      const providerResults = runProviderChecks();
+      for (const result of providerResults) {
+        if (!result.required) continue;
+        if (result.status === "error") {
+          issues.push({
+            severity: "warning",
+            code: "provider_key_missing",
+            scope: "project",
+            unitId: "project",
+            message: result.message + (result.detail ? ` — ${result.detail}` : ""),
+            fixable: false,
+          });
+        } else if (result.status === "warning") {
+          issues.push({
+            severity: "warning",
+            code: "provider_key_backedoff",
+            scope: "project",
+            unitId: "project",
+            message: result.message + (result.detail ? ` — ${result.detail}` : ""),
+            fixable: false,
+          });
+        }
+      }
+    } catch {
+      // Non-fatal — provider check failure should not block other checks
+    }
+  }
+
   for (const milestone of state.registry) {
     const milestoneId = milestone.id;
     const milestonePath = resolveMilestonePath(basePath, milestoneId);
@@ -1038,21 +440,103 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
     // Validate milestone title for delimiter characters that break state documents.
     const milestoneTitleIssue = validateTitle(milestone.title);
     if (milestoneTitleIssue) {
-      issues.push({
-        severity: "warning",
-        code: "delimiter_in_title",
-        scope: "milestone",
-        unitId: milestoneId,
-        message: `Milestone ${milestoneId} ${milestoneTitleIssue}. Rename the milestone to remove these characters to prevent state corruption.`,
-        file: relMilestoneFile(basePath, milestoneId, "ROADMAP"),
-        fixable: false,
-      });
+      const roadmapFile = resolveMilestoneFile(basePath, milestoneId, "ROADMAP");
+      let wasFixed = false;
+      if (shouldFix("delimiter_in_title") && roadmapFile) {
+        try {
+          const raw = readFileSync(roadmapFile, "utf-8");
+          // Replace em/en dashes with " - " in the H1 title line only
+          const sanitized = raw.replace(/^(# .*)$/m, (line) =>
+            line.replace(/[\u2014\u2013]/g, "-"),
+          );
+          if (sanitized !== raw) {
+            await saveFile(roadmapFile, sanitized);
+            fixesApplied.push(`sanitized delimiter characters in ${milestoneId} title`);
+            wasFixed = true;
+          }
+        } catch { /* non-fatal — report the warning below */ }
+      }
+      if (!wasFixed) {
+        issues.push({
+          severity: "warning",
+          code: "delimiter_in_title",
+          scope: "milestone",
+          unitId: milestoneId,
+          message: `Milestone ${milestoneId} ${milestoneTitleIssue}. Rename the milestone to remove these characters to prevent state corruption.`,
+          file: relMilestoneFile(basePath, milestoneId, "ROADMAP"),
+          fixable: true,
+        });
+      }
     }
 
     const roadmapPath = resolveMilestoneFile(basePath, milestoneId, "ROADMAP");
     const roadmapContent = roadmapPath ? await loadFile(roadmapPath) : null;
     if (!roadmapContent) continue;
-    const roadmap = parseRoadmap(roadmapContent);
+
+    // Normalize slices: prefer DB, fall back to parser
+    type NormSlice = RoadmapSliceEntry & { pending?: boolean };
+    let slices: NormSlice[];
+    if (isDbAvailable()) {
+      const dbSlices = getMilestoneSlices(milestoneId);
+      slices = dbSlices.map(s => ({
+        id: s.id,
+        title: s.title,
+        done: s.status === "complete",
+        pending: s.status === "pending",
+        risk: (s.risk || "medium") as RoadmapSliceEntry["risk"],
+        depends: s.depends,
+        demo: s.demo,
+      }));
+    } else {
+      const activeMilestoneId = state.activeMilestone?.id;
+      const activeSliceId = state.activeSlice?.id;
+      slices = parseLegacyRoadmap(roadmapContent).slices.map(s => ({
+        ...s,
+        // Legacy roadmaps only encode done vs not-done. For doctor's
+        // missing-directory checks, treat every undone slice except the
+        // current active slice as effectively pending/unstarted.
+        pending: !s.done && (milestoneId !== activeMilestoneId || s.id !== activeSliceId),
+      }));
+    }
+    // Wrap in Roadmap-compatible shape for detectCircularDependencies
+    const roadmap = { slices };
+
+    // ── Circular dependency detection ──────────────────────────────────────
+    for (const cycle of detectCircularDependencies(roadmap.slices)) {
+      issues.push({
+        severity: "error",
+        code: "circular_slice_dependency",
+        scope: "milestone",
+        unitId: milestoneId,
+        message: `Circular dependency detected: ${cycle.join(" → ")}`,
+        file: relMilestoneFile(basePath, milestoneId, "ROADMAP"),
+        fixable: false,
+      });
+    }
+
+    // ── Orphaned slice directories ─────────────────────────────────────────
+    try {
+      const slicesDir = join(milestonePath, "slices");
+      if (existsSync(slicesDir)) {
+        const knownSliceIds = new Set(roadmap.slices.map(s => s.id));
+        for (const entry of readdirSync(slicesDir)) {
+          try {
+            if (!lstatSync(join(slicesDir, entry)).isDirectory()) continue;
+          } catch { continue; }
+          if (!knownSliceIds.has(entry)) {
+            issues.push({
+              severity: "warning",
+              code: "orphaned_slice_directory",
+              scope: "milestone",
+              unitId: milestoneId,
+              message: `Directory "${entry}" exists in ${milestoneId}/slices/ but is not referenced in the roadmap`,
+              file: `${relMilestonePath(basePath, milestoneId)}/slices/${entry}`,
+              fixable: false,
+            });
+          }
+        }
+      }
+    } catch { /* non-fatal */ }
 
     for (const slice of roadmap.slices) {
       const unitId = `${milestoneId}/${slice.id}`;
@@ -1061,6 +545,9 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
       // Validate slice title for delimiter characters.
       const sliceTitleIssue = validateTitle(slice.title);
       if (sliceTitleIssue) {
+        // Slice titles live inside the roadmap H1/checkbox lines — the milestone-level
+        // fix above already sanitizes the roadmap file. For slices we only report, because
+        // the title comes from the checkbox text and requires careful regex to fix safely.
         issues.push({
           severity: "warning",
           code: "delimiter_in_title",
@@ -1072,9 +559,7 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
         });
       }
 
-      // Check for unresolvable dependency IDs — catches range syntax like "S01-S04"
-      // that the parser expanded but that don't match any actual slice in the roadmap.
-      // Also catches plain typos or IDs referencing slices not yet defined.
+      // Check for unresolvable dependency IDs
       const knownSliceIds = new Set(roadmap.slices.map(s => s.id));
       for (const dep of slice.depends) {
         if (!knownSliceIds.has(dep)) {
@@ -1091,17 +576,41 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
       }
 
       const slicePath = resolveSlicePath(basePath, milestoneId, slice.id);
-      if (!slicePath) continue;
+      if (!slicePath) {
+        // Pending slices haven't been planned yet — directories are created
+        // lazily by ensurePreconditions() at dispatch time. Skip them.
+        if (slice.pending) continue;
+        const expectedPath = relSlicePath(basePath, milestoneId, slice.id);
+        issues.push({
+          severity: slice.done ? "warning" : "error",
+          code: "missing_slice_dir",
+          scope: "slice",
+          unitId,
+          message: slice.done
+            ? `Missing slice directory for ${unitId} (slice is complete — cosmetic only)`
+            : `Missing slice directory for ${unitId}`,
+          file: expectedPath,
+          fixable: true,
+        });
+        if (fix) {
+          const absoluteSliceDir = join(milestonePath, "slices", slice.id);
+          mkdirSync(absoluteSliceDir, { recursive: true });
+          fixesApplied.push(`created ${absoluteSliceDir}`);
+        }
+        continue;
+      }
 
       const tasksDir = resolveTasksDir(basePath, milestoneId, slice.id);
       if (!tasksDir) {
+        // Pending slices haven't been planned yet — tasks/ is created on demand.
+        if (slice.pending) continue;
         issues.push({
           severity: slice.done ? "warning" : "error",
           code: "missing_tasks_dir",
           scope: "slice",
           unitId,
           message: slice.done
-            ? `Missing tasks directory for ${unitId} (slice is complete — cosmetic only)`
+            ? `Missing tasks directory for ${unitId} (slice is complete \u2014 cosmetic only)`
             : `Missing tasks directory for ${unitId}`,
           file: relSlicePath(basePath, milestoneId, slice.id),
           fixable: true,
@@ -1114,7 +623,17 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
 
       const planPath = resolveSliceFile(basePath, milestoneId, slice.id, "PLAN");
       const planContent = planPath ? await loadFile(planPath) : null;
-      const plan = planContent ? parsePlan(planContent) : null;
+      // Normalize plan tasks: prefer DB, fall back to parsers-legacy
+      let plan: { tasks: Array<{ id: string; done: boolean; title: string; estimate?: string }> } | null = null;
+      if (isDbAvailable()) {
+        const dbTasks = getSliceTasks(milestoneId, slice.id);
+        if (dbTasks.length > 0) {
+          plan = { tasks: dbTasks.map(t => ({ id: t.id, done: t.status === "complete" || t.status === "done", title: t.title, estimate: t.estimate || undefined })) };
+        }
+      }
+      if (!plan && planContent) {
+        plan = parseLegacyPlan(planContent);
+      }
       if (!plan) {
         if (!slice.done) {
           issues.push({
@@ -1130,38 +649,40 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
         continue;
       }
 
+      // ── Duplicate task IDs ───────────────────────────────────────────────
+      const taskIdCounts = new Map<string, number>();
+      for (const task of plan.tasks) taskIdCounts.set(task.id, (taskIdCounts.get(task.id) ?? 0) + 1);
+      for (const [taskId, count] of taskIdCounts) {
+        if (count > 1) {
+          issues.push({ severity: "error", code: "duplicate_task_id", scope: "slice", unitId,
+            message: `Task ID "${taskId}" appears ${count} times in ${slice.id}-PLAN.md — duplicate IDs cause dispatch failures`,
+            file: relSliceFile(basePath, milestoneId, slice.id, "PLAN"), fixable: false });
+        }
+      }
+
+      // ── Task files on disk not in plan ────────────────────────────────────
+      try {
+        if (tasksDir) {
+          const planTaskIds = new Set(plan.tasks.map(t => t.id));
+          for (const f of readdirSync(tasksDir)) {
+            if (!f.endsWith("-SUMMARY.md")) continue;
+            const diskTaskId = f.replace(/-SUMMARY\.md$/, "");
+            if (!planTaskIds.has(diskTaskId)) {
+              issues.push({ severity: "info", code: "task_file_not_in_plan", scope: "slice", unitId,
+                message: `Task summary "${f}" exists on disk but "${diskTaskId}" is not in ${slice.id}-PLAN.md`,
+                file: relTaskFile(basePath, milestoneId, slice.id, diskTaskId, "SUMMARY"), fixable: false });
+            }
+          }
+        }
+      } catch { /* non-fatal */ }
+
       let allTasksDone = plan.tasks.length > 0;
       for (const task of plan.tasks) {
         const taskUnitId = `${unitId}/${task.id}`;
         const summaryPath = resolveTaskFile(basePath, milestoneId, slice.id, task.id, "SUMMARY");
         const hasSummary = !!(summaryPath && await loadFile(summaryPath));
 
-        if (task.done && !hasSummary) {
-          issues.push({
-            severity: "error",
-            code: "task_done_missing_summary",
-            scope: "task",
-            unitId: taskUnitId,
-            message: `Task ${task.id} is marked done but summary is missing`,
-            file: relTaskFile(basePath, milestoneId, slice.id, task.id, "SUMMARY"),
-            fixable: false,
-          });
-        }
-
-        if (!task.done && hasSummary) {
-          issues.push({
-            severity: "warning",
-            code: "task_summary_without_done_checkbox",
-            scope: "task",
-            unitId: taskUnitId,
-            message: `Task ${task.id} has a summary but is not marked done in the slice plan`,
-            file: relSliceFile(basePath, milestoneId, slice.id, "PLAN"),
-            fixable: true,
-          });
-          if (fix) await markTaskDoneInPlan(basePath, milestoneId, slice.id, task.id, fixesApplied);
-        }
-
-        // Must-have verification: done task with summary — check if must-haves are addressed
+        // Must-have verification
         if (task.done && hasSummary) {
           const taskPlanPath = resolveTaskFile(basePath, milestoneId, slice.id, task.id, "PLAN");
           if (taskPlanPath) {
@@ -1189,13 +710,30 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
           }
         }
 
+        // ── Future timestamp check ─────────────────────────────────────
+        if (task.done && hasSummary && summaryPath) {
+          try {
+            const rawSummary = await loadFile(summaryPath);
+            const m = rawSummary?.match(/^completed_at:\s*(.+)$/m);
+            if (m) {
+              const ts = new Date(m[1].trim());
+              if (!isNaN(ts.getTime()) && ts.getTime() > Date.now() + 24 * 60 * 60 * 1000) {
+                issues.push({ severity: "warning", code: "future_timestamp", scope: "task", unitId: taskUnitId,
+                  message: `Task ${task.id} has completed_at "${m[1].trim()}" which is more than 24h in the future`,
+                  file: relTaskFile(basePath, milestoneId, slice.id, task.id, "SUMMARY"), fixable: false });
+              }
+            }
+          } catch { /* non-fatal */ }
+        }
+
         allTasksDone = allTasksDone && task.done;
       }
 
-      // Blocker-without-replan detection: a completed task reported blocker_discovered
-      // but no REPLAN.md exists yet — the slice is stuck
+      // Blocker-without-replan detection
+      // Skip when all tasks are done — the blocker was implicitly resolved
+      // within the task and the slice is not stuck (#3105 Bug 2).
       const replanPath = resolveSliceFile(basePath, milestoneId, slice.id, "REPLAN");
-      if (!replanPath) {
+      if (!replanPath && !allTasksDone) {
         for (const task of plan.tasks) {
           if (!task.done) continue;
           const summaryPath = resolveTaskFile(basePath, milestoneId, slice.id, task.id, "SUMMARY");
@@ -1209,122 +747,63 @@ export async function runGSDDoctor(basePath: string, options?: { fix?: boolean; 
               code: "blocker_discovered_no_replan",
               scope: "slice",
               unitId,
-              message: `Task ${task.id} reported blocker_discovered but no REPLAN.md exists for ${slice.id} — slice may be stuck`,
+              message: `Task ${task.id} reported blocker_discovered but no REPLAN.md exists for ${slice.id} \u2014 slice may be stuck`,
               file: relSliceFile(basePath, milestoneId, slice.id, "REPLAN"),
               fixable: false,
             });
-            break; // one issue per slice is sufficient
+            break;
           }
         }
       }
 
-      const sliceSummaryPath = resolveSliceFile(basePath, milestoneId, slice.id, "SUMMARY");
-      const sliceUatPath = join(slicePath, `${slice.id}-UAT.md`);
-      const hasSliceSummary = !!(sliceSummaryPath && await loadFile(sliceSummaryPath));
-      const hasSliceUat = existsSync(sliceUatPath);
-
-      if (allTasksDone && !hasSliceSummary) {
-        issues.push({
-          severity: "error",
-          code: "all_tasks_done_missing_slice_summary",
-          scope: "slice",
-          unitId,
-          message: `All tasks are done but ${slice.id}-SUMMARY.md is missing`,
-          file: relSliceFile(basePath, milestoneId, slice.id, "SUMMARY"),
-          fixable: true,
-        });
-        if (shouldFix("all_tasks_done_missing_slice_summary")) await ensureSliceSummaryStub(basePath, milestoneId, slice.id, fixesApplied);
+      // ── Stale REPLAN: exists but all tasks done ────────────────────────
+      if (replanPath && allTasksDone) {
+        issues.push({ severity: "info", code: "stale_replan_file", scope: "slice", unitId,
+          message: `${slice.id} has a REPLAN.md but all tasks are done — REPLAN.md may be stale`,
+          file: relSliceFile(basePath, milestoneId, slice.id, "REPLAN"), fixable: false });
       }
 
-      if (allTasksDone && !hasSliceUat) {
-        issues.push({
-          severity: "warning",
-          code: "all_tasks_done_missing_slice_uat",
-          scope: "slice",
-          unitId,
-          message: `All tasks are done but ${slice.id}-UAT.md is missing`,
-          file: `${relSlicePath(basePath, milestoneId, slice.id)}/${slice.id}-UAT.md`,
-          fixable: true,
-        });
-        if (shouldFix("all_tasks_done_missing_slice_uat")) await ensureSliceUatStub(basePath, milestoneId, slice.id, fixesApplied);
-      }
-
-      if (allTasksDone && !slice.done) {
-        issues.push({
-          severity: "error",
-          code: "all_tasks_done_roadmap_not_checked",
-          scope: "slice",
-          unitId,
-          message: `All tasks are done but roadmap still shows ${slice.id} as incomplete`,
-          file: relMilestoneFile(basePath, milestoneId, "ROADMAP"),
-          fixable: true,
-        });
-        if (shouldFix("all_tasks_done_roadmap_not_checked") && (hasSliceSummary || issues.some(issue => issue.code === "all_tasks_done_missing_slice_summary" && issue.unitId === unitId))) {
-          await markSliceDoneInRoadmap(basePath, milestoneId, slice.id, fixesApplied);
-        }
-      }
-
-      if (slice.done && !hasSliceSummary) {
-        issues.push({
-          severity: "error",
-          code: "slice_checked_missing_summary",
-          scope: "slice",
-          unitId,
-          message: `Roadmap marks ${slice.id} complete but slice summary is missing`,
-          file: relSliceFile(basePath, milestoneId, slice.id, "SUMMARY"),
-          fixable: true,
-        });
-      }
-
-      if (slice.done && !hasSliceUat) {
-        issues.push({
-          severity: "warning",
-          code: "slice_checked_missing_uat",
-          scope: "slice",
-          unitId,
-          message: `Roadmap marks ${slice.id} complete but UAT file is missing`,
-          file: `${relSlicePath(basePath, milestoneId, slice.id)}/${slice.id}-UAT.md`,
-          fixable: true,
-        });
-      }
     }
 
     // Milestone-level check: all slices done but no validation file
-    if (isMilestoneComplete(roadmap) && !resolveMilestoneFile(basePath, milestoneId, "VALIDATION") && !resolveMilestoneFile(basePath, milestoneId, "SUMMARY")) {
+    const milestoneComplete = roadmap.slices.length > 0 && roadmap.slices.every(s => s.done);
+    if (milestoneComplete && !resolveMilestoneFile(basePath, milestoneId, "VALIDATION") && !resolveMilestoneFile(basePath, milestoneId, "SUMMARY")) {
       issues.push({
         severity: "info",
         code: "all_slices_done_missing_milestone_validation",
         scope: "milestone",
         unitId: milestoneId,
-        message: `All slices are done but ${milestoneId}-VALIDATION.md is missing — milestone is in validating-milestone phase`,
+        message: `All slices are done but ${milestoneId}-VALIDATION.md is missing \u2014 milestone is in validating-milestone phase`,
         file: relMilestoneFile(basePath, milestoneId, "VALIDATION"),
         fixable: false,
       });
     }
 
     // Milestone-level check: all slices done but no milestone summary
-    if (isMilestoneComplete(roadmap) && !resolveMilestoneFile(basePath, milestoneId, "SUMMARY")) {
+    if (milestoneComplete && !resolveMilestoneFile(basePath, milestoneId, "SUMMARY")) {
       issues.push({
         severity: "warning",
         code: "all_slices_done_missing_milestone_summary",
         scope: "milestone",
         unitId: milestoneId,
-        message: `All slices are done but ${milestoneId}-SUMMARY.md is missing — milestone is stuck in completing-milestone phase`,
+        message: `All slices are done but ${milestoneId}-SUMMARY.md is missing \u2014 milestone is stuck in completing-milestone phase`,
         file: relMilestoneFile(basePath, milestoneId, "SUMMARY"),
         fixable: false,
       });
     }
   }
 
-  if (fix && fixesApplied.length > 0) {
+  if (fix && !dryRun && fixesApplied.length > 0) {
     await updateStateFile(basePath, fixesApplied);
   }
 
-  return {
+  const report: DoctorReport = {
     ok: issues.every(issue => issue.severity !== "error"),
     basePath,
     issues,
     fixesApplied,
+    timing: { git: gitMs, runtime: runtimeMs, environment: envMs, gsdState: Math.max(0, Date.now() - t0env - envMs) },
   };
+  await appendDoctorHistory(basePath, report);
+  return report;
 }
-

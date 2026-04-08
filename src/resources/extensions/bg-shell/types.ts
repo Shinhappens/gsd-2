@@ -21,9 +21,7 @@ export interface ProcessEvent {
 		| "recovered"
 		| "exited"
 		| "crashed"
-		| "output"
 		| "port_open"
-		| "pattern_match"
 		| "port_timeout";
 	timestamp: number;
 	detail: string;
@@ -53,6 +51,10 @@ export interface BgProcess {
 	label: string;
 	command: string;
 	cwd: string;
+	/** Session file that created this process (used for per-session cleanup) */
+	ownerSessionFile: string | null;
+	/** Whether this process should survive a new-session boundary */
+	persistAcrossSessions: boolean;
 	startedAt: number;
 	proc: import("node:child_process").ChildProcess;
 	/** Unified chronologically-interleaved output buffer */
@@ -88,22 +90,24 @@ export interface BgProcess {
 	lastErrorCount: number;
 	/** Last warning count snapshot for diff detection */
 	lastWarningCount: number;
-	/** Command history for shell-type sessions */
-	commandHistory: string[];
-	/** Dedup tracker: hash → count of repeated lines (capped at LINE_DEDUP_MAX entries) */
-	lineDedup: Map<string, number>;
-	/** Total raw lines (before dedup) for token savings calc */
-	totalRawLines: number;
 	/** Tracked stdout line count (incremented in addOutputLine, avoids O(n) filter) */
 	stdoutLineCount: number;
 	/** Tracked stderr line count (incremented in addOutputLine, avoids O(n) filter) */
 	stderrLineCount: number;
-	/** Env snapshot (keys only, no values for security) */
-	envKeys: string[];
 	/** Restart count */
 	restartCount: number;
 	/** Original start config for restart */
-	startConfig: { command: string; cwd: string; label: string; processType: ProcessType; readyPattern: string | null; readyPort: number | null; group: string | null };
+	startConfig: {
+		command: string;
+		cwd: string;
+		label: string;
+		processType: ProcessType;
+		ownerSessionFile: string | null;
+		persistAcrossSessions: boolean;
+		readyPattern: string | null;
+		readyPort: number | null;
+		group: string | null;
+	};
 }
 
 export interface BgProcessInfo {
@@ -111,6 +115,8 @@ export interface BgProcessInfo {
 	label: string;
 	command: string;
 	cwd: string;
+	ownerSessionFile: string | null;
+	persistAcrossSessions: boolean;
 	startedAt: number;
 	alive: boolean;
 	exitCode: number | null;
@@ -133,6 +139,8 @@ export interface BgProcessInfo {
 export interface StartOptions {
 	command: string;
 	cwd: string;
+	ownerSessionFile?: string | null;
+	persistAcrossSessions?: boolean;
 	label?: string;
 	type?: ProcessType;
 	readyPattern?: string;
@@ -154,6 +162,8 @@ export interface ProcessManifest {
 	label: string;
 	command: string;
 	cwd: string;
+	ownerSessionFile: string | null;
+	persistAcrossSessions: boolean;
 	startedAt: number;
 	processType: ProcessType;
 	group: string | null;
@@ -167,8 +177,6 @@ export interface ProcessManifest {
 export const MAX_BUFFER_LINES = 5000;
 export const MAX_EVENTS = 200;
 export const DEAD_PROCESS_TTL = 10 * 60 * 1000;
-/** Maximum unique entries in the per-process lineDedup Map before LRU eviction. */
-export const LINE_DEDUP_MAX = 500;
 export const PORT_PROBE_TIMEOUT = 500;
 export const READY_POLL_INTERVAL = 250;
 export const DEFAULT_READY_TIMEOUT = 30000;

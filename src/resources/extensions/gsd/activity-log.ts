@@ -11,6 +11,7 @@
 import { writeFileSync, writeSync, mkdirSync, readdirSync, unlinkSync, statSync, openSync, closeSync, constants } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { GSDError, GSD_IO_ERROR } from "./errors.js";
 
 const SEQ_PREFIX_RE = /^(\d+)-/;
 import type { ExtensionContext } from "@gsd/pi-coding-agent";
@@ -95,7 +96,7 @@ function nextActivityFilePath(
     }
   }
   // Fallback: should never reach here in practice
-  throw new Error(`Failed to find available activity log sequence in ${activityDir}`);
+  throw new GSDError(GSD_IO_ERROR, `Failed to find available activity log sequence in ${activityDir}`);
 }
 
 export function saveActivityLog(
@@ -152,6 +153,7 @@ export function pruneActivityLogs(activityDir: string, retentionDays: number): v
     const cutoff = Date.now() - retentionDays * 86_400_000;
     for (const entry of entries) {
       if (entry.seq === maxSeq) continue;  // always preserve highest-seq
+      if (retentionDays === 0) { try { unlinkSync(entry.filePath); } catch { /* skip */ } continue; }
       try {
         const mtime = statSync(entry.filePath).mtimeMs;
         if (Math.floor(mtime) <= cutoff) unlinkSync(entry.filePath);

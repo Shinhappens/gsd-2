@@ -5,6 +5,7 @@ import {
   stripThinkingFromHistory,
   BRAVE_TOOL_NAMES,
   CUSTOM_SEARCH_TOOL_NAMES,
+  MAX_NATIVE_SEARCHES_PER_SESSION,
   type NativeSearchPI,
 } from "../resources/extensions/search-the-web/native-search.ts";
 
@@ -92,11 +93,12 @@ test("before_provider_request injects web_search for claude models", async () =>
   });
 
   const tools = (result as any)?.tools ?? payload.tools;
-  const hasNative = (tools as any[]).some(
+  const nativeTool = (tools as any[]).find(
     (t: any) => t.type === "web_search_20250305"
   );
-  assert.ok(hasNative, "Should inject web_search_20250305 tool");
+  assert.ok(nativeTool, "Should inject web_search_20250305 tool");
   assert.equal((tools as any[]).length, 2, "Should have original + injected tool");
+  assert.equal(nativeTool.max_uses, 5, "Should set max_uses to 5 to prevent search loops (#817)");
 });
 
 test("before_provider_request injects web_search for claude models even without model_select", async () => {
@@ -278,6 +280,7 @@ test("before_provider_request creates tools array if missing", async () => {
   assert.ok(Array.isArray(tools), "Should create tools array");
   assert.equal((tools as any[]).length, 1, "Should have exactly 1 tool");
   assert.equal((tools as any[])[0].type, "web_search_20250305");
+  assert.equal((tools as any[])[0].max_uses, 5, "Should include max_uses limit");
 });
 
 test("before_provider_request skips when payload is falsy", async () => {
@@ -292,94 +295,91 @@ test("before_provider_request skips when payload is falsy", async () => {
   assert.equal(result, undefined, "Should return undefined for null payload");
 });
 
-test("model_select disables Brave tools when Anthropic + no BRAVE_API_KEY", async () => {
+test("model_select disables Brave tools when Anthropic + no BRAVE_API_KEY", async (t) => {
   const originalKey = process.env.BRAVE_API_KEY;
   delete process.env.BRAVE_API_KEY;
 
-  try {
-    const pi = createMockPI();
-    registerNativeSearchHooks(pi);
-
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "anthropic", name: "claude-sonnet-4-6" },
-      previousModel: undefined,
-      source: "set",
-    });
-
-    const active = pi.getActiveTools();
-    assert.ok(!active.includes("search-the-web"), "search-the-web should be disabled");
-    assert.ok(!active.includes("search_and_read"), "search_and_read should be disabled");
-    assert.ok(!active.includes("google_search"), "google_search should be disabled");
-    assert.ok(active.includes("fetch_page"), "fetch_page should remain active");
-    assert.ok(active.includes("bash"), "Other tools should remain active");
-  } finally {
+  t.after(() => {
     if (originalKey) process.env.BRAVE_API_KEY = originalKey;
     else delete process.env.BRAVE_API_KEY;
-  }
+  });
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  const active = pi.getActiveTools();
+  assert.ok(!active.includes("search-the-web"), "search-the-web should be disabled");
+  assert.ok(!active.includes("search_and_read"), "search_and_read should be disabled");
+  assert.ok(!active.includes("google_search"), "google_search should be disabled");
+  assert.ok(active.includes("fetch_page"), "fetch_page should remain active");
+  assert.ok(active.includes("bash"), "Other tools should remain active");
 });
 
-test("model_select disables all custom search tools when Anthropic even with BRAVE_API_KEY", async () => {
+test("model_select disables all custom search tools when Anthropic even with BRAVE_API_KEY", async (t) => {
   const originalKey = process.env.BRAVE_API_KEY;
   process.env.BRAVE_API_KEY = "test-key";
 
-  try {
-    const pi = createMockPI();
-    registerNativeSearchHooks(pi);
-
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "anthropic", name: "claude-sonnet-4-6" },
-      previousModel: undefined,
-      source: "set",
-    });
-
-    const active = pi.getActiveTools();
-    assert.ok(!active.includes("search-the-web"), "search-the-web should be disabled for Anthropic");
-    assert.ok(!active.includes("search_and_read"), "search_and_read should be disabled for Anthropic");
-    assert.ok(!active.includes("google_search"), "google_search should be disabled for Anthropic");
-    assert.ok(active.includes("fetch_page"), "fetch_page should remain active");
-  } finally {
+  t.after(() => {
     if (originalKey) process.env.BRAVE_API_KEY = originalKey;
     else delete process.env.BRAVE_API_KEY;
-  }
+  });
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  const active = pi.getActiveTools();
+  assert.ok(!active.includes("search-the-web"), "search-the-web should be disabled for Anthropic");
+  assert.ok(!active.includes("search_and_read"), "search_and_read should be disabled for Anthropic");
+  assert.ok(!active.includes("google_search"), "google_search should be disabled for Anthropic");
+  assert.ok(active.includes("fetch_page"), "fetch_page should remain active");
 });
 
-test("model_select re-enables Brave tools when switching away from Anthropic", async () => {
+test("model_select re-enables Brave tools when switching away from Anthropic", async (t) => {
   const originalKey = process.env.BRAVE_API_KEY;
   delete process.env.BRAVE_API_KEY;
 
-  try {
-    const pi = createMockPI();
-    registerNativeSearchHooks(pi);
-
-    // First: select Anthropic — disables Brave tools
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "anthropic", name: "claude-sonnet-4-6" },
-      previousModel: undefined,
-      source: "set",
-    });
-
-    let active = pi.getActiveTools();
-    assert.ok(!active.includes("search-the-web"), "Should disable after Anthropic select");
-
-    // Second: switch to non-Anthropic — re-enables
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "openai", name: "gpt-4o" },
-      previousModel: { provider: "anthropic", name: "claude-sonnet-4-6" },
-      source: "set",
-    });
-
-    active = pi.getActiveTools();
-    assert.ok(active.includes("search-the-web"), "search-the-web should be re-enabled");
-    assert.ok(active.includes("search_and_read"), "search_and_read should be re-enabled");
-    assert.ok(active.includes("google_search"), "google_search should be re-enabled");
-  } finally {
+  t.after(() => {
     if (originalKey) process.env.BRAVE_API_KEY = originalKey;
     else delete process.env.BRAVE_API_KEY;
-  }
+  });
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  // First: select Anthropic — disables Brave tools
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  let active = pi.getActiveTools();
+  assert.ok(!active.includes("search-the-web"), "Should disable after Anthropic select");
+
+  // Second: switch to non-Anthropic — re-enables
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "openai", name: "gpt-4o" },
+    previousModel: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    source: "set",
+  });
+
+  active = pi.getActiveTools();
+  assert.ok(active.includes("search-the-web"), "search-the-web should be re-enabled");
+  assert.ok(active.includes("search_and_read"), "search_and_read should be re-enabled");
+  assert.ok(active.includes("google_search"), "google_search should be re-enabled");
 });
 
 test("model_select shows 'Native Anthropic web search active' for Anthropic provider", async () => {
@@ -403,68 +403,43 @@ test("model_select shows 'Native Anthropic web search active' for Anthropic prov
   );
 });
 
-test("model_select shows warning for non-Anthropic without Brave key", async () => {
+test("model_select shows warning for non-Anthropic without Brave key", async (t) => {
   const originalKey = process.env.BRAVE_API_KEY;
   delete process.env.BRAVE_API_KEY;
 
-  try {
-    const pi = createMockPI();
-    registerNativeSearchHooks(pi);
-
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "openai", name: "gpt-4o" },
-      previousModel: undefined,
-      source: "set",
-    });
-
-    const warning = pi.notifications.find((n) => n.level === "warning");
-    assert.ok(warning, "Should show warning for non-Anthropic without Brave key");
-    assert.ok(
-      warning!.message.includes("Anthropic"),
-      `Warning should mention Anthropic — got: ${warning!.message}`
-    );
-  } finally {
+  t.after(() => {
     if (originalKey) process.env.BRAVE_API_KEY = originalKey;
     else delete process.env.BRAVE_API_KEY;
-  }
+  });
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "openai", name: "gpt-4o" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  const warning = pi.notifications.find((n) => n.level === "warning");
+  assert.ok(warning, "Should show warning for non-Anthropic without Brave key");
+  assert.ok(
+    warning!.message.includes("Anthropic"),
+    `Warning should mention Anthropic — got: ${warning!.message}`
+  );
 });
 
-test("session_start shows v4 loaded message", async () => {
+test("session_start resets search count and shows no startup notification", async () => {
   const pi = createMockPI();
   registerNativeSearchHooks(pi);
 
   await pi.fire("session_start", { type: "session_start" });
 
+  // Tool status is now shown in the welcome screen bar layout — no notification on session_start
   const infoNotif = pi.notifications.find(
     (n) => n.level === "info" && n.message.includes("v4")
   );
-  assert.ok(infoNotif, "Should have v4 info notification");
-  assert.ok(
-    infoNotif!.message.startsWith("Web search v4 loaded"),
-    `Should start with 'Web search v4 loaded' — got: ${infoNotif!.message}`
-  );
-});
-
-test("session_start shows Brave status when key present", async () => {
-  const originalKey = process.env.BRAVE_API_KEY;
-  process.env.BRAVE_API_KEY = "test-key";
-
-  try {
-    const pi = createMockPI();
-    registerNativeSearchHooks(pi);
-
-    await pi.fire("session_start", { type: "session_start" });
-
-    const info = pi.notifications.find((n) => n.level === "info");
-    assert.ok(info!.message.includes("Brave"), "Should mention Brave in status");
-
-    const warning = pi.notifications.find((n) => n.level === "warning");
-    assert.equal(warning, undefined, "Should NOT show warning when Brave key is present");
-  } finally {
-    if (originalKey) process.env.BRAVE_API_KEY = originalKey;
-    else delete process.env.BRAVE_API_KEY;
-  }
+  assert.equal(infoNotif, undefined, "Should NOT emit a v4 startup notification (welcome screen handles this)");
 });
 
 test("BRAVE_TOOL_NAMES contains expected tool names", () => {
@@ -475,160 +450,157 @@ test("CUSTOM_SEARCH_TOOL_NAMES contains all custom search tools", () => {
   assert.deepEqual(CUSTOM_SEARCH_TOOL_NAMES, ["search-the-web", "search_and_read", "google_search"]);
 });
 
-test("before_provider_request removes Brave tools from payload when no BRAVE_API_KEY", async () => {
+test("before_provider_request removes Brave tools from payload when no BRAVE_API_KEY", async (t) => {
   const originalKey = process.env.BRAVE_API_KEY;
   delete process.env.BRAVE_API_KEY;
 
-  try {
-    const pi = createMockPI();
-    registerNativeSearchHooks(pi);
-
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "anthropic", name: "claude-sonnet-4-6" },
-      previousModel: undefined,
-      source: "set",
-    });
-
-    const payload: Record<string, unknown> = {
-      model: "claude-sonnet-4-6-20250514",
-      tools: [
-        { name: "bash", type: "function" },
-        { name: "search-the-web", type: "function" },
-        { name: "search_and_read", type: "function" },
-        { name: "google_search", type: "function" },
-        { name: "fetch_page", type: "function" },
-      ],
-    };
-
-    const result = await pi.fire("before_provider_request", {
-      type: "before_provider_request",
-      payload,
-    });
-
-    const tools = ((result as any)?.tools ?? payload.tools) as any[];
-    const names = tools.map((t: any) => t.name);
-
-    assert.ok(!names.includes("search-the-web"), "search-the-web should be removed from payload");
-    assert.ok(!names.includes("search_and_read"), "search_and_read should be removed from payload");
-    assert.ok(!names.includes("google_search"), "google_search should be removed from payload");
-    assert.ok(names.includes("bash"), "bash should remain");
-    assert.ok(names.includes("fetch_page"), "fetch_page should remain");
-    assert.ok(names.includes("web_search"), "native web_search should be injected");
-  } finally {
+  t.after(() => {
     if (originalKey) process.env.BRAVE_API_KEY = originalKey;
     else delete process.env.BRAVE_API_KEY;
-  }
+  });
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  const payload: Record<string, unknown> = {
+    model: "claude-sonnet-4-6-20250514",
+    tools: [
+      { name: "bash", type: "function" },
+      { name: "search-the-web", type: "function" },
+      { name: "search_and_read", type: "function" },
+      { name: "google_search", type: "function" },
+      { name: "fetch_page", type: "function" },
+    ],
+  };
+
+  const result = await pi.fire("before_provider_request", {
+    type: "before_provider_request",
+    payload,
+  });
+
+  const tools = ((result as any)?.tools ?? payload.tools) as any[];
+  const names = tools.map((t: any) => t.name);
+
+  assert.ok(!names.includes("search-the-web"), "search-the-web should be removed from payload");
+  assert.ok(!names.includes("search_and_read"), "search_and_read should be removed from payload");
+  assert.ok(!names.includes("google_search"), "google_search should be removed from payload");
+  assert.ok(names.includes("bash"), "bash should remain");
+  assert.ok(names.includes("fetch_page"), "fetch_page should remain");
+  assert.ok(names.includes("web_search"), "native web_search should be injected");
 });
 
-test("before_provider_request removes all custom search tools from payload even with BRAVE_API_KEY", async () => {
+test("before_provider_request removes all custom search tools from payload even with BRAVE_API_KEY", async (t) => {
   const originalKey = process.env.BRAVE_API_KEY;
   process.env.BRAVE_API_KEY = "test-key";
 
-  try {
-    const pi = createMockPI();
-    registerNativeSearchHooks(pi);
-
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "anthropic", name: "claude-sonnet-4-6" },
-      previousModel: undefined,
-      source: "set",
-    });
-
-    const payload: Record<string, unknown> = {
-      model: "claude-sonnet-4-6-20250514",
-      tools: [
-        { name: "search-the-web", type: "function" },
-        { name: "search_and_read", type: "function" },
-        { name: "google_search", type: "function" },
-        { name: "fetch_page", type: "function" },
-      ],
-    };
-
-    const result = await pi.fire("before_provider_request", {
-      type: "before_provider_request",
-      payload,
-    });
-
-    const tools = ((result as any)?.tools ?? payload.tools) as any[];
-    const names = tools.map((t: any) => t.name);
-
-    assert.ok(!names.includes("search-the-web"), "search-the-web should be removed for Anthropic");
-    assert.ok(!names.includes("search_and_read"), "search_and_read should be removed for Anthropic");
-    assert.ok(!names.includes("google_search"), "google_search should be removed for Anthropic");
-    assert.ok(names.includes("fetch_page"), "fetch_page should remain");
-    assert.ok(names.includes("web_search"), "native web_search should be injected");
-  } finally {
+  t.after(() => {
     if (originalKey) process.env.BRAVE_API_KEY = originalKey;
     else delete process.env.BRAVE_API_KEY;
-  }
+  });
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  const payload: Record<string, unknown> = {
+    model: "claude-sonnet-4-6-20250514",
+    tools: [
+      { name: "search-the-web", type: "function" },
+      { name: "search_and_read", type: "function" },
+      { name: "google_search", type: "function" },
+      { name: "fetch_page", type: "function" },
+    ],
+  };
+
+  const result = await pi.fire("before_provider_request", {
+    type: "before_provider_request",
+    payload,
+  });
+
+  const tools = ((result as any)?.tools ?? payload.tools) as any[];
+  const names = tools.map((t: any) => t.name);
+
+  assert.ok(!names.includes("search-the-web"), "search-the-web should be removed for Anthropic");
+  assert.ok(!names.includes("search_and_read"), "search_and_read should be removed for Anthropic");
+  assert.ok(!names.includes("google_search"), "google_search should be removed for Anthropic");
+  assert.ok(names.includes("fetch_page"), "fetch_page should remain");
+  assert.ok(names.includes("web_search"), "native web_search should be injected");
 });
 
 // ─── BUG-1 regression: duplicate Brave tools on repeated provider toggle ────
 
-test("model_select re-enable does not duplicate Brave tools across toggle cycles", async () => {
+test("model_select re-enable does not duplicate Brave tools across toggle cycles", async (t) => {
   const originalKey = process.env.BRAVE_API_KEY;
   delete process.env.BRAVE_API_KEY;
 
-  try {
-    const pi = createMockPI();
-    registerNativeSearchHooks(pi);
-
-    // Cycle 1: Anthropic disables Brave tools
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "anthropic", name: "claude-sonnet-4-6" },
-      previousModel: undefined,
-      source: "set",
-    });
-    assert.ok(!pi.getActiveTools().includes("search-the-web"), "Disabled after 1st Anthropic select");
-
-    // Cycle 1: switch away re-enables
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "openai", name: "gpt-4o" },
-      previousModel: { provider: "anthropic", name: "claude-sonnet-4-6" },
-      source: "set",
-    });
-    let active = pi.getActiveTools();
-    assert.equal(
-      active.filter((t) => t === "search-the-web").length, 1,
-      "search-the-web exactly once after first re-enable"
-    );
-
-    // Cycle 2: Anthropic again
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "anthropic", name: "claude-sonnet-4-6" },
-      previousModel: { provider: "openai", name: "gpt-4o" },
-      source: "set",
-    });
-
-    // Cycle 2: switch away again — must NOT accumulate duplicates
-    await pi.fire("model_select", {
-      type: "model_select",
-      model: { provider: "openai", name: "gpt-4o" },
-      previousModel: { provider: "anthropic", name: "claude-sonnet-4-6" },
-      source: "set",
-    });
-    active = pi.getActiveTools();
-    assert.equal(
-      active.filter((t) => t === "search-the-web").length, 1,
-      "search-the-web exactly once after second re-enable (no duplicates)"
-    );
-    assert.equal(
-      active.filter((t) => t === "search_and_read").length, 1,
-      "search_and_read exactly once (no duplicates)"
-    );
-    assert.equal(
-      active.filter((t) => t === "google_search").length, 1,
-      "google_search exactly once (no duplicates)"
-    );
-  } finally {
+  t.after(() => {
     if (originalKey) process.env.BRAVE_API_KEY = originalKey;
     else delete process.env.BRAVE_API_KEY;
-  }
+  });
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  // Cycle 1: Anthropic disables Brave tools
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+  assert.ok(!pi.getActiveTools().includes("search-the-web"), "Disabled after 1st Anthropic select");
+
+  // Cycle 1: switch away re-enables
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "openai", name: "gpt-4o" },
+    previousModel: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    source: "set",
+  });
+  let active = pi.getActiveTools();
+  assert.equal(
+    active.filter((t) => t === "search-the-web").length, 1,
+    "search-the-web exactly once after first re-enable"
+  );
+
+  // Cycle 2: Anthropic again
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: { provider: "openai", name: "gpt-4o" },
+    source: "set",
+  });
+
+  // Cycle 2: switch away again — must NOT accumulate duplicates
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "openai", name: "gpt-4o" },
+    previousModel: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    source: "set",
+  });
+  active = pi.getActiveTools();
+  assert.equal(
+    active.filter((t) => t === "search-the-web").length, 1,
+    "search-the-web exactly once after second re-enable (no duplicates)"
+  );
+  assert.equal(
+    active.filter((t) => t === "search_and_read").length, 1,
+    "search_and_read exactly once (no duplicates)"
+  );
+  assert.equal(
+    active.filter((t) => t === "google_search").length, 1,
+    "google_search exactly once (no duplicates)"
+  );
 });
 
 // ─── BUG-3 regression: mock fire() must call all handlers, not just first ───
@@ -684,6 +656,248 @@ test("model_select DOES show notification on explicit user set", async () => {
     (n) => n.message.includes("Native Anthropic web search active")
   );
   assert.ok(nativeNotif, "Should show notification on explicit 'set' source");
+});
+
+// ─── Session-level search budget (#1309) ────────────────────────────────────
+
+test("session search budget: max_uses decreases as history accumulates search results", async () => {
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  // Simulate a conversation with 10 web_search_tool_result blocks in history
+  const messages: any[] = [
+    { role: "user", content: "research this topic" },
+    {
+      role: "assistant",
+      content: [
+        { type: "web_search_tool_result", tool_use_id: "ws1", content: [] },
+        { type: "web_search_tool_result", tool_use_id: "ws2", content: [] },
+        { type: "web_search_tool_result", tool_use_id: "ws3", content: [] },
+        { type: "web_search_tool_result", tool_use_id: "ws4", content: [] },
+        { type: "web_search_tool_result", tool_use_id: "ws5", content: [] },
+        { type: "text", text: "Here are some results..." },
+      ],
+    },
+    { role: "user", content: "continue" },
+    {
+      role: "assistant",
+      content: [
+        { type: "web_search_tool_result", tool_use_id: "ws6", content: [] },
+        { type: "web_search_tool_result", tool_use_id: "ws7", content: [] },
+        { type: "web_search_tool_result", tool_use_id: "ws8", content: [] },
+        { type: "web_search_tool_result", tool_use_id: "ws9", content: [] },
+        { type: "web_search_tool_result", tool_use_id: "ws10", content: [] },
+        { type: "text", text: "More results..." },
+      ],
+    },
+    { role: "user", content: "keep going" },
+  ];
+
+  const payload: Record<string, unknown> = {
+    model: "claude-sonnet-4-6-20250514",
+    tools: [{ name: "bash", type: "custom" }],
+    messages,
+  };
+
+  const result = await pi.fire("before_provider_request", {
+    type: "before_provider_request",
+    payload,
+  });
+
+  const tools = ((result as any)?.tools ?? payload.tools) as any[];
+  const nativeTool = tools.find((t: any) => t.type === "web_search_20250305");
+  assert.ok(nativeTool, "Should still inject web_search when budget remaining");
+  // 15 - 10 = 5 remaining, min(5, 5) = 5
+  assert.equal(nativeTool.max_uses, 5, "Should cap at min(5, remaining)");
+});
+
+test("session search budget: reduces max_uses when close to limit", async () => {
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  // 13 search results in history → only 2 remaining
+  const searchBlocks = Array.from({ length: 13 }, (_, i) => ({
+    type: "web_search_tool_result",
+    tool_use_id: `ws${i}`,
+    content: [],
+  }));
+
+  const messages: any[] = [
+    { role: "user", content: "research" },
+    { role: "assistant", content: [...searchBlocks, { type: "text", text: "results" }] },
+    { role: "user", content: "more" },
+  ];
+
+  const payload: Record<string, unknown> = {
+    model: "claude-sonnet-4-6-20250514",
+    tools: [{ name: "bash", type: "custom" }],
+    messages,
+  };
+
+  const result = await pi.fire("before_provider_request", {
+    type: "before_provider_request",
+    payload,
+  });
+
+  const tools = ((result as any)?.tools ?? payload.tools) as any[];
+  const nativeTool = tools.find((t: any) => t.type === "web_search_20250305");
+  assert.ok(nativeTool, "Should still inject when budget > 0");
+  // 15 - 13 = 2 remaining
+  assert.equal(nativeTool.max_uses, 2, "Should reduce max_uses to remaining budget");
+});
+
+test("session search budget: omits web_search tool when budget exhausted", async () => {
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  // 15+ search results in history → budget exhausted
+  const searchBlocks = Array.from({ length: MAX_NATIVE_SEARCHES_PER_SESSION }, (_, i) => ({
+    type: "web_search_tool_result",
+    tool_use_id: `ws${i}`,
+    content: [],
+  }));
+
+  const messages: any[] = [
+    { role: "user", content: "research" },
+    { role: "assistant", content: [...searchBlocks, { type: "text", text: "results" }] },
+    { role: "user", content: "more" },
+  ];
+
+  const payload: Record<string, unknown> = {
+    model: "claude-sonnet-4-6-20250514",
+    tools: [{ name: "bash", type: "custom" }],
+    messages,
+  };
+
+  const result = await pi.fire("before_provider_request", {
+    type: "before_provider_request",
+    payload,
+  });
+
+  const tools = ((result as any)?.tools ?? payload.tools) as any[];
+  const nativeTool = tools.find((t: any) => t.type === "web_search_20250305");
+  assert.equal(nativeTool, undefined, "Should NOT inject web_search when budget exhausted (#1309)");
+  // Other tools should remain
+  assert.ok(tools.some((t: any) => t.name === "bash"), "Non-search tools should remain");
+});
+
+test("session search budget: resets on session_start", async () => {
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  // First session: exhaust budget
+  const searchBlocks = Array.from({ length: MAX_NATIVE_SEARCHES_PER_SESSION }, (_, i) => ({
+    type: "web_search_tool_result",
+    tool_use_id: `ws${i}`,
+    content: [],
+  }));
+
+  let payload: Record<string, unknown> = {
+    model: "claude-sonnet-4-6-20250514",
+    tools: [{ name: "bash", type: "custom" }],
+    messages: [
+      { role: "user", content: "research" },
+      { role: "assistant", content: [...searchBlocks] },
+      { role: "user", content: "more" },
+    ],
+  };
+
+  await pi.fire("before_provider_request", { type: "before_provider_request", payload });
+  let tools = (payload.tools as any[]);
+  assert.ok(!tools.some((t: any) => t.type === "web_search_20250305"), "Budget should be exhausted");
+
+  // New session starts — counter resets
+  await pi.fire("session_start", { type: "session_start" });
+
+  // New request with no history — full budget available
+  payload = {
+    model: "claude-sonnet-4-6-20250514",
+    tools: [{ name: "bash", type: "custom" }],
+    messages: [{ role: "user", content: "new research" }],
+  };
+
+  const result = await pi.fire("before_provider_request", { type: "before_provider_request", payload });
+  tools = ((result as any)?.tools ?? payload.tools) as any[];
+  const nativeTool = tools.find((t: any) => t.type === "web_search_20250305");
+  assert.ok(nativeTool, "Should inject web_search after session reset");
+  assert.equal(nativeTool.max_uses, 5, "Should have full per-turn budget after reset");
+});
+
+test("MAX_NATIVE_SEARCHES_PER_SESSION is exported and equals 15", () => {
+  assert.equal(MAX_NATIVE_SEARCHES_PER_SESSION, 15, "Session budget should be 15 (#1309)");
+});
+
+test("session search budget: survives context compaction (high-water mark)", async () => {
+  const pi = createMockPI();
+  registerNativeSearchHooks(pi);
+
+  await pi.fire("model_select", {
+    type: "model_select",
+    model: { provider: "anthropic", name: "claude-sonnet-4-6" },
+    previousModel: undefined,
+    source: "set",
+  });
+
+  // First request: history has 12 web_search_tool_result blocks
+  const searchBlocks = Array.from({ length: 12 }, (_, i) => ({
+    type: "web_search_tool_result",
+    tool_use_id: `ws${i}`,
+    content: [],
+  }));
+
+  let payload: Record<string, unknown> = {
+    model: "claude-sonnet-4-6-20250514",
+    tools: [{ name: "bash", type: "custom" }],
+    messages: [{ role: "user", content: [{ type: "text", text: "search" }, ...searchBlocks] }],
+  };
+
+  await pi.fire("before_provider_request", { type: "before_provider_request", payload });
+  let tools = payload.tools as any[];
+  let nativeTool = tools.find((t: any) => t.type === "web_search_20250305");
+  assert.ok(nativeTool, "Should still inject web_search with 12/15 used");
+  assert.equal(nativeTool.max_uses, 3, "Should have 3 remaining (15 - 12)");
+
+  // Second request: context was compacted — search blocks gone from history.
+  // Without high-water mark, the budget would reset to 15.
+  payload = {
+    model: "claude-sonnet-4-6-20250514",
+    tools: [{ name: "bash", type: "custom" }],
+    messages: [{ role: "user", content: "compacted context — no search blocks" }],
+  };
+
+  await pi.fire("before_provider_request", { type: "before_provider_request", payload });
+  tools = payload.tools as any[];
+  nativeTool = tools.find((t: any) => t.type === "web_search_20250305");
+  assert.ok(nativeTool, "Should still inject web_search with 12/15 used (high-water mark)");
+  assert.equal(nativeTool.max_uses, 3, "High-water mark should preserve 12 — only 3 remaining");
 });
 
 // ─── stripThinkingFromHistory tests ─────────────────────────────────────────

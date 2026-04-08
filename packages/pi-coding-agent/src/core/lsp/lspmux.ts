@@ -1,7 +1,9 @@
-import { execSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { LSP_LIVENESS_TIMEOUT_MS, LSP_STATE_CACHE_TTL_MS } from "../constants.js";
+import { which } from "./config.js";
 
 /**
  * lspmux integration for LSP server multiplexing.
@@ -41,20 +43,6 @@ const DEFAULT_SUPPORTED_SERVERS = new Set([
 	"rust-analyzer",
 ]);
 
-const LIVENESS_TIMEOUT_MS = 1000;
-const STATE_CACHE_TTL_MS = 5 * 60 * 1000;
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-function which(command: string): string | null {
-	try {
-		return execSync(`which ${command}`, { encoding: "utf-8" }).trim() || null;
-	} catch {
-		return null;
-	}
-}
 
 // =============================================================================
 // Config Path
@@ -102,13 +90,16 @@ async function checkServerRunning(binaryPath: string): Promise<boolean> {
 	try {
 		const proc = spawn(binaryPath, ["status"], {
 			stdio: ["ignore", "pipe", "pipe"],
+			// On Windows, the binary may be a .cmd wrapper requiring shell
+			// resolution to avoid ENOENT/EINVAL (#2854).
+			shell: process.platform === "win32",
 		});
 
 		const exited = await Promise.race([
 			new Promise<number>((resolve) => {
 				proc.on("exit", (code: number | null) => resolve(code ?? 1));
 			}),
-			new Promise<null>(resolve => setTimeout(() => resolve(null), LIVENESS_TIMEOUT_MS)),
+			new Promise<null>(resolve => setTimeout(() => resolve(null), LSP_LIVENESS_TIMEOUT_MS)),
 		]);
 
 		if (exited === null) {
@@ -124,7 +115,7 @@ async function checkServerRunning(binaryPath: string): Promise<boolean> {
 
 export async function detectLspmux(): Promise<LspmuxState> {
 	const now = Date.now();
-	if (cachedState && now - cacheTimestamp < STATE_CACHE_TTL_MS) {
+	if (cachedState && now - cacheTimestamp < LSP_STATE_CACHE_TTL_MS) {
 		return cachedState;
 	}
 
@@ -164,7 +155,7 @@ export interface LspmuxWrappedCommand {
 	env?: Record<string, string>;
 }
 
-export function wrapWithLspmux(
+function wrapWithLspmux(
 	originalCommand: string,
 	originalArgs: string[] | undefined,
 	state: LspmuxState,

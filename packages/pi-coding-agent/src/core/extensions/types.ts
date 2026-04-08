@@ -603,9 +603,44 @@ export interface ModelSelectEvent {
 	source: ModelSelectSource;
 }
 
+/** Fired before model selection runs capability scoring. Extensions can override the selected model. */
+export interface BeforeModelSelectEvent {
+	type: "before_model_select";
+	unitType: string;
+	unitId: string;
+	classification: { tier: string; reason: string; downgraded: boolean };
+	taskMetadata?: Record<string, unknown>;
+	eligibleModels: string[];
+	phaseConfig?: { primary: string; fallbacks: string[] };
+}
+
+/** Result from before_model_select event handler. Return { modelId } to override selection. */
+export interface BeforeModelSelectResult {
+	modelId: string;
+}
+
 // ============================================================================
 // User Bash Events
 // ============================================================================
+
+/**
+ * Fired before the bash tool executes a shell command.
+ * Extensions can return a transformed command string.
+ * All registered handlers are called in order; each receives the output of the previous.
+ */
+export interface BashTransformEvent {
+	type: "bash_transform";
+	/** The command string about to be executed */
+	command: string;
+	/** Current working directory */
+	cwd: string;
+}
+
+/** Result from bash_transform event handler */
+export interface BashTransformEventResult {
+	/** Replacement command string. If omitted or empty, the original command is used. */
+	command?: string;
+}
 
 /** Fired when user executes a bash command via ! or !! prefix */
 export interface UserBashEvent {
@@ -761,27 +796,36 @@ export type ToolResultEvent =
 	| LsToolResultEvent
 	| CustomToolResultEvent;
 
-// Type guards for ToolResultEvent
-export function isBashToolResult(e: ToolResultEvent): e is BashToolResultEvent {
-	return e.toolName === "bash";
-}
-export function isReadToolResult(e: ToolResultEvent): e is ReadToolResultEvent {
-	return e.toolName === "read";
-}
-export function isEditToolResult(e: ToolResultEvent): e is EditToolResultEvent {
-	return e.toolName === "edit";
-}
-export function isWriteToolResult(e: ToolResultEvent): e is WriteToolResultEvent {
-	return e.toolName === "write";
-}
-export function isGrepToolResult(e: ToolResultEvent): e is GrepToolResultEvent {
-	return e.toolName === "grep";
-}
-export function isFindToolResult(e: ToolResultEvent): e is FindToolResultEvent {
-	return e.toolName === "find";
-}
-export function isLsToolResult(e: ToolResultEvent): e is LsToolResultEvent {
-	return e.toolName === "ls";
+/**
+ * Type guard for narrowing ToolResultEvent by tool name.
+ *
+ * Built-in tools narrow automatically (no type params needed):
+ * ```ts
+ * if (isToolResultEventType("bash", event)) {
+ *   event.details;  // BashToolDetails | undefined
+ * }
+ * ```
+ *
+ * Custom tools require explicit type parameters:
+ * ```ts
+ * if (isToolResultEventType<"my_tool", MyDetails>("my_tool", event)) {
+ *   event.details;  // typed
+ * }
+ * ```
+ */
+export function isToolResultEventType(toolName: "bash", event: ToolResultEvent): event is BashToolResultEvent;
+export function isToolResultEventType(toolName: "read", event: ToolResultEvent): event is ReadToolResultEvent;
+export function isToolResultEventType(toolName: "edit", event: ToolResultEvent): event is EditToolResultEvent;
+export function isToolResultEventType(toolName: "write", event: ToolResultEvent): event is WriteToolResultEvent;
+export function isToolResultEventType(toolName: "grep", event: ToolResultEvent): event is GrepToolResultEvent;
+export function isToolResultEventType(toolName: "find", event: ToolResultEvent): event is FindToolResultEvent;
+export function isToolResultEventType(toolName: "ls", event: ToolResultEvent): event is LsToolResultEvent;
+export function isToolResultEventType<TName extends string, TDetails = unknown>(
+	toolName: TName,
+	event: ToolResultEvent,
+): event is ToolResultEvent & { toolName: TName; details: TDetails };
+export function isToolResultEventType(toolName: string, event: ToolResultEvent): boolean {
+	return event.toolName === toolName;
 }
 
 /**
@@ -837,6 +881,7 @@ export type ExtensionEvent =
 	| ToolExecutionUpdateEvent
 	| ToolExecutionEndEvent
 	| ModelSelectEvent
+	| BashTransformEvent
 	| UserBashEvent
 	| InputEvent
 	| ToolCallEvent
@@ -940,6 +985,33 @@ export interface RegisteredCommand {
 	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 }
 
+export type LifecycleHookScope = "user" | "project";
+export type LifecycleHookPhase = "beforeInstall" | "afterInstall" | "beforeRemove" | "afterRemove";
+
+export interface LifecycleHookContext {
+	/** Lifecycle phase currently being executed. */
+	phase: LifecycleHookPhase;
+	/** Package source string passed to install (npm:, git:, https://, local path). */
+	source: string;
+	/** Resolved installed package path (or resolved local path), when available for this phase. */
+	installedPath?: string;
+	/** Where the package was installed. */
+	scope: LifecycleHookScope;
+	/** Current working directory for the install invocation. */
+	cwd: string;
+	/** Whether install is running in an interactive TTY. */
+	interactive: boolean;
+	/** Info-level logging sink for install output. */
+	log(message: string): void;
+	/** Warning-level logging sink for install output. */
+	warn(message: string): void;
+	/** Error-level logging sink for install output. */
+	error(message: string): void;
+}
+
+export type LifecycleHookHandler = (ctx: LifecycleHookContext) => Promise<void> | void;
+export type LifecycleHookMap = Record<LifecycleHookPhase, LifecycleHookHandler[]>;
+
 // ============================================================================
 // Extension API
 // ============================================================================
@@ -991,10 +1063,19 @@ export interface ExtensionAPI {
 	on(event: "tool_execution_update", handler: ExtensionHandler<ToolExecutionUpdateEvent>): void;
 	on(event: "tool_execution_end", handler: ExtensionHandler<ToolExecutionEndEvent>): void;
 	on(event: "model_select", handler: ExtensionHandler<ModelSelectEvent>): void;
+	on(event: "bash_transform", handler: ExtensionHandler<BashTransformEvent, BashTransformEventResult>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
+	on(event: "before_model_select", handler: ExtensionHandler<BeforeModelSelectEvent, BeforeModelSelectResult>): void;
+
+	// =========================================================================
+	// Event Emission (for host extensions that orchestrate model selection)
+	// =========================================================================
+
+	/** Emit before_model_select event. Returns override model ID or undefined. */
+	emitBeforeModelSelect(event: Omit<BeforeModelSelectEvent, "type">): Promise<BeforeModelSelectResult | undefined>;
 
 	// =========================================================================
 	// Tool Registration
@@ -1009,6 +1090,18 @@ export interface ExtensionAPI {
 
 	/** Register a custom command. */
 	registerCommand(name: string, options: Omit<RegisteredCommand, "name">): void;
+
+	/** Register a lifecycle hook run before package installation starts. */
+	registerBeforeInstall(handler: LifecycleHookHandler): void;
+
+	/** Register a lifecycle hook run after package installation completes. */
+	registerAfterInstall(handler: LifecycleHookHandler): void;
+
+	/** Register a lifecycle hook run before package removal starts. */
+	registerBeforeRemove(handler: LifecycleHookHandler): void;
+
+	/** Register a lifecycle hook run after package removal completes. */
+	registerAfterRemove(handler: LifecycleHookHandler): void;
 
 	/** Register a keyboard shortcut. */
 	registerShortcut(
@@ -1057,6 +1150,13 @@ export interface ExtensionAPI {
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp" },
 	): void;
+
+	/**
+	 * Retry the last turn by removing the failed assistant response and
+	 * re-running the agent from the last user message. No-op if the last
+	 * message is not an assistant error.
+	 */
+	retryLastTurn(): void;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
@@ -1185,6 +1285,11 @@ export interface ExtensionAPI {
 
 /** Configuration for registering a provider via pi.registerProvider(). */
 export interface ProviderConfig {
+	/** Auth behavior for provider availability and request key handling. Defaults to "apiKey". */
+	authMode?: "apiKey" | "oauth" | "externalCli" | "none";
+	/** Optional readiness check. Return false if the provider cannot accept requests (e.g., CLI not authenticated, API key invalid).
+	 * Called before default auth checks. Trusted at the same level as extension code — extensions already have arbitrary code execution. */
+	isReady?: () => boolean;
 	/** Base URL for the API endpoint. Required when defining models. */
 	baseUrl?: string;
 	/** API key or environment variable name. Required when defining models (unless oauth provided). */
@@ -1236,6 +1341,8 @@ export interface ProviderModelConfig {
 	headers?: Record<string, string>;
 	/** OpenAI compatibility settings. */
 	compat?: Model<Api>["compat"];
+	/** Opaque provider-specific options (e.g. Ollama keep_alive, num_gpu). */
+	providerOptions?: Record<string, unknown>;
 }
 
 /** Extension factory function type. Supports both sync and async initialization. */
@@ -1267,42 +1374,8 @@ export interface ExtensionShortcut {
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
-export type SendMessageHandler = <T = unknown>(
-	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
-) => void;
-
-export type SendUserMessageHandler = (
-	content: string | (TextContent | ImageContent)[],
-	options?: { deliverAs?: "steer" | "followUp" },
-) => void;
-
-export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
-
-export type SetSessionNameHandler = (name: string) => void;
-
-export type GetSessionNameHandler = () => string | undefined;
-
-export type GetActiveToolsHandler = () => string[];
-
 /** Tool info with name, description, and parameter schema */
 export type ToolInfo = Pick<ToolDefinition, "name" | "description" | "parameters">;
-
-export type GetAllToolsHandler = () => ToolInfo[];
-
-export type GetCommandsHandler = () => SlashCommandInfo[];
-
-export type SetActiveToolsHandler = (toolNames: string[]) => void;
-
-export type RefreshToolsHandler = () => void;
-
-export type SetModelHandler = (model: Model<any>, options?: { persist?: boolean }) => Promise<boolean>;
-
-export type GetThinkingLevelHandler = () => ThinkingLevel;
-
-export type SetThinkingLevelHandler = (level: ThinkingLevel) => void;
-
-export type SetLabelHandler = (entryId: string, label: string | undefined) => void;
 
 /**
  * Shared state created by loader, used during registration and runtime.
@@ -1320,6 +1393,8 @@ export interface ExtensionRuntimeState {
 	 */
 	registerProvider: (name: string, config: ProviderConfig) => void;
 	unregisterProvider: (name: string) => void;
+	/** Emit before_model_select event to all registered handlers. Bound by ExtensionRunner. */
+	emitBeforeModelSelect: (event: Omit<BeforeModelSelectEvent, "type">) => Promise<BeforeModelSelectResult | undefined>;
 }
 
 /**
@@ -1327,20 +1402,27 @@ export interface ExtensionRuntimeState {
  * Provided to runner.initialize(), copied into the shared runtime.
  */
 export interface ExtensionActions {
-	sendMessage: SendMessageHandler;
-	sendUserMessage: SendUserMessageHandler;
-	appendEntry: AppendEntryHandler;
-	setSessionName: SetSessionNameHandler;
-	getSessionName: GetSessionNameHandler;
-	setLabel: SetLabelHandler;
-	getActiveTools: GetActiveToolsHandler;
-	getAllTools: GetAllToolsHandler;
-	setActiveTools: SetActiveToolsHandler;
-	refreshTools: RefreshToolsHandler;
-	getCommands: GetCommandsHandler;
-	setModel: SetModelHandler;
-	getThinkingLevel: GetThinkingLevelHandler;
-	setThinkingLevel: SetThinkingLevelHandler;
+	sendMessage: <T = unknown>(
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	) => void;
+	sendUserMessage: (
+		content: string | (TextContent | ImageContent)[],
+		options?: { deliverAs?: "steer" | "followUp" },
+	) => void;
+	retryLastTurn: () => void;
+	appendEntry: <T = unknown>(customType: string, data?: T) => void;
+	setSessionName: (name: string) => void;
+	getSessionName: () => string | undefined;
+	setLabel: (entryId: string, label: string | undefined) => void;
+	getActiveTools: () => string[];
+	getAllTools: () => ToolInfo[];
+	setActiveTools: (toolNames: string[]) => void;
+	refreshTools: () => void;
+	getCommands: () => SlashCommandInfo[];
+	setModel: (model: Model<any>, options?: { persist?: boolean }) => Promise<boolean>;
+	getThinkingLevel: () => ThinkingLevel;
+	setThinkingLevel: (level: ThinkingLevel) => void;
 }
 
 /**
@@ -1393,6 +1475,7 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	lifecycleHooks: LifecycleHookMap;
 }
 
 /** Result of loading extensions. */

@@ -12,7 +12,9 @@
  * SLICE_BRANCH_RE) remain for backwards compatibility with legacy branches.
  */
 
-import { sep } from "node:path";
+import { existsSync, readFileSync, realpathSync, utimesSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
+import { homedir } from "node:os";
 
 import { GitServiceImpl, writeIntegrationBranch, type TaskCommitContext } from "./git-service.js";
 import { loadEffectiveGSDPreferences } from "./preferences.js";
@@ -41,6 +43,16 @@ function getService(basePath: string): GitServiceImpl {
 }
 
 /**
+ * Clear the cached GitServiceImpl. For testing only — forces the next
+ * getService() call to re-read preferences and create a fresh instance.
+ * @internal
+ */
+export function _resetServiceCache(): void {
+  cachedService = null;
+  cachedBasePath = null;
+}
+
+/**
  * Set the active milestone ID on the cached GitServiceImpl.
  * This enables integration branch resolution in getMainBranch().
  */
@@ -55,16 +67,39 @@ export function setActiveMilestoneId(basePath: string, milestoneId: string | nul
  * record when the user starts from a different branch (#300). Always a no-op
  * if on a GSD slice branch.
  */
-export function captureIntegrationBranch(basePath: string, milestoneId: string, options?: { commitDocs?: boolean }): void {
+export function captureIntegrationBranch(basePath: string, milestoneId: string): void {
   // In a worktree, the base branch is implicit (worktree/<name>).
   // Writing it to META.json would leave stale metadata after merge back to main.
   if (detectWorktreeName(basePath)) return;
   const svc = getService(basePath);
   const current = svc.getCurrentBranch();
-  writeIntegrationBranch(basePath, milestoneId, current, options);
+  writeIntegrationBranch(basePath, milestoneId, current);
 }
 
 // ─── Pure Utility Functions (unchanged) ────────────────────────────────────
+
+/**
+ * Find the worktrees segment in a path, supporting both direct
+ * (`/.gsd/worktrees/`) and symlink-resolved (`/.gsd/projects/<hash>/worktrees/`)
+ * layouts.  When `.gsd` is a symlink to `~/.gsd/projects/<hash>`, resolved
+ * paths contain the intermediate `projects/<hash>/` segment that the old
+ * single-marker check missed.
+ */
+function findWorktreeSegment(normalizedPath: string): { gsdIdx: number; afterWorktrees: number } | null {
+  // Direct layout: /.gsd/worktrees/<name>
+  const directMarker = "/.gsd/worktrees/";
+  const idx = normalizedPath.indexOf(directMarker);
+  if (idx !== -1) {
+    return { gsdIdx: idx, afterWorktrees: idx + directMarker.length };
+  }
+  // Symlink-resolved layout: /.gsd/projects/<hash>/worktrees/<name>
+  const symlinkRe = /\/\.gsd\/projects\/[a-f0-9]+\/worktrees\//;
+  const match = normalizedPath.match(symlinkRe);
+  if (match && match.index !== undefined) {
+    return { gsdIdx: match.index, afterWorktrees: match.index + match[0].length };
+  }
+  return null;
+}
 
 /**
  * Detect the active worktree name from the current working directory.
@@ -72,34 +107,125 @@ export function captureIntegrationBranch(basePath: string, milestoneId: string, 
  */
 export function detectWorktreeName(basePath: string): string | null {
   const normalizedPath = basePath.replaceAll("\\", "/");
-  const marker = "/.gsd/worktrees/";
-  const idx = normalizedPath.indexOf(marker);
-  if (idx === -1) return null;
-  const afterMarker = normalizedPath.slice(idx + marker.length);
+  const seg = findWorktreeSegment(normalizedPath);
+  if (!seg) return null;
+  const afterMarker = normalizedPath.slice(seg.afterWorktrees);
   const name = afterMarker.split("/")[0];
   return name || null;
 }
 
 /**
  * Resolve the project root from a path that may be inside a worktree.
- * If the path contains `/.gsd/worktrees/<name>/`, returns the portion
- * before `/.gsd/`. Otherwise returns the input unchanged.
+ * If the path contains a worktrees segment, returns the portion before
+ * `/.gsd/`. Otherwise returns the input unchanged.
+ *
+ * When the worker was spawned with GSD_PROJECT_ROOT set, use that directly —
+ * the coordinator already knows the real project root unambiguously.
+ *
+ * When `/.gsd/` in the resolved path is actually the user-level `~/.gsd/`
+ * (common when `.gsd` is a symlink into `~/.gsd/projects/<hash>`), the
+ * string-slice heuristic would return `~` — which is catastrophically wrong.
+ * In that case, fall back to reading the worktree's `.git` file, which
+ * contains a `gitdir:` pointer to the real project's `.git/worktrees/<name>`,
+ * giving the real project root unambiguously.
  *
  * Use this in commands that call `process.cwd()` to ensure they always
  * operate against the real project root, not a worktree subdirectory.
  */
 export function resolveProjectRoot(basePath: string): string {
+  // Layer 1: If the coordinator passed the real project root, use it.
+  if (process.env.GSD_PROJECT_ROOT) {
+    return process.env.GSD_PROJECT_ROOT;
+  }
+
   const normalizedPath = basePath.replaceAll("\\", "/");
-  const marker = "/.gsd/worktrees/";
-  const idx = normalizedPath.indexOf(marker);
-  if (idx === -1) return basePath;
-  // Return the original path up to the .gsd/ marker (un-normalized)
-  // Account for potential OS-specific separators
-  const sep = basePath.includes("\\") ? "\\" : "/";
-  const markerOs = `${sep}.gsd${sep}worktrees${sep}`;
-  const idxOs = basePath.indexOf(markerOs);
-  if (idxOs !== -1) return basePath.slice(0, idxOs);
-  return basePath.slice(0, idx);
+  const seg = findWorktreeSegment(normalizedPath);
+  if (!seg) return basePath;
+
+  // Candidate root via the string-slice heuristic
+  const sepChar = basePath.includes("\\") ? "\\" : "/";
+  const gsdMarker = `${sepChar}.gsd${sepChar}`;
+  const gsdIdx = basePath.indexOf(gsdMarker);
+  const candidate = gsdIdx !== -1
+    ? basePath.slice(0, gsdIdx)
+    : basePath.slice(0, seg.gsdIdx);
+
+  // Layer 2: Guard against resolving to the user's home directory.
+  // When .gsd is a symlink into ~/.gsd/projects/<hash>, the resolved path
+  // contains /.gsd/ at the user-level boundary. Slicing there yields ~ — wrong.
+  const gsdHome = normalizePathForCompare(process.env.GSD_HOME || join(homedir(), ".gsd"));
+  const candidateGsdPath = normalizePathForCompare(join(candidate, ".gsd"));
+
+  if (candidateGsdPath === gsdHome || candidateGsdPath.startsWith(gsdHome + "/")) {
+    // The candidate is the home directory (or within it in a way that .gsd
+    // maps to the user-level GSD dir). Try to recover the real project root
+    // from the worktree's .git file.
+    const realRoot = resolveProjectRootFromGitFile(basePath);
+    if (realRoot) return realRoot;
+    // If git file resolution failed, return basePath unchanged rather than ~
+    return basePath;
+  }
+
+  return candidate;
+}
+
+/**
+ * Recover the real project root from a worktree's .git file.
+ *
+ * Each git worktree has a `.git` file (not directory) containing:
+ *   gitdir: /real/project/.git/worktrees/<name>
+ *
+ * Walking up from that gitdir gives us `/real/project/.git`, and its
+ * parent is the real project root.
+ */
+function resolveProjectRootFromGitFile(worktreePath: string): string | null {
+  try {
+    // Walk up from the worktree path to find the .git file
+    let dir = worktreePath;
+    for (let i = 0; i < 30; i++) {
+      const gitPath = join(dir, ".git");
+      if (existsSync(gitPath)) {
+        const content = readFileSync(gitPath, "utf8").trim();
+        if (content.startsWith("gitdir: ")) {
+          // gitdir points to: <real-project>/.git/worktrees/<name>
+          const gitDir = resolve(dir, content.slice(8));
+          // Walk up: .git/worktrees/<name> → .git/worktrees → .git → project root
+          const dotGitDir = resolve(gitDir, "..", "..");
+          // Verify this looks like a .git directory
+          if (dotGitDir.endsWith(".git") || dotGitDir.endsWith(".git/") || dotGitDir.endsWith(".git\\")) {
+            return resolve(dotGitDir, "..");
+          }
+          // Alternative: the commondir file inside the worktree gitdir
+          // points to the main .git directory
+          const commonDirPath = join(gitDir, "commondir");
+          if (existsSync(commonDirPath)) {
+            const commonDir = readFileSync(commonDirPath, "utf8").trim();
+            const resolvedCommonDir = resolve(gitDir, commonDir);
+            return resolve(resolvedCommonDir, "..");
+          }
+        }
+        break;
+      }
+      const parent = resolve(dir, "..");
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {
+    // Non-fatal — caller will use fallback
+  }
+  return null;
+}
+
+function normalizePathForCompare(path: string): string {
+  let normalized: string;
+  try {
+    normalized = realpathSync(path);
+  } catch {
+    normalized = resolve(path);
+  }
+  const slashed = normalized.replaceAll("\\", "/");
+  const trimmed = slashed.replace(/\/+$/, "");
+  return trimmed || "/";
 }
 
 /**
@@ -119,8 +245,9 @@ export function getSliceBranchName(milestoneId: string, sliceId: string, worktre
   return `gsd/${milestoneId}/${sliceId}`;
 }
 
-/** Regex that matches both plain and worktree-namespaced slice branches. */
-export const SLICE_BRANCH_RE = /^gsd\/(?:([a-zA-Z0-9_-]+)\/)?(M\d+(?:-[a-z0-9]{6})?)\/(S\d+)$/;
+/** Re-export for backward compatibility — canonical definition in branch-patterns.ts */
+export { SLICE_BRANCH_RE } from "./branch-patterns.js";
+import { SLICE_BRANCH_RE } from "./branch-patterns.js";
 
 /**
  * Parse a slice branch name into its components.
@@ -177,4 +304,43 @@ export function autoCommitCurrentBranch(
   return getService(basePath).autoCommit(unitType, unitId, [], taskContext);
 }
 
+// ─── Git HEAD Resolution ────────────────────────────────────────────────────
 
+/**
+ * Resolve the git HEAD file path for a given directory.
+ * Handles both normal repos (.git is a directory) and worktrees (.git is a file
+ * containing a `gitdir:` pointer to the real gitdir).
+ */
+export function resolveGitHeadPath(dir: string): string | null {
+  const gitPath = join(dir, ".git");
+  if (!existsSync(gitPath)) return null;
+
+  try {
+    const content = readFileSync(gitPath, "utf8").trim();
+    if (content.startsWith("gitdir: ")) {
+      const gitDir = resolve(dir, content.slice(8));
+      const headPath = join(gitDir, "HEAD");
+      return existsSync(headPath) ? headPath : null;
+    }
+    const headPath = join(dir, ".git", "HEAD");
+    return existsSync(headPath) ? headPath : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Nudge pi's FooterDataProvider to re-read the git branch after chdir.
+ * Touches HEAD in both old and new cwd to fire the fs watcher.
+ */
+export function nudgeGitBranchCache(previousCwd: string): void {
+  const now = new Date();
+  for (const dir of [previousCwd, process.cwd()]) {
+    try {
+      const headPath = resolveGitHeadPath(dir);
+      if (headPath) utimesSync(headPath, now, now);
+    } catch {
+      // Best-effort
+    }
+  }
+}

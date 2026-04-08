@@ -10,11 +10,11 @@
  * so the file on disk reflects every tool call up to the crash point).
  */
 
-import { writeFileSync, readFileSync, unlinkSync, existsSync } from "node:fs";
+import { readFileSync, unlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { gsdRoot } from "./paths.js";
-
-const LOCK_FILE = "auto.lock";
+import { atomicWriteSync } from "./atomic-write.js";
+import { effectiveLockFile } from "./session-lock.js";
 
 export interface LockData {
   pid: number;
@@ -22,13 +22,12 @@ export interface LockData {
   unitType: string;
   unitId: string;
   unitStartedAt: string;
-  completedUnits: number;
   /** Path to the pi session JSONL file that was active when this unit started. */
   sessionFile?: string;
 }
 
 function lockPath(basePath: string): string {
-  return join(gsdRoot(basePath), LOCK_FILE);
+  return join(gsdRoot(basePath), effectiveLockFile());
 }
 
 /** Write or update the lock file with current auto-mode state. */
@@ -36,7 +35,6 @@ export function writeLock(
   basePath: string,
   unitType: string,
   unitId: string,
-  completedUnits: number,
   sessionFile?: string,
 ): void {
   try {
@@ -46,10 +44,10 @@ export function writeLock(
       unitType,
       unitId,
       unitStartedAt: new Date().toISOString(),
-      completedUnits,
       sessionFile,
     };
-    writeFileSync(lockPath(basePath), JSON.stringify(data, null, 2), "utf-8");
+    const lp = lockPath(basePath);
+    atomicWriteSync(lp, JSON.stringify(data, null, 2));
   } catch (e) { /* non-fatal: lock write failure */ void e; }
 }
 
@@ -77,12 +75,16 @@ export function readCrashLock(basePath: string): LockData | null {
 /**
  * Check whether the process that wrote the lock is still running.
  * Uses `process.kill(pid, 0)` which sends no signal but checks liveness.
- * Returns false if the PID matches our own (recycled PID from a prior run).
+ * Returns true if the PID matches our own — we are the lock holder (#2470).
  */
 export function isLockProcessAlive(lock: LockData): boolean {
   const pid = lock.pid;
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  if (pid === process.pid) return false;
+  // Our own PID means WE hold this lock — we are alive. (#2470)
+  // Callers that need to distinguish "our lock" from "someone else's lock"
+  // (e.g. startAuto checking for a prior crashed session with a recycled PID)
+  // already guard with `crashLock.pid !== process.pid` before calling us.
+  if (pid === process.pid) return true;
   try {
     process.kill(pid, 0);
     return true;
@@ -96,11 +98,23 @@ export function isLockProcessAlive(lock: LockData): boolean {
 
 /** Format crash info for display or injection into a prompt. */
 export function formatCrashInfo(lock: LockData): string {
-  return [
+  const lines = [
     `Previous auto-mode session was interrupted.`,
     `  Was executing: ${lock.unitType} (${lock.unitId})`,
     `  Started at: ${lock.unitStartedAt}`,
-    `  Units completed before crash: ${lock.completedUnits}`,
     `  PID: ${lock.pid}`,
-  ].join("\n");
+  ];
+
+  // Add recovery guidance based on what was happening when it crashed
+  if (lock.unitType === "starting" && lock.unitId === "bootstrap") {
+    lines.push(`No work was lost. Run /gsd auto to restart.`);
+  } else if (lock.unitType.includes("research") || lock.unitType.includes("plan")) {
+    lines.push(`The ${lock.unitType} unit may be incomplete. Run /gsd auto to re-run it.`);
+  } else if (lock.unitType.includes("execute")) {
+    lines.push(`Task execution was interrupted. Run /gsd auto to resume — completed work is preserved.`);
+  } else if (lock.unitType.includes("complete")) {
+    lines.push(`Slice/milestone completion was interrupted. Run /gsd auto to finish.`);
+  }
+
+  return lines.join("\n");
 }

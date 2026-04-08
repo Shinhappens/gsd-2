@@ -20,9 +20,11 @@
 
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
+import { gsdRoot } from "./paths.js";
+import { truncateWithEllipsis } from "../shared/format-utils.js";
 import { nativeParseJsonlTail } from "./native-parser-bridge.js";
+import { MAX_JSONL_BYTES, parseJSONL } from "./jsonl-utils.js";
 import { nativeWorkingTreeStatus, nativeDiffStat } from "./native-git-bridge.js";
-import { getAutoWorktreePath } from "./auto-worktree.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -63,21 +65,7 @@ export interface RecoveryBriefing {
 }
 
 // ─── JSONL Parsing ────────────────────────────────────────────────────────────
-
-/** Max bytes to parse from a JSONL source. Prevents V8 OOM on bloated activity logs. */
-const MAX_JSONL_BYTES = 10 * 1024 * 1024; // 10 MB
-
-function parseJSONL(raw: string): unknown[] {
-  // If the file is enormous, only parse the tail (most recent entries).
-  // This prevents the OOM crash path: large file → split → map → parse → OOM.
-  const source = raw.length > MAX_JSONL_BYTES
-    ? raw.slice(-MAX_JSONL_BYTES)
-    : raw;
-  return source.trim().split("\n").map(line => {
-    try { return JSON.parse(line); }
-    catch { return null; }
-  }).filter(Boolean) as unknown[];
-}
+// MAX_JSONL_BYTES and parseJSONL are imported from ./jsonl-utils.js
 
 /**
  * Find the entries belonging to the last session in a JSONL file.
@@ -183,7 +171,17 @@ export function extractTrace(entries: unknown[]): ExecutionTrace {
       }
 
       if (isError && resultText) {
-        errors.push(resultText.slice(0, 300));
+        // Filter out benign "errors" that are normal during code exploration:
+        // - grep/rg/find returning exit code 1 (no matches) is expected POSIX behavior
+        // - User interrupts (Escape/skip) are intentional, not failures
+        const trimmed = resultText.trim();
+        const isBenignNoMatch = pending?.name === "bash" &&
+          /^\(no output\)\s*\n\s*Command exited with code 1$/m.test(trimmed);
+        const isUserSkip = /^Skipped due to queued user message/i.test(trimmed);
+
+        if (!isBenignNoMatch && !isUserSkip) {
+          errors.push(resultText.slice(0, 300));
+        }
       }
     }
   }
@@ -296,23 +294,19 @@ export function synthesizeCrashRecovery(
  * Deep diagnostic from any JSONL source (activity log or session file).
  * Replaces the old shallow getLastActivityDiagnostic().
  */
-export function getDeepDiagnostic(basePath: string): string | null {
-  // Try worktree activity logs first if an auto-worktree is active
+export function getDeepDiagnostic(basePath: string, worktreePath?: string): string | null {
+  // Try worktree activity logs first if a worktree path is provided
   let trace: ExecutionTrace | null = null;
   try {
-    const mid = readActiveMilestoneId(basePath);
-    if (mid) {
-      const wtPath = getAutoWorktreePath(basePath, mid);
-      if (wtPath) {
-        const wtActivityDir = join(wtPath, ".gsd", "activity");
-        trace = readLastActivityLog(wtActivityDir);
-      }
+    if (worktreePath) {
+      const wtActivityDir = join(gsdRoot(worktreePath), "activity");
+      trace = readLastActivityLog(wtActivityDir);
     }
   } catch { /* non-fatal — fall through to root */ }
 
   // Fall back to root activity logs
   if (!trace || trace.toolCallCount === 0) {
-    const activityDir = join(basePath, ".gsd", "activity");
+    const activityDir = join(gsdRoot(basePath), "activity");
     trace = readLastActivityLog(activityDir);
   }
 
@@ -324,9 +318,9 @@ export function getDeepDiagnostic(basePath: string): string | null {
  * Read the active milestone ID directly from STATE.md without async deriveState().
  * Looks for `**Active Milestone:** M001` pattern.
  */
-function readActiveMilestoneId(basePath: string): string | null {
+export function readActiveMilestoneId(basePath: string): string | null {
   try {
-    const statePath = join(basePath, ".gsd", "STATE.md");
+    const statePath = join(gsdRoot(basePath), "STATE.md");
     if (!existsSync(statePath)) return null;
     const content = readFileSync(statePath, "utf-8");
     const match = /\*\*Active Milestone:\*\*\s*(\S+)/i.exec(content);
@@ -379,7 +373,7 @@ function formatRecoveryPrompt(
     sections.push("", "### Commands Already Run");
     for (const c of significantCommands.slice(-10)) {
       const status = c.failed ? " ❌" : " ✓";
-      sections.push(`- \`${truncate(c.command, 120)}\`${status}`);
+      sections.push(`- \`${truncateWithEllipsis(c.command, 121)}\`${status}`);
     }
   }
 
@@ -387,7 +381,7 @@ function formatRecoveryPrompt(
   if (trace.errors.length > 0) {
     sections.push(
       "", "### Errors Before Interruption",
-      ...trace.errors.slice(-3).map(e => `- ${truncate(e, 200)}`),
+      ...trace.errors.slice(-3).map(e => `- ${truncateWithEllipsis(e, 201)}`),
     );
   }
 
@@ -453,7 +447,7 @@ function compressToolCallTrace(calls: ToolCall[]): string {
     if (call.name === "write" || call.name === "edit") {
       lines.push(`${num}. ${call.name} \`${call.input.path || "?"}\`${err}`);
     } else if (call.name === "bash" || call.name === "bg_shell") {
-      const cmd = truncate(String(call.input.command || ""), 80);
+      const cmd = truncateWithEllipsis(String(call.input.command || ""), 81);
       lines.push(`${num}. ${call.name}: \`${cmd}\`${err}`);
     } else {
       lines.push(`${num}. ${call.name}${err}`);
@@ -472,15 +466,19 @@ function formatTraceSummary(trace: ExecutionTrace): string {
     parts.push(`Files written: ${trace.filesWritten.map(f => `\`${f}\``).join(", ")}`);
   }
   if (trace.commandsRun.length > 0) {
-    const cmds = trace.commandsRun.slice(-5).map(c => `\`${truncate(c.command, 80)}\`${c.failed ? " ❌" : ""}`);
+    const cmds = trace.commandsRun.slice(-5).map(c => `\`${truncateWithEllipsis(c.command, 81)}\`${c.failed ? " ❌" : ""}`);
     parts.push(`Commands run: ${cmds.join(", ")}`);
   }
   if (trace.errors.length > 0) {
     parts.push(`Errors: ${trace.errors.slice(-3).join("; ")}`);
   }
-  if (trace.lastReasoning) {
-    parts.push(`Last reasoning: "${trace.lastReasoning}"`);
-  }
+  // NOTE: lastReasoning is intentionally excluded from the retry diagnostic.
+  // This summary is injected into retry prompts via getDeepDiagnostic() →
+  // phases.ts. Including prior assistant free-text causes hallucination loops
+  // when the previous turn was truncated or malformed. Crash recovery has its
+  // own path (formatCrashRecoveryBriefing) that handles lastReasoning safely
+  // with explicit "Last Agent Reasoning Before Interruption" framing.
+  // See: https://github.com/gsd-build/gsd-2/issues/2195
   return parts.join("\n");
 }
 
@@ -530,7 +528,7 @@ function redactInput(name: string, input: Record<string, unknown>): Record<strin
   const safe: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(input)) {
     if (key === "content" || key === "oldText" || key === "newText") {
-      safe[key] = typeof value === "string" ? truncate(value, 100) : "[redacted]";
+      safe[key] = typeof value === "string" ? truncateWithEllipsis(value, 101) : "[redacted]";
     } else {
       safe[key] = value;
     }
@@ -546,6 +544,3 @@ function findLast<T>(arr: T[], predicate: (item: T) => boolean): T | undefined {
   return undefined;
 }
 
-function truncate(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max) + "…" : s;
-}

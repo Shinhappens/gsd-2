@@ -52,20 +52,18 @@ function makeTmpAuth(data: Record<string, unknown> = {}): { authPath: string; cl
 // 1. resolveSearchProvider — 8 scenarios
 // ═══════════════════════════════════════════════════════════════════════════
 
-test('resolveSearchProvider returns tavily when only TAVILY_API_KEY is set', async () => {
+test('resolveSearchProvider returns tavily when only TAVILY_API_KEY is set', async (t) => {
   const { resolveSearchProvider } = await import(
     '../resources/extensions/search-the-web/provider.ts'
   )
   const { authPath, cleanup } = makeTmpAuth()
-  try {
-    withEnv({ TAVILY_API_KEY: 'tvly-test', BRAVE_API_KEY: undefined }, () => {
-      // Override preference read to use our temp auth (auto)
-      const result = resolveSearchProvider('auto')
-      assert.equal(result, 'tavily')
-    })
-  } finally {
-    cleanup()
-  }
+  t.after(() => { cleanup() });
+
+  withEnv({ TAVILY_API_KEY: 'tvly-test', BRAVE_API_KEY: undefined }, () => {
+    // Override preference read to use our temp auth (auto)
+    const result = resolveSearchProvider('auto')
+    assert.equal(result, 'tavily')
+  })
 })
 
 test('resolveSearchProvider returns brave when only BRAVE_API_KEY is set', async () => {
@@ -148,69 +146,61 @@ test('resolveSearchProvider falls back to other provider when preferred key miss
 // 2. Preference get/set round-trip
 // ═══════════════════════════════════════════════════════════════════════════
 
-test('getSearchProviderPreference returns auto when no preference stored', async () => {
+test('getSearchProviderPreference returns auto when no preference stored', async (t) => {
   const { getSearchProviderPreference } = await import(
     '../resources/extensions/search-the-web/provider.ts'
   )
   const { authPath, cleanup } = makeTmpAuth()
-  try {
-    const pref = getSearchProviderPreference(authPath)
-    assert.equal(pref, 'auto')
-  } finally {
-    cleanup()
-  }
+  t.after(() => { cleanup() });
+
+  const pref = getSearchProviderPreference(authPath)
+  assert.equal(pref, 'auto')
 })
 
-test('getSearchProviderPreference reads from auth.json via AuthStorage', async () => {
+test('getSearchProviderPreference reads from auth.json via AuthStorage', async (t) => {
   const { getSearchProviderPreference } = await import(
     '../resources/extensions/search-the-web/provider.ts'
   )
   const { authPath, cleanup } = makeTmpAuth({
     search_provider: { type: 'api_key', key: 'tavily' },
   })
-  try {
-    const pref = getSearchProviderPreference(authPath)
-    assert.equal(pref, 'tavily')
-  } finally {
-    cleanup()
-  }
+  t.after(() => { cleanup() });
+
+  const pref = getSearchProviderPreference(authPath)
+  assert.equal(pref, 'tavily')
 })
 
-test('setSearchProviderPreference writes to auth.json via AuthStorage', async () => {
+test('setSearchProviderPreference writes to auth.json via AuthStorage', async (t) => {
   const { getSearchProviderPreference, setSearchProviderPreference } = await import(
     '../resources/extensions/search-the-web/provider.ts'
   )
   const { authPath, cleanup } = makeTmpAuth()
-  try {
-    setSearchProviderPreference('brave', authPath)
-    const pref = getSearchProviderPreference(authPath)
-    assert.equal(pref, 'brave')
+  t.after(() => { cleanup() });
 
-    // Round-trip: change to tavily
-    setSearchProviderPreference('tavily', authPath)
-    assert.equal(getSearchProviderPreference(authPath), 'tavily')
+  setSearchProviderPreference('brave', authPath)
+  const pref = getSearchProviderPreference(authPath)
+  assert.equal(pref, 'brave')
 
-    // Round-trip: change to auto
-    setSearchProviderPreference('auto', authPath)
-    assert.equal(getSearchProviderPreference(authPath), 'auto')
-  } finally {
-    cleanup()
-  }
+  // Round-trip: change to tavily
+  setSearchProviderPreference('tavily', authPath)
+  assert.equal(getSearchProviderPreference(authPath), 'tavily')
+
+  // Round-trip: change to auto
+  setSearchProviderPreference('auto', authPath)
+  assert.equal(getSearchProviderPreference(authPath), 'auto')
 })
 
-test('getSearchProviderPreference returns auto for invalid stored value', async () => {
+test('getSearchProviderPreference returns auto for invalid stored value', async (t) => {
   const { getSearchProviderPreference } = await import(
     '../resources/extensions/search-the-web/provider.ts'
   )
   const { authPath, cleanup } = makeTmpAuth({
     search_provider: { type: 'api_key', key: 'google' },
   })
-  try {
-    const pref = getSearchProviderPreference(authPath)
-    assert.equal(pref, 'auto', 'invalid stored value falls back to auto')
-  } finally {
-    cleanup()
-  }
+  t.after(() => { cleanup() });
+
+  const pref = getSearchProviderPreference(authPath)
+  assert.equal(pref, 'auto', 'invalid stored value falls back to auto')
 })
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -245,7 +235,7 @@ test('getBraveApiKey reads from process.env.BRAVE_API_KEY', async () => {
 // 4. Boundary contract — S01→S02 public API surface
 // ═══════════════════════════════════════════════════════════════════════════
 
-test('provider.ts exports exactly the 6 expected functions', async () => {
+test('provider.ts exports exactly the 7 expected functions', async () => {
   const provider = await import(
     '../resources/extensions/search-the-web/provider.ts'
   )
@@ -254,6 +244,7 @@ test('provider.ts exports exactly the 6 expected functions', async () => {
     'resolveSearchProvider',
     'getTavilyApiKey',
     'getBraveApiKey',
+    'braveHeaders',
     'getOllamaApiKey',
     'getSearchProviderPreference',
     'setSearchProviderPreference',
@@ -271,6 +262,6 @@ test('provider.ts exports exactly the 6 expected functions', async () => {
   assert.deepEqual(
     actualFunctions.sort(),
     [...expectedExports].sort(),
-    'provider.ts should export exactly the 6 expected functions (no extra function exports)',
+    'provider.ts should export exactly the 7 expected functions (no extra function exports)',
   )
 })

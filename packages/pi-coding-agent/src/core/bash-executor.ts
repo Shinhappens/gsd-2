@@ -7,10 +7,28 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { createWriteStream, type WriteStream } from "node:fs";
+import { createWriteStream, unlinkSync, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ChildProcess, spawn } from "child_process";
+
+/** Track temp files created by bash execution for cleanup on exit. */
+const bashTempFiles = new Set<string>();
+
+let cleanupRegistered = false;
+function registerTempCleanup(): void {
+	if (cleanupRegistered) return;
+	cleanupRegistered = true;
+	process.on("exit", () => {
+		for (const file of bashTempFiles) {
+			try {
+				unlinkSync(file);
+			} catch {
+				// Best-effort cleanup
+			}
+		}
+	});
+}
 import { processStreamChunk, type StreamState } from "@gsd/native";
 import { getShellConfig, getShellEnv, killProcessTree, sanitizeCommand } from "../utils/shell.js";
 import type { BashOperations } from "./tools/bash.js";
@@ -58,11 +76,23 @@ export interface BashResult {
  * @param options - Optional streaming callback and abort signal
  * @returns Promise resolving to execution result
  */
-export function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
+export function executeBash(command: string, options?: BashExecutorOptions & { loginShell?: boolean }): Promise<BashResult> {
 	return new Promise((resolve, reject) => {
-		const { shell, args } = getShellConfig();
+		let shell: string;
+		let args: string[];
+		if (options?.loginShell) {
+			// Use the user's login shell with -l for PATH/env from shell profiles
+			shell = process.env.SHELL || "/bin/bash";
+			args = ["-l", "-c"];
+		} else {
+			({ shell, args } = getShellConfig());
+		}
+		// On Windows, detached: true sets CREATE_NEW_PROCESS_GROUP which can
+		// cause EINVAL in VSCode/ConPTY terminal contexts.  The bg-shell
+		// extension already guards this (process-manager.ts); align here.
+		// Process-tree cleanup uses taskkill /F /T on Windows regardless.
 		const child: ChildProcess = spawn(shell, [...args, sanitizeCommand(command)], {
-			detached: true,
+			detached: process.platform !== "win32",
 			env: getShellEnv(),
 			stdio: ["ignore", "pipe", "pipe"],
 		});
@@ -111,8 +141,10 @@ export function executeBash(command: string, options?: BashExecutorOptions): Pro
 
 			// Start writing to temp file if exceeds threshold
 			if (totalBytes > DEFAULT_MAX_BYTES && !tempFilePath) {
+				registerTempCleanup();
 				const id = randomBytes(8).toString("hex");
 				tempFilePath = join(tmpdir(), `pi-bash-${id}.log`);
+				bashTempFiles.add(tempFilePath);
 				tempFileStream = createWriteStream(tempFilePath);
 				// Write already-buffered chunks to temp file
 				for (const chunk of outputChunks) {
@@ -212,8 +244,10 @@ export async function executeBashWithOperations(
 
 		// Start writing to temp file if exceeds threshold
 		if (totalBytes > DEFAULT_MAX_BYTES && !tempFilePath) {
+			registerTempCleanup();
 			const id = randomBytes(8).toString("hex");
 			tempFilePath = join(tmpdir(), `pi-bash-${id}.log`);
+			bashTempFiles.add(tempFilePath);
 			tempFileStream = createWriteStream(tempFilePath);
 			for (const chunk of outputChunks) {
 				tempFileStream.write(chunk);

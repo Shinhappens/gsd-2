@@ -24,10 +24,24 @@ const clients = new Map<string, LspClient>();
 const clientLocks = new Map<string, Promise<LspClient>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
 
+/** Track stream listeners per client so they can be removed on shutdown. */
+interface StreamHandlers {
+	stdoutData?: (chunk: Buffer) => void;
+	stdoutEnd?: () => void;
+	stdoutError?: () => void;
+	stderrData?: (chunk: Buffer) => void;
+	stderrEnd?: () => void;
+	stderrError?: () => void;
+}
+const clientStreamHandlers = new Map<string, StreamHandlers>();
+
 // Idle timeout configuration (disabled by default)
 let idleTimeoutMs: number | null = null;
 let idleCheckInterval: ReturnType<typeof setInterval> | null = null;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
+
+/** Maximum allowed size for the message buffer (10 MB). */
+const MAX_MESSAGE_BUFFER_SIZE = 10 * 1024 * 1024;
 
 /**
  * Configure the idle timeout for LSP clients.
@@ -51,6 +65,10 @@ function startIdleChecker(): void {
 			if (now - client.lastActivity > idleTimeoutMs) {
 				shutdownClient(key);
 			}
+		}
+		// Stop the checker if there are no more clients to monitor
+		if (clients.size === 0) {
+			stopIdleChecker();
 		}
 	}, IDLE_CHECK_INTERVAL_MS);
 }
@@ -197,8 +215,12 @@ function parseMessage(
 	let message: LspJsonRpcResponse | LspJsonRpcNotification;
 	try {
 		message = JSON.parse(messageText);
-	} catch {
-		// Malformed JSON from LSP server — skip this message and advance past it
+	} catch (err) {
+		// Malformed JSON from LSP server — log and skip this message
+		if (process.env.DEBUG) {
+			const preview = messageText.length > 200 ? messageText.slice(0, 200) + "..." : messageText;
+			console.error(`[lsp] Dropped malformed JSON message: ${err instanceof Error ? err.message : err} — ${preview}`);
+		}
 		return { message: null, remaining };
 	}
 
@@ -246,8 +268,21 @@ async function startMessageReader(client: LspClient): Promise<void> {
 	}
 
 	return new Promise<void>((resolve) => {
-		stdout.on("data", async (chunk: Buffer) => {
+		const handlers = clientStreamHandlers.get(client.name) ?? {};
+
+		handlers.stdoutData = async (chunk: Buffer) => {
 			const currentBuffer: Buffer = Buffer.concat([client.messageBuffer, chunk]);
+
+			if (currentBuffer.length > MAX_MESSAGE_BUFFER_SIZE) {
+				if (process.env.DEBUG) {
+					console.error(
+						`[lsp] Message buffer exceeded ${MAX_MESSAGE_BUFFER_SIZE} bytes (${currentBuffer.length}), discarding`,
+					);
+				}
+				client.messageBuffer = Buffer.alloc(0);
+				return;
+			}
+
 			client.messageBuffer = currentBuffer;
 
 			let workingBuffer = currentBuffer;
@@ -285,17 +320,22 @@ async function startMessageReader(client: LspClient): Promise<void> {
 			}
 
 			client.messageBuffer = workingBuffer;
-		});
+		};
+		stdout.on("data", handlers.stdoutData);
 
-		stdout.on("end", () => {
+		handlers.stdoutEnd = () => {
 			client.isReading = false;
 			resolve();
-		});
+		};
+		stdout.on("end", handlers.stdoutEnd);
 
-		stdout.on("error", () => {
+		handlers.stdoutError = () => {
 			client.isReading = false;
 			resolve();
-		});
+		};
+		stdout.on("error", handlers.stdoutError);
+
+		clientStreamHandlers.set(client.name, handlers);
 	});
 }
 
@@ -380,21 +420,28 @@ async function startStderrReader(client: LspClient): Promise<void> {
 	if (!stderr) return;
 
 	return new Promise<void>((resolve) => {
-		stderr.on("data", (chunk: Buffer) => {
+		const handlers = clientStreamHandlers.get(client.name) ?? {};
+
+		handlers.stderrData = (chunk: Buffer) => {
 			const text = chunk.toString("utf-8");
 			client.stderrBuffer += text;
 			if (client.stderrBuffer.length > 4096) {
 				client.stderrBuffer = client.stderrBuffer.slice(-4096);
 			}
-		});
+		};
+		stderr.on("data", handlers.stderrData);
 
-		stderr.on("end", () => {
+		handlers.stderrEnd = () => {
 			resolve();
-		});
+		};
+		stderr.on("end", handlers.stderrEnd);
 
-		stderr.on("error", () => {
+		handlers.stderrError = () => {
 			resolve();
-		});
+		};
+		stderr.on("error", handlers.stderrError);
+
+		clientStreamHandlers.set(client.name, handlers);
 	});
 }
 
@@ -409,6 +456,22 @@ export const WARMUP_TIMEOUT_MS = 5000;
  * Get or create an LSP client for the given server configuration and working directory.
  */
 export async function getOrCreateClient(config: ServerConfig, cwd: string, initTimeoutMs?: number): Promise<LspClient> {
+	const maxRetries = 2;
+	let lastErr: unknown;
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		try {
+			return await getOrCreateClientOnce(config, cwd, initTimeoutMs);
+		} catch (err) {
+			lastErr = err;
+			if (attempt < maxRetries) {
+				await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+			}
+		}
+	}
+	throw lastErr;
+}
+
+async function getOrCreateClientOnce(config: ServerConfig, cwd: string, initTimeoutMs?: number): Promise<LspClient> {
 	const key = `${config.command}:${cwd}`;
 
 	const existingClient = clients.get(key);
@@ -435,6 +498,17 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],
 			env: env ? { ...process.env, ...env } : undefined,
+			// On Windows, executables like npx/tsc are .cmd scripts that need
+			// shell resolution. Without this, spawn fails with ENOENT (#1222).
+			shell: process.platform === "win32",
+		});
+
+		// Handle spawn failure (e.g., ENOENT when the command doesn't exist).
+		// Without this, the error bubbles up and can crash auto-mode (#901).
+		proc.on("error", (err: NodeJS.ErrnoException) => {
+			if (err.code === "ENOENT") {
+				proc.emit("exit", 1);
+			}
 		});
 
 		const exitedPromise = new Promise<number>((resolve) => {
@@ -587,76 +661,6 @@ export async function ensureFileOpen(client: LspClient, filePath: string, signal
 	}
 }
 
-/**
- * Sync in-memory content to the LSP client without reading from disk.
- */
-export async function syncContent(
-	client: LspClient,
-	filePath: string,
-	content: string,
-	signal?: AbortSignal,
-): Promise<void> {
-	const uri = fileToUri(filePath);
-	const lockKey = `${client.name}:${uri}`;
-	throwIfAborted(signal);
-
-	const existingLock = fileOperationLocks.get(lockKey);
-	if (existingLock) {
-		await untilAborted(signal, () => existingLock);
-	}
-
-	const syncPromise = (async () => {
-		client.diagnostics.delete(uri);
-
-		const info = client.openFiles.get(uri);
-
-		if (!info) {
-			const languageId = detectLanguageId(filePath);
-			throwIfAborted(signal);
-			await sendNotification(client, "textDocument/didOpen", {
-				textDocument: {
-					uri,
-					languageId,
-					version: 1,
-					text: content,
-				},
-			});
-			client.openFiles.set(uri, { version: 1, languageId });
-			client.lastActivity = Date.now();
-			return;
-		}
-
-		const version = ++info.version;
-		throwIfAborted(signal);
-		await sendNotification(client, "textDocument/didChange", {
-			textDocument: { uri, version },
-			contentChanges: [{ text: content }],
-		});
-		client.lastActivity = Date.now();
-	})();
-
-	fileOperationLocks.set(lockKey, syncPromise);
-	try {
-		await syncPromise;
-	} finally {
-		fileOperationLocks.delete(lockKey);
-	}
-}
-
-/**
- * Notify LSP that a file was saved.
- */
-export async function notifySaved(client: LspClient, filePath: string, signal?: AbortSignal): Promise<void> {
-	const uri = fileToUri(filePath);
-	const info = client.openFiles.get(uri);
-	if (!info) return;
-
-	throwIfAborted(signal);
-	await sendNotification(client, "textDocument/didSave", {
-		textDocument: { uri },
-	});
-	client.lastActivity = Date.now();
-}
 
 /**
  * Refresh a file in the LSP client.
@@ -728,9 +732,26 @@ export function notifyFileChanged(filePath: string): void {
 }
 
 /**
+ * Remove stdout/stderr stream listeners for a client to prevent leaks.
+ */
+function removeStreamHandlers(client: LspClient): void {
+	const handlers = clientStreamHandlers.get(client.name);
+	if (!handlers) return;
+
+	if (handlers.stdoutData) client.proc.stdout?.removeListener("data", handlers.stdoutData);
+	if (handlers.stdoutEnd) client.proc.stdout?.removeListener("end", handlers.stdoutEnd);
+	if (handlers.stdoutError) client.proc.stdout?.removeListener("error", handlers.stdoutError);
+	if (handlers.stderrData) client.proc.stderr?.removeListener("data", handlers.stderrData);
+	if (handlers.stderrEnd) client.proc.stderr?.removeListener("end", handlers.stderrEnd);
+	if (handlers.stderrError) client.proc.stderr?.removeListener("error", handlers.stderrError);
+
+	clientStreamHandlers.delete(client.name);
+}
+
+/**
  * Shutdown a specific client by key.
  */
-export function shutdownClient(key: string): void {
+function shutdownClient(key: string): void {
 	const client = clients.get(key);
 	if (!client) return;
 
@@ -741,12 +762,23 @@ export function shutdownClient(key: string): void {
 
 	sendRequest(client, "shutdown", null).catch(() => {});
 
+	// Remove stream listeners before killing the process
+	removeStreamHandlers(client);
+
 	try {
 		killProcessTree(client.proc.pid);
 	} catch {
 		client.proc.kill();
 	}
 	clients.delete(key);
+	clientLocks.delete(key);
+
+	// Clean up any file operation locks associated with this client
+	for (const lockKey of Array.from(fileOperationLocks.keys())) {
+		if (lockKey.startsWith(`${key}:`)) {
+			fileOperationLocks.delete(lockKey);
+		}
+	}
 }
 
 // =============================================================================
@@ -834,7 +866,7 @@ export async function sendRequest(
 	return promise;
 }
 
-export async function sendNotification(client: LspClient, method: string, params: unknown): Promise<void> {
+async function sendNotification(client: LspClient, method: string, params: unknown): Promise<void> {
 	const notification: LspJsonRpcNotification = {
 		jsonrpc: "2.0",
 		method,
@@ -842,15 +874,28 @@ export async function sendNotification(client: LspClient, method: string, params
 	};
 
 	client.lastActivity = Date.now();
-	await writeMessage(client.proc.stdin, notification);
+	try {
+		await writeMessage(client.proc.stdin, notification);
+	} catch (err: unknown) {
+		// EPIPE means the LSP process died (e.g. after lsp.reload killed it).
+		// Swallow so callers don't crash — the next getOrCreateClient call
+		// will spawn a fresh server (#815).
+		if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'EPIPE') {
+			return;
+		}
+		throw err;
+	}
 }
 
 /**
  * Shutdown all LSP clients.
  */
-export function shutdownAll(): void {
+function shutdownAll(): void {
 	const clientsToShutdown = Array.from(clients.values());
 	clients.clear();
+	clientLocks.clear();
+	fileOperationLocks.clear();
+	stopIdleChecker();
 
 	const err = new Error("LSP client shutdown");
 	for (const client of clientsToShutdown) {
@@ -859,6 +904,9 @@ export function shutdownAll(): void {
 		for (const pending of reqs) {
 			pending.reject(err);
 		}
+
+		// Remove stream listeners before killing the process
+		removeStreamHandlers(client);
 
 		void (async () => {
 			const timeout = new Promise<void>(resolve => setTimeout(resolve, 5_000));
@@ -893,14 +941,28 @@ export function getActiveClients(): LspServerStatus[] {
 // Process Cleanup
 // =============================================================================
 
+const _beforeExitHandler = () => shutdownAll();
+const _sigintHandler = () => {
+	shutdownAll();
+	process.exit(0);
+};
+const _sigtermHandler = () => {
+	shutdownAll();
+	process.exit(0);
+};
+
 if (typeof process !== "undefined") {
-	process.on("beforeExit", shutdownAll);
-	process.on("SIGINT", () => {
-		shutdownAll();
-		process.exit(0);
-	});
-	process.on("SIGTERM", () => {
-		shutdownAll();
-		process.exit(0);
-	});
+	process.on("beforeExit", _beforeExitHandler);
+	process.on("SIGINT", _sigintHandler);
+	process.on("SIGTERM", _sigtermHandler);
+}
+
+/**
+ * Remove process-level signal handlers registered at module load.
+ * Call this during graceful teardown to prevent leaked listeners.
+ */
+export function removeProcessHandlers(): void {
+	process.off("beforeExit", _beforeExitHandler);
+	process.off("SIGINT", _sigintHandler);
+	process.off("SIGTERM", _sigtermHandler);
 }

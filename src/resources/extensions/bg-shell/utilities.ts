@@ -34,36 +34,59 @@ export function restoreWindowsVTInput(): void {
 
 // ── Time Formatting ────────────────────────────────────────────────────────
 
-export function formatUptime(ms: number): string {
-	const seconds = Math.floor(ms / 1000);
-	if (seconds < 60) return `${seconds}s`;
-	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
-	const hours = Math.floor(minutes / 60);
-	return `${hours}h ${minutes % 60}m`;
-}
+import { formatDuration } from "../shared/mod.js";
+
+export const formatUptime = formatDuration;
 
 export function formatTimeAgo(timestamp: number): string {
-	return formatUptime(Date.now() - timestamp) + " ago";
+	return formatDuration(Date.now() - timestamp) + " ago";
 }
 
-export function formatTokenCount(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
-	return `${Math.round(count / 1000000)}M`;
+function deriveProjectRootFromAutoWorktree(cachedCwd?: string): string | undefined {
+	if (!cachedCwd) return undefined;
+	const match = cachedCwd.match(/^(.*?)[\\/]\.gsd[\\/]worktrees[\\/][^\\/]+(?:[\\/].*)?$/);
+	return match?.[1];
+}
+
+export function getBgShellLiveCwd(
+	cachedCwd?: string,
+	pathExists: (path: string) => boolean = existsSync,
+	getCwd: () => string = () => process.cwd(),
+	chdir: (path: string) => void = (path) => process.chdir(path),
+): string {
+	try {
+		return getCwd();
+	} catch {
+		const projectRoot = deriveProjectRootFromAutoWorktree(cachedCwd);
+		const home = process.env.HOME || process.env.USERPROFILE;
+		const fallbacks = [projectRoot, cachedCwd, home, "/"].filter(
+			(candidate): candidate is string => Boolean(candidate),
+		);
+
+		for (const candidate of fallbacks) {
+			if (candidate !== "/" && !pathExists(candidate)) continue;
+			try {
+				chdir(candidate);
+			} catch {
+				// Best-effort only. Returning a known-good fallback is enough to avoid crashes.
+			}
+			return candidate;
+		}
+
+		return "/";
+	}
 }
 
 export function resolveBgShellPersistenceCwd(
 	cachedCwd: string,
-	liveCwd = process.cwd(),
+	liveCwd: string | undefined = undefined,
 	pathExists: (path: string) => boolean = existsSync,
 ): string {
+	const resolvedLiveCwd = liveCwd ?? getBgShellLiveCwd(cachedCwd, pathExists);
 	const cachedIsAutoWorktree = /(?:^|[\\/])\.gsd[\\/]worktrees[\\/]/.test(cachedCwd);
 	if (!cachedIsAutoWorktree) return cachedCwd;
-	if (cachedCwd === liveCwd && pathExists(cachedCwd)) return cachedCwd;
-	if (!pathExists(cachedCwd)) return liveCwd;
-	if (liveCwd !== cachedCwd) return liveCwd;
+	if (cachedCwd === resolvedLiveCwd && pathExists(cachedCwd)) return cachedCwd;
+	if (!pathExists(cachedCwd)) return resolvedLiveCwd;
+	if (resolvedLiveCwd !== cachedCwd) return resolvedLiveCwd;
 	return cachedCwd;
 }

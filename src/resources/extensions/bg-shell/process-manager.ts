@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { getShellConfig, sanitizeCommand } from "@gsd/pi-coding-agent";
+import { rewriteCommandWithRtk } from "../shared/rtk.js";
 import type {
 	BgProcess,
 	BgProcessInfo,
@@ -31,6 +32,8 @@ export const processes = new Map<string, BgProcess>();
 
 /** Pending alerts to inject into the next agent context */
 export let pendingAlerts: string[] = [];
+
+const MAX_PENDING_ALERTS = 50;
 
 /** Replace the pendingAlerts array (used by the extension entry point) */
 export function setPendingAlerts(alerts: string[]): void {
@@ -57,8 +60,12 @@ export function addEvent(bg: BgProcess, event: Omit<ProcessEvent, "timestamp">):
 	}
 }
 
-export function pushAlert(bg: BgProcess, message: string): void {
-	pendingAlerts.push(`[bg:${bg.id} ${bg.label}] ${message}`);
+export function pushAlert(bg: BgProcess | null, message: string): void {
+	const prefix = bg ? `[bg:${bg.id} ${bg.label}] ` : "";
+	pendingAlerts.push(`${prefix}${message}`);
+	if (pendingAlerts.length > MAX_PENDING_ALERTS) {
+		pendingAlerts.splice(0, pendingAlerts.length - MAX_PENDING_ALERTS);
+	}
 }
 
 export function getInfo(p: BgProcess): BgProcessInfo {
@@ -67,6 +74,8 @@ export function getInfo(p: BgProcess): BgProcessInfo {
 		label: p.label,
 		command: p.command,
 		cwd: p.cwd,
+		ownerSessionFile: p.ownerSessionFile,
+		persistAcrossSessions: p.persistAcrossSessions,
 		startedAt: p.startedAt,
 		alive: p.alive,
 		exitCode: p.exitCode,
@@ -125,7 +134,9 @@ export function startProcess(opts: StartOptions): BgProcess {
 
 	const { shell, args: shellArgs } = getShellConfig();
 	// Shell sessions default to the user's shell if no command specified
-	const command = processType === "shell" && !opts.command ? shell : opts.command;
+	const command = processType === "shell" && !opts.command
+		? shell
+		: rewriteCommandWithRtk(opts.command);
 	const proc = spawn(shell, [...shellArgs, sanitizeCommand(command)], {
 		cwd: opts.cwd,
 		stdio: ["pipe", "pipe", "pipe"],
@@ -138,6 +149,8 @@ export function startProcess(opts: StartOptions): BgProcess {
 		label: opts.label || command.slice(0, 60),
 		command,
 		cwd: opts.cwd,
+		ownerSessionFile: opts.ownerSessionFile ?? null,
+		persistAcrossSessions: opts.persistAcrossSessions ?? false,
 		startedAt: Date.now(),
 		proc,
 		output: [],
@@ -158,18 +171,16 @@ export function startProcess(opts: StartOptions): BgProcess {
 		group: opts.group || null,
 		lastErrorCount: 0,
 		lastWarningCount: 0,
-		commandHistory: [],
-		lineDedup: new Map(),
-		totalRawLines: 0,
 		stdoutLineCount: 0,
 		stderrLineCount: 0,
-		envKeys: Object.keys(opts.env || {}),
 		restartCount: 0,
 		startConfig: {
 			command,
 			cwd: opts.cwd,
 			label: opts.label || command.slice(0, 60),
 			processType,
+			ownerSessionFile: opts.ownerSessionFile ?? null,
+			persistAcrossSessions: opts.persistAcrossSessions ?? false,
 			readyPattern: opts.readyPattern || null,
 			readyPort: opts.readyPort || null,
 			group: opts.group || null,
@@ -312,6 +323,8 @@ export async function restartProcess(id: string): Promise<BgProcess | null> {
 		cwd: config.cwd,
 		label: config.label,
 		type: config.processType,
+		ownerSessionFile: config.ownerSessionFile,
+		persistAcrossSessions: config.persistAcrossSessions,
 		readyPattern: config.readyPattern || undefined,
 		readyPort: config.readyPort || undefined,
 		group: config.group || undefined,
@@ -367,6 +380,54 @@ export function cleanupAll(): void {
 	processes.clear();
 }
 
+/**
+ * Kill all alive, non-persistent bg processes.
+ * Called between auto-mode units to prevent orphaned servers from
+ * keeping ports bound across task boundaries (#1209).
+ */
+export function killSessionProcesses(): void {
+	for (const [id, bg] of processes) {
+		if (bg.alive && !bg.persistAcrossSessions) {
+			killProcess(id, "SIGTERM");
+		}
+	}
+}
+
+async function waitForProcessExit(bg: BgProcess, timeoutMs: number): Promise<boolean> {
+	if (!bg.alive) return true;
+	await new Promise<void>((resolve) => {
+		const done = () => resolve();
+		const timer = setTimeout(done, timeoutMs);
+		bg.proc.once("exit", () => {
+			clearTimeout(timer);
+			resolve();
+		});
+	});
+	return !bg.alive;
+}
+
+export async function cleanupSessionProcesses(
+	sessionFile: string,
+	options?: { graceMs?: number },
+): Promise<string[]> {
+	const graceMs = Math.max(0, options?.graceMs ?? 300);
+	const matches = Array.from(processes.values()).filter(
+		(bg) => bg.alive && !bg.persistAcrossSessions && bg.ownerSessionFile === sessionFile,
+	);
+	if (matches.length === 0) return [];
+
+	for (const bg of matches) {
+		killProcess(bg.id, "SIGTERM");
+	}
+	if (graceMs > 0) {
+		await Promise.all(matches.map((bg) => waitForProcessExit(bg, graceMs)));
+	}
+	for (const bg of matches) {
+		if (bg.alive) killProcess(bg.id, "SIGKILL");
+	}
+	return matches.map((bg) => bg.id);
+}
+
 // ── Persistence ────────────────────────────────────────────────────────────
 
 export function getManifestPath(cwd: string): string {
@@ -384,6 +445,8 @@ export function persistManifest(cwd: string): void {
 				label: p.label,
 				command: p.command,
 				cwd: p.cwd,
+				ownerSessionFile: p.ownerSessionFile,
+				persistAcrossSessions: p.persistAcrossSessions,
 				startedAt: p.startedAt,
 				processType: p.processType,
 				group: p.group,

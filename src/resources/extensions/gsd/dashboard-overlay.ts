@@ -9,31 +9,28 @@
 import type { Theme } from "@gsd/pi-coding-agent";
 import { truncateToWidth, visibleWidth, matchesKey, Key } from "@gsd/pi-tui";
 import { deriveState } from "./state.js";
-import { loadFile, parseRoadmap, parsePlan } from "./files.js";
+import { loadFile } from "./files.js";
+import { isDbAvailable, getMilestoneSlices, getSliceTasks } from "./gsd-db.js";
 import { resolveMilestoneFile, resolveSliceFile } from "./paths.js";
-import { getAutoDashboardData, type AutoDashboardData } from "./auto.js";
+import { getAutoDashboardData } from "./auto.js";
+import type { AutoDashboardData } from "./auto-dashboard.js";
 import {
   getLedger, getProjectTotals, aggregateByPhase, aggregateBySlice,
-  aggregateByModel, formatCost, formatTokenCount, formatCostProjection,
+  aggregateByModel, aggregateCacheHitRate, formatCost, formatTokenCount, formatCostProjection,
   type UnitMetrics,
 } from "./metrics.js";
 import { loadEffectiveGSDPreferences } from "./preferences.js";
 import { getActiveWorktreeName } from "./worktree-command.js";
 import { getWorkerBatches, hasActiveWorkers, type WorkerEntry } from "../subagent/worker-registry.js";
-
-function formatDuration(ms: number): string {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rs = s % 60;
-  if (m < 60) return `${m}m ${rs}s`;
-  const h = Math.floor(m / 60);
-  const rm = m % 60;
-  return `${h}h ${rm}m`;
-}
+import { formatDuration, padRight, joinColumns, centerLine, fitColumns, STATUS_GLYPH, STATUS_COLOR } from "../shared/mod.js";
+import { estimateTimeRemaining } from "./auto-dashboard.js";
+import { computeProgressScore, formatProgressLine } from "./progress-score.js";
+import { runEnvironmentChecks, type EnvironmentCheckResult } from "./doctor-environment.js";
 
 function unitLabel(type: string): string {
   switch (type) {
+    case "discuss-milestone":
+    case "discuss-slice": return "Discuss";
     case "research-milestone": return "Research";
     case "plan-milestone": return "Plan";
     case "research-slice": return "Research";
@@ -44,42 +41,11 @@ function unitLabel(type: string): string {
     case "triage-captures": return "Triage";
     case "quick-task": return "Quick Task";
     case "replan-slice": return "Replan";
+    case "custom-step": return "Workflow Step";
     default: return type;
   }
 }
 
-function centerLine(content: string, width: number): string {
-  const vis = visibleWidth(content);
-  if (vis >= width) return truncateToWidth(content, width);
-  const leftPad = Math.floor((width - vis) / 2);
-  return " ".repeat(leftPad) + content;
-}
-
-function padRight(content: string, width: number): string {
-  const vis = visibleWidth(content);
-  return content + " ".repeat(Math.max(0, width - vis));
-}
-
-function joinColumns(left: string, right: string, width: number): string {
-  const leftW = visibleWidth(left);
-  const rightW = visibleWidth(right);
-  if (leftW + rightW + 2 > width) {
-    return truncateToWidth(`${left}  ${right}`, width);
-  }
-  return left + " ".repeat(width - leftW - rightW) + right;
-}
-
-function fitColumns(parts: string[], width: number, separator = "  "): string {
-  const filtered = parts.filter(Boolean);
-  if (filtered.length === 0) return "";
-  let result = filtered[0];
-  for (let i = 1; i < filtered.length; i++) {
-    const candidate = `${result}${separator}${filtered[i]}`;
-    if (visibleWidth(candidate) > width) break;
-    result = candidate;
-  }
-  return truncateToWidth(result, width);
-}
 
 export class GSDDashboardOverlay {
   private tui: { requestRender: () => void };
@@ -95,6 +61,7 @@ export class GSDDashboardOverlay {
   private loadedDashboardIdentity?: string;
   private refreshInFlight: Promise<void> | null = null;
   private disposed = false;
+  private resizeHandler: (() => void) | null = null;
 
   constructor(
     tui: { requestRender: () => void },
@@ -105,6 +72,14 @@ export class GSDDashboardOverlay {
     this.theme = theme;
     this.onClose = onClose;
     this.dashData = getAutoDashboardData();
+
+    // Invalidate cache on terminal resize
+    this.resizeHandler = () => {
+      if (this.disposed) return;
+      this.invalidate();
+      this.tui.requestRender();
+    };
+    process.stdout.on("resize", this.resizeHandler);
 
     this.scheduleRefresh(true);
 
@@ -126,18 +101,11 @@ export class GSDDashboardOverlay {
     const currentUnit = dashData.currentUnit
       ? `${dashData.currentUnit.type}:${dashData.currentUnit.id}:${dashData.currentUnit.startedAt}`
       : "-";
-    const lastCompleted = dashData.completedUnits.length > 0
-      ? dashData.completedUnits[dashData.completedUnits.length - 1]
-      : null;
-    const completedKey = lastCompleted
-      ? `${dashData.completedUnits.length}:${lastCompleted.type}:${lastCompleted.id}:${lastCompleted.finishedAt}`
-      : "0";
     return [
       base,
       dashData.active ? "1" : "0",
       dashData.paused ? "1" : "0",
       currentUnit,
-      completedKey,
     ].join("|");
   }
 
@@ -187,9 +155,14 @@ export class GSDDashboardOverlay {
 
       const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
       const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
-      if (roadmapContent) {
-        const roadmap = parseRoadmap(roadmapContent);
-        for (const s of roadmap.slices) {
+      // Normalize slices from DB
+      type NormSlice = { id: string; done: boolean; title: string; risk: string };
+      let normSlices: NormSlice[] = [];
+      if (isDbAvailable()) {
+        normSlices = getMilestoneSlices(mid).map(s => ({ id: s.id, done: s.status === "complete", title: s.title, risk: s.risk || "medium" }));
+      }
+
+      for (const s of normSlices) {
           const sliceView: SliceView = {
             id: s.id,
             title: s.title,
@@ -200,19 +173,18 @@ export class GSDDashboardOverlay {
           };
 
           if (sliceView.active) {
-            const planFile = resolveSliceFile(base, mid, s.id, "PLAN");
-            const planContent = planFile ? await loadFile(planFile) : null;
-            if (planContent) {
-              const plan = parsePlan(planContent);
+            // Normalize tasks from DB
+            if (isDbAvailable()) {
+              const dbTasks = getSliceTasks(mid, s.id);
               sliceView.taskProgress = {
-                done: plan.tasks.filter(t => t.done).length,
-                total: plan.tasks.length,
+                done: dbTasks.filter(t => t.status === "complete" || t.status === "done").length,
+                total: dbTasks.length,
               };
-              for (const t of plan.tasks) {
+              for (const t of dbTasks) {
                 sliceView.tasks.push({
                   id: t.id,
                   title: t.title,
-                  done: t.done,
+                  done: t.status === "complete" || t.status === "done",
                   active: state.activeTask?.id === t.id,
                 });
               }
@@ -220,7 +192,6 @@ export class GSDDashboardOverlay {
           }
 
           view.slices.push(sliceView);
-        }
       }
 
       this.milestoneData = view;
@@ -233,7 +204,7 @@ export class GSDDashboardOverlay {
 
   handleInput(data: string): void {
     if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || matchesKey(data, Key.ctrlAlt("g"))) {
-      clearInterval(this.refreshTimer);
+      this.dispose();
       this.onClose();
       return;
     }
@@ -332,12 +303,38 @@ export class GSDDashboardOverlay {
     const worktreeTag = worktreeName
       ? `  ${th.fg("warning", `⎇ ${worktreeName}`)}`
       : "";
-    const elapsed = this.dashData.active || this.dashData.paused
-      ? th.fg("dim", formatDuration(this.dashData.elapsed))
-      : isRemote
-        ? th.fg("dim", `since ${this.dashData.remoteSession!.startedAt.replace("T", " ").slice(0, 19)}`)
+    let elapsedParts = "";
+    if (this.dashData.active || this.dashData.paused) {
+      // Guard: skip display when elapsed is zero or unreasonably large (>30 days)
+      const elapsed = this.dashData.elapsed;
+      elapsedParts = elapsed > 0 && elapsed < 30 * 24 * 3600_000
+        ? th.fg("dim", formatDuration(elapsed))
         : "";
-    lines.push(row(joinColumns(`${title}  ${status}${worktreeTag}`, elapsed, contentWidth)));
+      const eta = estimateTimeRemaining();
+      if (eta) elapsedParts += th.fg("dim", `  ·  ${eta}`);
+    } else if (isRemote) {
+      elapsedParts = th.fg("dim", `since ${this.dashData.remoteSession!.startedAt.replace("T", " ").slice(0, 19)}`);
+    }
+    lines.push(row(joinColumns(`${title}  ${status}${worktreeTag}`, elapsedParts, contentWidth)));
+
+    // Progress score — traffic light indicator (#1221)
+    if (this.dashData.active || this.dashData.paused) {
+      const progressScore = computeProgressScore();
+      const progressIcon = progressScore.level === "green" ? th.fg("success", "●")
+        : progressScore.level === "yellow" ? th.fg("warning", "●")
+          : th.fg("error", "●");
+      lines.push(row(`${progressIcon} ${th.fg("text", progressScore.summary)}`));
+
+      // Show signal details when degraded — real-time visibility into what doctor found
+      if (progressScore.level !== "green" && progressScore.signals.length > 0) {
+        for (const signal of progressScore.signals) {
+          const prefix = signal.kind === "positive" ? th.fg("success", "  ✓")
+            : signal.kind === "negative" ? th.fg("error", "  ✗")
+              : th.fg("dim", "  ·");
+          lines.push(row(`${prefix} ${th.fg("dim", signal.label)}`));
+        }
+      }
+    }
     lines.push(blank());
 
     if (this.dashData.currentUnit) {
@@ -435,69 +432,25 @@ export class GSDDashboardOverlay {
       lines.push(blank());
 
       for (const s of mv.slices) {
-        const icon = s.done ? th.fg("success", "✓")
-          : s.active ? th.fg("accent", "▸")
-          : th.fg("dim", "○");
-        const titleText = s.active ? th.fg("accent", `${s.id}: ${s.title}`)
-          : s.done ? th.fg("muted", `${s.id}: ${s.title}`)
-          : th.fg("dim", `${s.id}: ${s.title}`);
+        const sliceStatus = s.done ? "done" : s.active ? "active" : "pending";
+        const icon = th.fg(STATUS_COLOR[sliceStatus], STATUS_GLYPH[sliceStatus]);
+        const titleColor = s.active ? "accent" : s.done ? "muted" : "dim";
+        const titleText = th.fg(titleColor, `${s.id}: ${s.title}`);
         const risk = th.fg("dim", s.risk);
         lines.push(row(joinColumns(`  ${icon} ${titleText}`, risk, contentWidth)));
 
         if (s.active && s.tasks.length > 0) {
           for (const t of s.tasks) {
-            const tIcon = t.done ? th.fg("success", "✓")
-              : t.active ? th.fg("warning", "▸")
-              : th.fg("dim", "·");
-            const tTitle = t.active ? th.fg("warning", `${t.id}: ${t.title}`)
-              : t.done ? th.fg("muted", `${t.id}: ${t.title}`)
-              : th.fg("dim", `${t.id}: ${t.title}`);
+            const taskStatus = t.done ? "done" : t.active ? "active" : "pending";
+            const tIcon = th.fg(STATUS_COLOR[taskStatus], STATUS_GLYPH[taskStatus]);
+            const tColor = t.active ? "warning" : t.done ? "muted" : "dim";
+            const tTitle = th.fg(tColor, `${t.id}: ${t.title}`);
             lines.push(row(`      ${tIcon} ${truncateToWidth(tTitle, contentWidth - 6)}`));
           }
         }
       }
     } else {
       lines.push(centered(th.fg("dim", "No active milestone.")));
-    }
-
-    if (this.dashData.completedUnits.length > 0) {
-      lines.push(blank());
-      lines.push(hr());
-      lines.push(row(th.fg("text", th.bold("Completed"))));
-      lines.push(blank());
-
-      // Build ledger lookup for budget indicators (last entry wins for retries)
-      const ledgerLookup = new Map<string, UnitMetrics>();
-      const currentLedger = getLedger();
-      if (currentLedger) {
-        for (const lu of currentLedger.units) {
-          ledgerLookup.set(`${lu.type}:${lu.id}`, lu);
-        }
-      }
-
-      const recent = [...this.dashData.completedUnits].reverse().slice(0, 10);
-      for (const u of recent) {
-        const left = `  ${th.fg("success", "✓")} ${th.fg("muted", unitLabel(u.type))} ${th.fg("muted", u.id)}`;
-
-        // Budget indicators from ledger
-        const ledgerEntry = ledgerLookup.get(`${u.type}:${u.id}`);
-        let budgetMarkers = "";
-        if (ledgerEntry) {
-          if (ledgerEntry.truncationSections && ledgerEntry.truncationSections > 0) {
-            budgetMarkers += th.fg("warning", ` ▼${ledgerEntry.truncationSections}`);
-          }
-          if (ledgerEntry.continueHereFired === true) {
-            budgetMarkers += th.fg("error", " → wrap-up");
-          }
-        }
-
-        const right = th.fg("dim", formatDuration(u.finishedAt - u.startedAt));
-        lines.push(row(joinColumns(`${left}${budgetMarkers}`, right, contentWidth)));
-      }
-
-      if (this.dashData.completedUnits.length > 10) {
-        lines.push(row(th.fg("dim", `  ...and ${this.dashData.completedUnits.length - 10} more`)));
-      }
     }
 
     const ledger = getLedger();
@@ -509,8 +462,12 @@ export class GSDDashboardOverlay {
       lines.push(row(th.fg("text", th.bold("Cost & Usage"))));
       lines.push(blank());
 
+      // Show cost or request count (for copilot/subscription users where cost is 0)
+      const costOrReqs = totals.cost > 0
+        ? `${th.fg("warning", formatCost(totals.cost))} total`
+        : `${th.fg("text", String(totals.apiRequests))} requests`;
       lines.push(row(fitColumns([
-        `${th.fg("warning", formatCost(totals.cost))} total`,
+        costOrReqs,
         `${th.fg("text", formatTokenCount(totals.tokens.total))} tokens`,
         `${th.fg("text", String(totals.toolCalls))} tools`,
         `${th.fg("text", String(totals.units))} units`,
@@ -596,6 +553,36 @@ export class GSDDashboardOverlay {
 
       lines.push(blank());
       lines.push(row(`${th.fg("dim", "avg/unit:")} ${th.fg("text", formatCost(totals.cost / totals.units))}  ${th.fg("dim", "·")}  ${th.fg("text", formatTokenCount(Math.round(totals.tokens.total / totals.units)))} tokens`));
+
+      // Cache hit rate
+      const cacheRate = aggregateCacheHitRate();
+      if (cacheRate > 0) {
+        lines.push(row(`${th.fg("dim", "cache hit rate:")} ${th.fg("text", `${cacheRate}%`)}`));
+      }
+
+      if (this.dashData.rtkEnabled && this.dashData.rtkSavings && this.dashData.rtkSavings.commands > 0) {
+        const rtk = this.dashData.rtkSavings;
+        lines.push(row(
+          `${th.fg("dim", "rtk saved:")} ${th.fg("text", formatTokenCount(rtk.savedTokens))} ${th.fg("dim", `(${Math.round(rtk.savingsPct)}% · ${rtk.commands} cmd${rtk.commands === 1 ? "" : "s"})`)}`,
+        ));
+      }
+    }
+
+    // Environment health section (#1221) — only show issues
+    const envResults = runEnvironmentChecks(this.dashData.basePath || process.cwd());
+    const envIssues = envResults.filter(r => r.status !== "ok");
+    if (envIssues.length > 0) {
+      lines.push(blank());
+      lines.push(hr());
+      lines.push(row(th.fg("text", th.bold("Environment"))));
+      lines.push(blank());
+      for (const r of envIssues) {
+        const icon = r.status === "error" ? th.fg("error", "✗") : th.fg("warning", "⚠");
+        lines.push(row(`  ${icon} ${th.fg("text", r.message)}`));
+        if (r.detail) {
+          lines.push(row(th.fg("dim", `     ${r.detail}`)));
+        }
+      }
     }
 
     lines.push(blank());
@@ -634,6 +621,10 @@ export class GSDDashboardOverlay {
   dispose(): void {
     this.disposed = true;
     clearInterval(this.refreshTimer);
+    if (this.resizeHandler) {
+      process.stdout.removeListener("resize", this.resizeHandler);
+      this.resizeHandler = null;
+    }
   }
 }
 

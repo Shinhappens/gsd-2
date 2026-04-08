@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
 import { deriveState, isValidationTerminal } from "../state.ts";
-import { resolveExpectedArtifactPath, verifyExpectedArtifact, diagnoseExpectedArtifact, buildLoopRemediationSteps } from "../auto-recovery.ts";
+import { resolveExpectedArtifactPath, diagnoseExpectedArtifact } from "../auto-artifact-paths.ts";
+import { verifyExpectedArtifact, buildLoopRemediationSteps } from "../auto-recovery.ts";
 import { resolveDispatch, type DispatchContext } from "../auto-dispatch.ts";
 import type { GSDState } from "../types.ts";
 import { clearPathCache } from "../paths.ts";
@@ -97,9 +98,26 @@ test("isValidationTerminal returns true for verdict: needs-attention", () => {
   assert.equal(isValidationTerminal(content), true);
 });
 
-test("isValidationTerminal returns false for verdict: needs-remediation", () => {
+test("isValidationTerminal returns true for verdict: needs-remediation (#832)", () => {
+  // needs-remediation is treated as terminal to prevent infinite loops
+  // when no remediation slices exist in the roadmap.
   const content = "---\nverdict: needs-remediation\nremediation_round: 0\n---\n\n# Validation";
-  assert.equal(isValidationTerminal(content), false);
+  assert.equal(isValidationTerminal(content), true);
+});
+
+test("isValidationTerminal returns true for verdict: passed (#1429)", () => {
+  const content = "---\nverdict: passed\nremediation_round: 0\n---\n\n# Validation";
+  assert.equal(isValidationTerminal(content), true);
+});
+
+test("isValidationTerminal returns true for verdict: fail (#2769)", () => {
+  const content = "---\nverdict: fail\nremediation_round: 1\n---\n\n# Validation";
+  assert.equal(isValidationTerminal(content), true);
+});
+
+test("isValidationTerminal returns true for any arbitrary verdict string (#2769)", () => {
+  const content = "---\nverdict: custom-verdict\nremediation_round: 0\n---\n\n# Validation";
+  assert.equal(isValidationTerminal(content), true);
 });
 
 test("isValidationTerminal returns false for missing frontmatter", () => {
@@ -145,13 +163,14 @@ test("deriveState returns completing-milestone when VALIDATION exists with termi
   }
 });
 
-test("deriveState returns validating-milestone when VALIDATION exists with needs-remediation verdict", async () => {
+test("deriveState treats needs-remediation as non-terminal — re-enters validating-milestone (#832)", async () => {
   const base = makeTmpBase();
   try {
     writeRoadmap(base, "M001", ALL_DONE_ROADMAP);
     writeValidation(base, "M001", "---\nverdict: needs-remediation\nremediation_round: 0\n---\n\n# Validation\nNeeds fixes.");
 
     const state = await deriveState(base);
+    // needs-remediation routes back to validating-milestone for re-validation
     assert.equal(state.phase, "validating-milestone");
     assert.equal(state.activeMilestone?.id, "M001");
   } finally {
@@ -192,6 +211,7 @@ test("dispatch rule matches validating-milestone phase", async () => {
   try {
     // Set up minimal milestone structure for the prompt builder
     writeRoadmap(base, "M001", ALL_DONE_ROADMAP);
+    writeSliceSummary(base, "M001", "S01", "# S01 Summary\nDone."); // Guard requires slice summaries (#1368)
 
     const ctx: DispatchContext = {
       basePath: base,
@@ -227,6 +247,7 @@ test("dispatch rule skips when skip_milestone_validation preference is set", asy
   const base = makeTmpBase();
   try {
     writeRoadmap(base, "M001", ALL_DONE_ROADMAP);
+    writeSliceSummary(base, "M001", "S01", "# S01 Summary\nDone."); // Guard requires slice summaries (#1368)
 
     const ctx: DispatchContext = {
       basePath: base,
@@ -286,6 +307,61 @@ test("verifyExpectedArtifact fails when VALIDATION.md is missing", () => {
   }
 });
 
+test("verifyExpectedArtifact rejects VALIDATION with missing frontmatter", () => {
+  const base = makeTmpBase();
+  try {
+    // A VALIDATION file without frontmatter should be treated as incomplete —
+    // matching what deriveState expects. Without this, the artifact check passes
+    // but deriveState still returns validating-milestone, causing the hard skip loop.
+    writeValidation(base, "M001", "# Validation\nNo frontmatter here.");
+    clearPathCache();
+    clearParseCache();
+    const result = verifyExpectedArtifact("validate-milestone", "M001", base);
+    assert.equal(result, false, "VALIDATION without frontmatter should fail verification");
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("verifyExpectedArtifact rejects VALIDATION with missing verdict field", () => {
+  const base = makeTmpBase();
+  try {
+    writeValidation(base, "M001", "---\nremediation_round: 0\n---\n\n# Validation");
+    clearPathCache();
+    clearParseCache();
+    const result = verifyExpectedArtifact("validate-milestone", "M001", base);
+    assert.equal(result, false, "VALIDATION without verdict field should fail verification");
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("verifyExpectedArtifact accepts VALIDATION with any extracted verdict", () => {
+  const base = makeTmpBase();
+  try {
+    writeValidation(base, "M001", "---\nverdict: unknown-value\nremediation_round: 0\n---\n\n# Validation");
+    clearPathCache();
+    clearParseCache();
+    const result = verifyExpectedArtifact("validate-milestone", "M001", base);
+    assert.equal(result, true, "VALIDATION with any extracted verdict should pass verification");
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("verifyExpectedArtifact passes VALIDATION with needs-attention verdict", () => {
+  const base = makeTmpBase();
+  try {
+    writeValidation(base, "M001", "---\nverdict: needs-attention\nremediation_round: 0\n---\n\n# Validation\nNeeds attention.");
+    clearPathCache();
+    clearParseCache();
+    const result = verifyExpectedArtifact("validate-milestone", "M001", base);
+    assert.equal(result, true, "VALIDATION with needs-attention verdict should pass verification");
+  } finally {
+    cleanup(base);
+  }
+});
+
 // ─── diagnoseExpectedArtifact ─────────────────────────────────────────────
 
 test("diagnoseExpectedArtifact returns validation path for validate-milestone", () => {
@@ -309,7 +385,7 @@ test("buildLoopRemediationSteps returns steps for validate-milestone", () => {
     assert.ok(result);
     assert.ok(result!.includes("VALIDATION"));
     assert.ok(result!.includes("verdict: pass"));
-    assert.ok(result!.includes("gsd doctor"));
+    assert.ok(result!.includes("gsd recover"));
   } finally {
     cleanup(base);
   }

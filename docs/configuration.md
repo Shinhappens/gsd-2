@@ -1,14 +1,14 @@
 # Configuration
 
-GSD preferences live in `~/.gsd/preferences.md` (global) or `.gsd/preferences.md` (project-local). Manage interactively with `/gsd prefs`.
+GSD preferences live in `~/.gsd/PREFERENCES.md` (global) or `.gsd/PREFERENCES.md` (project-local). Manage interactively with `/gsd prefs`.
 
 ## `/gsd prefs` Commands
 
 | Command | Description |
 |---------|-------------|
 | `/gsd prefs` | Open the global preferences wizard (default) |
-| `/gsd prefs global` | Interactive wizard for global preferences (`~/.gsd/preferences.md`) |
-| `/gsd prefs project` | Interactive wizard for project preferences (`.gsd/preferences.md`) |
+| `/gsd prefs global` | Interactive wizard for global preferences (`~/.gsd/PREFERENCES.md`) |
+| `/gsd prefs project` | Interactive wizard for project preferences (`.gsd/PREFERENCES.md`) |
 | `/gsd prefs status` | Show current preference files, merged values, and skill resolution status |
 | `/gsd prefs wizard` | Alias for `/gsd prefs global` |
 | `/gsd prefs setup` | Alias for `/gsd prefs wizard` — creates preferences file if missing |
@@ -42,13 +42,125 @@ token_profile: balanced
 
 | Scope | Path | Applies to |
 |-------|------|-----------|
-| Global | `~/.gsd/preferences.md` | All projects |
-| Project | `.gsd/preferences.md` | Current project only |
+| Global | `~/.gsd/PREFERENCES.md` | All projects |
+| Project | `.gsd/PREFERENCES.md` | Current project only |
 
 **Merge behavior:**
 - **Scalar fields** (`skill_discovery`, `budget_ceiling`): project wins if defined
 - **Array fields** (`always_use_skills`, etc.): concatenated (global first, then project)
 - **Object fields** (`models`, `git`, `auto_supervisor`): shallow-merged, project overrides per-key
+
+## Global API Keys (`/gsd config`)
+
+Tool API keys are stored globally in `~/.gsd/agent/auth.json` and apply to all projects automatically. Set them once with `/gsd config` — no need to configure per-project `.env` files.
+
+```bash
+/gsd config
+```
+
+This opens an interactive wizard showing which keys are configured and which are missing. Select a tool to enter its key.
+
+### Supported keys
+
+| Tool | Environment Variable | Purpose | Get a key |
+|------|---------------------|---------|-----------|
+| Tavily Search | `TAVILY_API_KEY` | Web search for non-Anthropic models | [tavily.com/app/api-keys](https://tavily.com/app/api-keys) |
+| Brave Search | `BRAVE_API_KEY` | Web search for non-Anthropic models | [brave.com/search/api](https://brave.com/search/api) |
+| Context7 Docs | `CONTEXT7_API_KEY` | Library documentation lookup | [context7.com/dashboard](https://context7.com/dashboard) |
+
+### How it works
+
+1. `/gsd config` saves keys to `~/.gsd/agent/auth.json`
+2. On every session start, `loadToolApiKeys()` reads the file and sets environment variables
+3. Keys apply to all projects — no per-project setup required
+4. Environment variables (`export BRAVE_API_KEY=...`) take precedence over saved keys
+5. Anthropic models don't need Brave/Tavily — they have built-in web search
+
+## MCP Servers
+
+GSD can connect to external MCP servers configured in project files. This is useful for local tools, internal APIs, self-hosted services, or integrations that aren't built in as native GSD extensions.
+
+### Config file locations
+
+GSD reads MCP client configuration from these project-local paths:
+
+- `.mcp.json`
+- `.gsd/mcp.json`
+
+If both files exist, server names are merged and the first definition found wins. Use:
+
+- `.mcp.json` for repo-shared MCP configuration you may want to commit
+- `.gsd/mcp.json` for local-only MCP configuration you do **not** want to share
+
+### Supported transports
+
+| Transport | Config shape | Use when |
+|-----------|--------------|----------|
+| `stdio` | `command` + optional `args`, `env`, `cwd` | Launching a local MCP server process |
+| `http` | `url` | Connecting to an already-running MCP server over HTTP |
+
+### Example: stdio server
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "type": "stdio",
+      "command": "/absolute/path/to/python3",
+      "args": ["/absolute/path/to/server.py"],
+      "env": {
+        "API_URL": "http://localhost:8000"
+      }
+    }
+  }
+}
+```
+
+### Example: HTTP server
+
+```json
+{
+  "mcpServers": {
+    "my-http-server": {
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+### Verifying a server
+
+After adding config, verify it from a GSD session:
+
+```text
+mcp_servers
+mcp_discover(server="my-server")
+mcp_call(server="my-server", tool="<tool_name>", args={...})
+```
+
+Recommended verification order:
+
+1. `mcp_servers` — confirms GSD can see the config file and parse the server entry
+2. `mcp_discover` — confirms the server process starts and responds to `tools/list`
+3. `mcp_call` — confirms at least one real tool invocation works
+
+### Notes
+
+- Use absolute paths for local executables and scripts when possible.
+- For `stdio` servers, prefer setting required environment variables directly in the MCP config instead of relying on an interactive shell profile.
+- If a server is team-shared and safe to commit, `.mcp.json` is usually the better home.
+- If a server depends on machine-local paths, personal services, or local-only secrets, prefer `.gsd/mcp.json`.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GSD_HOME` | `~/.gsd` | Global GSD directory. All paths derive from this unless individually overridden. Affects preferences, skills, sessions, and per-project state. (v2.39) |
+| `GSD_PROJECT_ID` | (auto-hash) | Override the automatic project identity hash. Per-project state goes to `$GSD_HOME/projects/<GSD_PROJECT_ID>/` instead of the computed hash. Useful for CI/CD or sharing state across clones of the same repo. (v2.39) |
+| `GSD_STATE_DIR` | `$GSD_HOME` | Per-project state root. Controls where `projects/<repo-hash>/` directories are created. Takes precedence over `GSD_HOME` for project state. |
+| `GSD_CODING_AGENT_DIR` | `$GSD_HOME/agent` | Agent directory containing managed resources, extensions, and auth. Takes precedence over `GSD_HOME` for agent paths. |
+| `GSD_ALLOWED_COMMAND_PREFIXES` | (built-in list) | Comma-separated command prefixes allowed for `!command` value resolution. Overrides `allowedCommandPrefixes` in settings.json. See [Custom Models — Command Allowlist](custom-models.md#command-allowlist). |
+| `GSD_FETCH_ALLOWED_URLS` | (none) | Comma-separated hostnames exempted from `fetch_page` URL blocking. Overrides `fetchAllowedUrls` in settings.json. See [URL Blocking](#url-blocking-fetch_page). |
 
 ## All Settings
 
@@ -78,12 +190,34 @@ models:
 
 ### Custom Model Definitions (`models.json`)
 
-Define custom models in `~/.gsd/agent/models.json`. This lets you add models not included in the default registry — useful for self-hosted endpoints, fine-tuned models, or new releases.
+Define custom models and providers in `~/.gsd/agent/models.json`. This lets you add models not included in the default registry — useful for self-hosted endpoints (Ollama, vLLM, LM Studio), fine-tuned models, proxies, or new provider releases.
 
 GSD resolves models.json with fallback logic:
 1. `~/.gsd/agent/models.json` — primary (GSD)
 2. `~/.pi/agent/models.json` — fallback (Pi)
 3. If neither exists, creates `~/.gsd/agent/models.json`
+
+**Quick example for local models (Ollama):**
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "models": [
+        { "id": "llama3.1:8b" },
+        { "id": "qwen2.5-coder:7b" }
+      ]
+    }
+  }
+}
+```
+
+The file reloads each time you open `/model` — no restart needed.
+
+For full documentation including provider configuration, model overrides, OpenAI compatibility settings, and advanced examples, see the [Custom Models Guide](./custom-models.md).
 
 **With fallbacks:**
 
@@ -98,6 +232,16 @@ models:
 ```
 
 When a model fails to switch (provider unavailable, rate limited, credits exhausted), GSD automatically tries the next model in the `fallbacks` list.
+
+### Community Provider Extensions
+
+For providers not built into GSD, community extensions can add full provider support with proper model definitions, thinking format configuration, and interactive API key setup.
+
+| Extension | Provider | Models | Install |
+|-----------|----------|--------|---------|
+| [`pi-dashscope`](https://www.npmjs.com/package/pi-dashscope) | Alibaba DashScope (ModelStudio) | Qwen3, GLM-5, MiniMax M2.5, Kimi K2.5 | `gsd install npm:pi-dashscope` |
+
+Community extensions are recommended over the built-in `alibaba-coding-plan` provider for DashScope models — they use the correct OpenAI-compatible endpoint and include per-model compatibility flags for thinking mode.
 
 ### `token_profile`
 
@@ -120,9 +264,13 @@ phases:
   skip_research: false        # skip milestone-level research
   skip_reassess: false        # skip roadmap reassessment after each slice
   skip_slice_research: true   # skip per-slice research
+  reassess_after_slice: true  # enable roadmap reassessment after each slice (required for reassessment)
+  require_slice_discussion: false  # pause auto-mode before each slice for discussion
 ```
 
 These are usually set automatically by `token_profile`, but can be overridden explicitly.
+
+> **Note:** Roadmap reassessment requires `reassess_after_slice: true` to be set explicitly. Without it, reassessment is skipped regardless of `skip_reassess`.
 
 ### `skill_discovery`
 
@@ -182,6 +330,71 @@ Enable automatic UAT (User Acceptance Test) runs after slice completion:
 uat_dispatch: true
 ```
 
+### Verification (v2.26)
+
+Configure shell commands that run automatically after every task execution. Failures trigger auto-fix retries before advancing.
+
+```yaml
+verification_commands:
+  - npm run lint
+  - npm run test
+verification_auto_fix: true       # auto-retry on failure (default: true)
+verification_max_retries: 2       # max retry attempts (default: 2)
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `verification_commands` | string[] | `[]` | Shell commands to run after task execution |
+| `verification_auto_fix` | boolean | `true` | Auto-retry when verification fails |
+| `verification_max_retries` | number | `2` | Maximum auto-fix retry attempts |
+
+### URL Blocking (`fetch_page`)
+
+The `fetch_page` tool blocks requests to private and internal network addresses to prevent server-side request forgery (SSRF). This protects against the agent being tricked into accessing internal services, cloud metadata endpoints, or local files.
+
+**Blocked by default:**
+
+| Category | Examples |
+|----------|----------|
+| Private IP ranges | `10.x.x.x`, `172.16-31.x.x`, `192.168.x.x`, `127.x.x.x` |
+| Link-local / cloud metadata | `169.254.x.x` (AWS/GCP instance metadata) |
+| Cloud metadata hostnames | `metadata.google.internal`, `instance-data` |
+| Localhost | `localhost` (any port) |
+| Non-HTTP protocols | `file://`, `ftp://` |
+| IPv6 private ranges | `::1`, `fc00:`, `fd`, `fe80:` |
+
+Public URLs (`https://example.com`, `http://8.8.8.8`) are not affected.
+
+**Allowing specific internal hosts:**
+
+If you need the agent to fetch from internal URLs (self-hosted docs, internal APIs behind a VPN), add their hostnames to `fetchAllowedUrls` in global settings (`~/.gsd/agent/settings.json`):
+
+```json
+{
+  "fetchAllowedUrls": ["internal-docs.company.com", "192.168.1.50"]
+}
+```
+
+Alternatively, set the `GSD_FETCH_ALLOWED_URLS` environment variable (comma-separated). The env var takes precedence over settings.json:
+
+```bash
+export GSD_FETCH_ALLOWED_URLS="internal-docs.company.com,192.168.1.50"
+```
+
+Allowed hostnames bypass the blocklist checks. The protocol restriction (HTTP/HTTPS only) still applies — `file://` and `ftp://` cannot be allowlisted.
+
+> **Note:** This setting is global-only. Project-level settings.json cannot override the URL allowlist — this prevents a cloned repo from directing `fetch_page` at internal infrastructure.
+
+### `auto_report` (v2.26)
+
+Auto-generate HTML reports after milestone completion:
+
+```yaml
+auto_report: true    # default: true
+```
+
+Reports are written to `.gsd/reports/` as self-contained HTML files with embedded CSS/JS.
+
 ### `unique_milestone_ids`
 
 Generate milestone IDs with a random suffix to avoid collisions in team workflows:
@@ -200,14 +413,17 @@ git:
   auto_push: false            # push commits to remote after committing
   push_branches: false        # push milestone branch to remote
   remote: origin              # git remote name
-  snapshots: false            # WIP snapshot commits during long tasks
-  pre_merge_check: false      # run checks before worktree merge (true/false/"auto")
+  snapshots: true             # WIP snapshot commits during long tasks
+  pre_merge_check: auto       # run checks before worktree merge (true/false/"auto")
   commit_type: feat           # override conventional commit prefix
   main_branch: main           # primary branch name
   merge_strategy: squash      # how worktree branches merge: "squash" or "merge"
   isolation: worktree         # git isolation: "worktree", "branch", or "none"
   commit_docs: true           # commit .gsd/ artifacts to git (set false to keep local)
+  manage_gitignore: true      # set false to prevent GSD from modifying .gitignore
   worktree_post_create: .gsd/hooks/post-worktree-create  # script to run after worktree creation
+  auto_pr: false              # create a PR on milestone completion (requires push_branches)
+  pr_target_branch: develop   # target branch for auto-created PRs (default: main branch)
 ```
 
 | Field | Type | Default | Description |
@@ -215,14 +431,17 @@ git:
 | `auto_push` | boolean | `false` | Push commits to remote after committing |
 | `push_branches` | boolean | `false` | Push milestone branch to remote |
 | `remote` | string | `"origin"` | Git remote name |
-| `snapshots` | boolean | `false` | WIP snapshot commits during long tasks |
-| `pre_merge_check` | bool/string | `false` | Run checks before merge (`true`/`false`/`"auto"`) |
+| `snapshots` | boolean | `true` | WIP snapshot commits during long tasks |
+| `pre_merge_check` | bool/string | `"auto"` | Run checks before merge (`true`/`false`/`"auto"`) |
 | `commit_type` | string | (inferred) | Override conventional commit prefix (`feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`, `build`, `style`) |
 | `main_branch` | string | `"main"` | Primary branch name |
 | `merge_strategy` | string | `"squash"` | How worktree branches merge: `"squash"` (combine all commits) or `"merge"` (preserve individual commits) |
 | `isolation` | string | `"worktree"` | Auto-mode isolation: `"worktree"` (separate directory), `"branch"` (work in project root — useful for submodule-heavy repos), or `"none"` (no isolation — commits on current branch, no worktree or milestone branch) |
 | `commit_docs` | boolean | `true` | Commit `.gsd/` planning artifacts to git. Set `false` to keep local-only |
+| `manage_gitignore` | boolean | `true` | When `false`, GSD will not modify `.gitignore` at all — no baseline patterns, no self-healing. Use if you manage your own `.gitignore` |
 | `worktree_post_create` | string | (none) | Script to run after worktree creation. Receives `SOURCE_DIR` and `WORKTREE_DIR` env vars |
+| `auto_pr` | boolean | `false` | Automatically create a pull request when a milestone completes. Requires `auto_push: true` and `gh` CLI installed and authenticated |
+| `pr_target_branch` | string | (main branch) | Target branch for auto-created PRs (e.g. `develop`, `qa`). Defaults to `main_branch` if not set |
 
 #### `git.worktree_post_create`
 
@@ -249,6 +468,57 @@ ln -sf "$SOURCE_DIR/assets" "$WORKTREE_DIR/assets"
 
 The path can be absolute or relative to the project root. The script runs with a 30-second timeout. Failure is non-fatal — GSD logs a warning and continues.
 
+#### `git.auto_pr`
+
+Automatically create a pull request when a milestone completes. Designed for teams using Gitflow or branch-based workflows where work should go through PR review before merging to a target branch.
+
+```yaml
+git:
+  auto_push: true
+  auto_pr: true
+  pr_target_branch: develop  # or qa, staging, etc.
+```
+
+**Requirements:**
+- `auto_push: true` — the milestone branch must be pushed before a PR can be created
+- [`gh` CLI](https://cli.github.com/) installed and authenticated (`gh auth login`)
+
+**How it works:**
+1. Milestone completes → GSD squash-merges the worktree to the main branch
+2. Pushes the main branch to remote (if `auto_push: true`)
+3. Pushes the milestone branch to remote
+4. Creates a PR from the milestone branch to `pr_target_branch` via `gh pr create`
+
+If `pr_target_branch` is not set, the PR targets the `main_branch` (or auto-detected main branch). PR creation failure is non-fatal — GSD logs and continues.
+
+### `github` (v2.39)
+
+GitHub sync configuration. When enabled, GSD auto-syncs milestones, slices, and tasks to GitHub Issues, PRs, and Milestones.
+
+```yaml
+github:
+  enabled: true
+  repo: "owner/repo"              # auto-detected from git remote if omitted
+  labels: [gsd, auto-generated]   # labels applied to created issues/PRs
+  project: "Project ID"           # optional GitHub Project board
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable GitHub sync |
+| `repo` | string | (auto-detected) | GitHub repository in `owner/repo` format |
+| `labels` | string[] | `[]` | Labels to apply to created issues and PRs |
+| `project` | string | (none) | GitHub Project ID for project board integration |
+
+**Requirements:**
+- `gh` CLI installed and authenticated (`gh auth login`)
+- Sync mapping is persisted in `.gsd/.github-sync.json`
+- Rate-limit aware — skips sync when GitHub API rate limit is low
+
+**Commands:**
+- `/github-sync bootstrap` — initial setup and sync
+- `/github-sync status` — show sync mapping counts
+
 ### `notifications`
 
 Control what notifications GSD sends during auto mode:
@@ -262,6 +532,14 @@ notifications:
   on_milestone: true          # notify when milestone finishes
   on_attention: true          # notify when manual attention needed
 ```
+
+**macOS delivery:** GSD uses [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) when available, falling back to `osascript`. We recommend installing `terminal-notifier` for reliable notification delivery:
+
+```bash
+brew install terminal-notifier
+```
+
+Why: `osascript display notification` is attributed to your terminal app (Ghostty, iTerm2, etc.), which may not have notification permissions in System Settings → Notifications. `terminal-notifier` registers as its own app and prompts for permission on first use. See [Troubleshooting: Notifications not appearing on macOS](troubleshooting.md#notifications-not-appearing-on-macos) if notifications aren't working.
 
 ### `remote_questions`
 
@@ -347,7 +625,7 @@ prefer_skills:
 avoid_skills: []
 ```
 
-Skills can be bare names (looked up in `~/.gsd/agent/skills/`) or absolute paths.
+Skills can be bare names (looked up in `~/.agents/skills/` and `.agents/skills/`) or absolute paths.
 
 ### `skill_rules`
 
@@ -375,6 +653,32 @@ custom_instructions:
 
 For project-specific knowledge (patterns, gotchas, lessons learned), use `.gsd/KNOWLEDGE.md` instead — it's injected into every agent prompt automatically. Add entries with `/gsd knowledge rule|pattern|lesson <description>`.
 
+### `RUNTIME.md` — Runtime Context (v2.39)
+
+Declare project-level runtime context in `.gsd/RUNTIME.md`. This file is inlined into task execution prompts, giving the agent accurate information about your runtime environment without relying on hallucinated paths or URLs.
+
+**Location:** `.gsd/RUNTIME.md`
+
+**Example:**
+
+```markdown
+# Runtime Context
+
+## API Endpoints
+- Main API: https://api.example.com
+- Cache: redis://localhost:6379
+
+## Environment Variables
+- DEPLOYMENT_ENV: staging
+- DB_POOL_SIZE: 20
+
+## Local Services
+- PostgreSQL: localhost:5432
+- Redis: localhost:6379
+```
+
+Use this for information that the agent needs during execution but that doesn't belong in `DECISIONS.md` (architectural) or `KNOWLEDGE.md` (patterns/rules). Common examples: API base URLs, service ports, deployment targets, and environment-specific configuration.
+
 ### `dynamic_routing`
 
 Complexity-based model routing. See [Dynamic Model Routing](./dynamic-model-routing.md).
@@ -382,6 +686,7 @@ Complexity-based model routing. See [Dynamic Model Routing](./dynamic-model-rout
 ```yaml
 dynamic_routing:
   enabled: true
+  capability_routing: true          # score models by task capability (v2.59)
   tier_models:
     light: claude-haiku-4-5
     standard: claude-sonnet-4-6
@@ -389,6 +694,48 @@ dynamic_routing:
   escalate_on_failure: true
   budget_pressure: true
   cross_provider: true
+```
+
+### `context_management` (v2.59)
+
+Controls observation masking and tool result truncation during auto-mode sessions. Reduces context bloat between compactions with zero LLM overhead.
+
+```yaml
+context_management:
+  observation_masking: true          # replace old tool results with placeholders (default: true)
+  observation_mask_turns: 8          # keep results from last N user turns (1-50, default: 8)
+  compaction_threshold_percent: 0.70 # target compaction at 70% context usage (0.5-0.95, default: 0.70)
+  tool_result_max_chars: 800         # cap individual tool result content (200-10000, default: 800)
+```
+
+### `service_tier` (v2.42)
+
+OpenAI service tier preference for supported models. Toggle with `/gsd fast`.
+
+| Value | Behavior |
+|-------|----------|
+| `"priority"` | Priority tier — 2x cost, faster responses |
+| `"flex"` | Flex tier — 0.5x cost, slower responses |
+| (unset) | Default tier |
+
+```yaml
+service_tier: priority
+```
+
+### `forensics_dedup` (v2.43)
+
+Opt-in: search existing issues and PRs before filing from `/gsd forensics`. Uses additional AI tokens.
+
+```yaml
+forensics_dedup: true    # default: false
+```
+
+### `show_token_cost` (v2.44)
+
+Opt-in: show per-prompt and cumulative session token cost in the footer.
+
+```yaml
+show_token_cost: true    # default: false
 ```
 
 ### `auto_visualize`
@@ -476,6 +823,13 @@ notifications:
 
 # Visualizer
 auto_visualize: true
+
+# Service tier
+service_tier: priority         # "priority" or "flex" (for /gsd fast)
+
+# Diagnostics
+forensics_dedup: true          # deduplicate before filing forensics issues
+show_token_cost: true          # show per-prompt cost in footer
 
 # Hooks
 post_unit_hooks:

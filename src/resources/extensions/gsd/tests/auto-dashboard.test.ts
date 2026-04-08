@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   unitVerb,
@@ -7,7 +9,12 @@ import {
   describeNextUnit,
   formatAutoElapsed,
   formatWidgetTokens,
+  estimateTimeRemaining,
+  extractUatSliceId,
 } from "../auto-dashboard.ts";
+
+const autoSource = readFileSync(join(process.cwd(), "src", "resources", "extensions", "gsd", "auto.ts"), "utf-8");
+const dashboardSource = readFileSync(join(process.cwd(), "src", "resources", "extensions", "gsd", "auto-dashboard.ts"), "utf-8");
 
 // ─── unitVerb ─────────────────────────────────────────────────────────────
 
@@ -150,4 +157,55 @@ test("formatWidgetTokens formats millions with M", () => {
   assert.equal(formatWidgetTokens(1_000_000), "1.0M");
   assert.equal(formatWidgetTokens(10_000_000), "10M");
   assert.equal(formatWidgetTokens(25_000_000), "25M");
+});
+
+// ─── estimateTimeRemaining ──────────────────────────────────────────────
+
+test("estimateTimeRemaining returns null when no ledger data", () => {
+  // With no active auto-mode session, ledger is empty
+  const result = estimateTimeRemaining();
+  assert.equal(result, null);
+});
+
+test("estimateTimeRemaining is exported and callable", () => {
+  assert.equal(typeof estimateTimeRemaining, "function");
+});
+
+// ─── getAutoDashboardData elapsed guard ──────────────────────────────────────
+// These tests verify the elapsed time calculation in getAutoDashboardData()
+// doesn't produce absurd values when autoStartTime is 0 (uninitialized).
+// The actual function is in auto.ts and tested structurally here by verifying
+// that formatAutoElapsed properly handles the zero case.
+
+test("formatAutoElapsed returns empty string for negative autoStartTime", () => {
+  // A negative value should be treated as invalid — the guard in
+  // getAutoDashboardData prevents this, but formatAutoElapsed should also
+  // handle it gracefully via its falsy check.
+  assert.equal(formatAutoElapsed(-1), "");
+  assert.equal(formatAutoElapsed(NaN), "");
+});
+
+test("getAutoDashboardData returns RTK savings in the dashboard payload", () => {
+  assert.match(autoSource, /const rtkSavings = sessionId && s\.basePath/);
+  assert.match(autoSource, /rtkSavings,/);
+});
+
+test("auto progress widget renders RTK savings under the footer stats line", () => {
+  assert.match(dashboardSource, /formatRtkSavingsLabel/);
+  assert.match(dashboardSource, /getRtkSessionSavings\(accessors\.getBasePath\(\), sessionId\)/);
+  assert.match(dashboardSource, /lines\.push\(rightAlign\("", theme\.fg\("dim", cachedRtkLabel\), width\)\);/);
+});
+
+// ─── extractUatSliceId ───────────────────────────────────────────────────
+
+test("extractUatSliceId extracts slice ID from M001/S01 format", () => {
+  assert.equal(extractUatSliceId("M001/S01"), "S01");
+  assert.equal(extractUatSliceId("M002/S03"), "S03");
+  assert.equal(extractUatSliceId("M001/S12"), "S12");
+});
+
+test("extractUatSliceId returns null for invalid formats", () => {
+  assert.equal(extractUatSliceId("M001"), null);
+  assert.equal(extractUatSliceId(""), null);
+  assert.equal(extractUatSliceId("M001/T01"), null);
 });
