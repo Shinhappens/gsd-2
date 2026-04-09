@@ -1,4 +1,5 @@
-import type { ExtensionCommandContext, ExtensionContext } from "@gsd/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@gsd/pi-coding-agent";
+import type { Model } from "@gsd/pi-ai";
 import type { GSDState } from "../../types.js";
 
 import { computeProgressScore, formatProgressLine } from "../../progress-score.js";
@@ -48,6 +49,7 @@ export function showHelp(ctx: ExtensionCommandContext): void {
     "SETUP & CONFIGURATION",
     "  /gsd init           Project init wizard — detect, configure, bootstrap .gsd/",
     "  /gsd setup          Global setup status  [llm|search|remote|keys|prefs]",
+    "  /gsd model          Switch active session model  [provider/model|model-id]",
     "  /gsd mode           Set workflow mode (solo/team)  [global|project]",
     "  /gsd prefs          Manage preferences  [global|project|status|wizard|setup|import-claude]",
     "  /gsd cmux           Manage cmux integration  [status|on|off|notifications|sidebar|splits|browser]",
@@ -179,7 +181,106 @@ export async function handleSetup(args: string, ctx: ExtensionCommandContext): P
   );
 }
 
-export async function handleCoreCommand(trimmed: string, ctx: ExtensionCommandContext): Promise<boolean> {
+function sortModelsForSelection(models: Model<any>[], currentModel: Model<any> | undefined): Model<any>[] {
+  return [...models].sort((a, b) => {
+    const aCurrent = currentModel && a.provider === currentModel.provider && a.id === currentModel.id;
+    const bCurrent = currentModel && b.provider === currentModel.provider && b.id === currentModel.id;
+    if (aCurrent && !bCurrent) return -1;
+    if (!aCurrent && bCurrent) return 1;
+    const providerCmp = a.provider.localeCompare(b.provider);
+    if (providerCmp !== 0) return providerCmp;
+    return a.id.localeCompare(b.id);
+  });
+}
+
+async function resolveRequestedModel(
+  query: string,
+  ctx: ExtensionCommandContext,
+): Promise<Model<any> | undefined> {
+  const { resolveModelId } = await import("../../auto-model-selection.js");
+  const models = ctx.modelRegistry.getAvailable();
+  const exact = resolveModelId(query, models, ctx.model?.provider);
+  if (exact) return exact;
+
+  const lowerQuery = query.toLowerCase();
+  const partialMatches = models.filter((model) =>
+    model.id.toLowerCase().includes(lowerQuery)
+      || `${model.provider}/${model.id}`.toLowerCase().includes(lowerQuery),
+  );
+
+  if (partialMatches.length === 1) return partialMatches[0];
+  if (partialMatches.length === 0 || !ctx.hasUI) return undefined;
+
+  const sorted = sortModelsForSelection(partialMatches, ctx.model);
+  const optionToModel = new Map<string, Model<any>>();
+  const options = sorted.map((model) => {
+    const label = `${model.provider}/${model.id}`;
+    optionToModel.set(label, model);
+    return label;
+  });
+  options.push("(cancel)");
+
+  const choice = await ctx.ui.select(`Multiple models match "${query}" — choose one:`, options);
+  if (!choice || typeof choice !== "string" || choice === "(cancel)") return undefined;
+  return optionToModel.get(choice);
+}
+
+async function handleModel(trimmedArgs: string, ctx: ExtensionCommandContext, pi: ExtensionAPI | undefined): Promise<void> {
+  const availableModels = ctx.modelRegistry.getAvailable();
+  if (availableModels.length === 0) {
+    ctx.ui.notify("No available models found. Check provider auth and model discovery.", "warning");
+    return;
+  }
+  if (!pi) {
+    ctx.ui.notify("Model switching is unavailable in this context.", "warning");
+    return;
+  }
+
+  const trimmed = trimmedArgs.trim();
+  let targetModel: Model<any> | undefined;
+
+  if (!trimmed) {
+    if (!ctx.hasUI) {
+      const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
+      ctx.ui.notify(`Current model: ${current}\nUsage: /gsd model <provider/model|model-id>`, "info");
+      return;
+    }
+
+    const optionToModel = new Map<string, Model<any>>();
+    const options = sortModelsForSelection(availableModels, ctx.model).map((model) => {
+      const isCurrent = ctx.model && model.provider === ctx.model.provider && model.id === ctx.model.id;
+      const label = `${isCurrent ? "* " : ""}${model.provider}/${model.id}`;
+      optionToModel.set(label, model);
+      return label;
+    });
+    options.push("(cancel)");
+
+    const choice = await ctx.ui.select("Select session model:", options);
+    if (!choice || typeof choice !== "string" || choice === "(cancel)") return;
+    targetModel = optionToModel.get(choice);
+  } else {
+    targetModel = await resolveRequestedModel(trimmed, ctx);
+  }
+
+  if (!targetModel) {
+    ctx.ui.notify(`Model "${trimmed}" not found. Use /gsd model with an exact provider/model or a unique model ID.`, "warning");
+    return;
+  }
+
+  const ok = await pi.setModel(targetModel);
+  if (!ok) {
+    ctx.ui.notify(`No API key for ${targetModel.provider}/${targetModel.id}`, "warning");
+    return;
+  }
+
+  ctx.ui.notify(`Model: ${targetModel.provider}/${targetModel.id}`, "info");
+}
+
+export async function handleCoreCommand(
+  trimmed: string,
+  ctx: ExtensionCommandContext,
+  pi?: ExtensionAPI,
+): Promise<boolean> {
   if (trimmed === "help" || trimmed === "h" || trimmed === "?") {
     showHelp(ctx);
     return true;
@@ -201,6 +302,10 @@ export async function handleCoreCommand(trimmed: string, ctx: ExtensionCommandCo
       cycleWidgetMode();
     }
     ctx.ui.notify(`Widget: ${getWidgetMode()}`, "info");
+    return true;
+  }
+  if (trimmed === "model" || trimmed.startsWith("model ")) {
+    await handleModel(trimmed.replace(/^model\s*/, "").trim(), ctx, pi);
     return true;
   }
   if (trimmed === "mode" || trimmed.startsWith("mode ")) {

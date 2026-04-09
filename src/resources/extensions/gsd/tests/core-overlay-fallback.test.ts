@@ -42,3 +42,35 @@ test("show-config only falls back when ctx.ui.custom() is unavailable", async ()
   assert.equal(fallbackCtx.notices.length, 1, "unavailable overlay triggers text fallback");
   assert.match(fallbackCtx.notices[0]!.message, /GSD Configuration/);
 });
+
+test("model command resolves and persists exact provider-qualified selection", async () => {
+  const selectedModel = { provider: "openai", id: "gpt-5.4" };
+  let applied: typeof selectedModel | null = null;
+  const ctx = {
+    hasUI: true,
+    model: { provider: "anthropic", id: "claude-sonnet-4-6" },
+    modelRegistry: {
+      getAvailable: () => [
+        { provider: "anthropic", id: "claude-sonnet-4-6" },
+        selectedModel,
+      ],
+    },
+    ui: {
+      notify: (message: string, type?: string) => {
+        notices.push({ message, type });
+      },
+    },
+  } as any;
+  const notices: Array<{ message: string; type?: string }> = [];
+  const pi = {
+    setModel: async (model: typeof selectedModel) => {
+      applied = model;
+      return true;
+    },
+  } as any;
+
+  const handled = await handleCoreCommand("model openai/gpt-5.4", ctx, pi);
+  assert.equal(handled, true);
+  assert.deepEqual(applied, selectedModel);
+  assert.match(notices[0]!.message, /openai\/gpt-5\.4/);
+});

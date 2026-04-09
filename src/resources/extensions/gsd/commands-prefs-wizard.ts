@@ -165,10 +165,10 @@ export function buildCategorySummaries(prefs: Record<string, unknown>): Record<s
   const modeSummary = mode ?? "(not set)";
 
   // Models
-  const models = prefs.models as Record<string, string> | undefined;
+  const models = prefs.models as Record<string, unknown> | undefined;
   let modelsSummary = "(not configured)";
   if (models && Object.keys(models).length > 0) {
-    const parts = Object.entries(models).map(([phase, model]) => `${phase}: ${model}`);
+    const parts = Object.entries(models).map(([phase, model]) => `${phase}: ${formatConfiguredModel(model)}`);
     modelsSummary = parts.join(", ");
   }
 
@@ -255,9 +255,38 @@ export function buildCategorySummaries(prefs: Record<string, unknown>): Record<s
 
 // ─── Category configuration functions ────────────────────────────────────────
 
+export function formatConfiguredModel(config: unknown): string {
+  if (typeof config === "string") return config;
+  if (!config || typeof config !== "object") return "(invalid)";
+  const maybeConfig = config as { model?: unknown; provider?: unknown };
+  if (typeof maybeConfig.model !== "string" || maybeConfig.model.trim() === "") return "(invalid)";
+  if (typeof maybeConfig.provider === "string" && maybeConfig.provider && !maybeConfig.model.includes("/")) {
+    return `${maybeConfig.provider}/${maybeConfig.model}`;
+  }
+  return maybeConfig.model;
+}
+
+export function toPersistedModelId(provider: string, modelId: string): string {
+  if (!provider.trim()) return modelId;
+  const normalizedProvider = provider.trim();
+  const normalizedModelId = modelId.trim();
+  return normalizedModelId.startsWith(`${normalizedProvider}/`)
+    ? normalizedModelId
+    : `${normalizedProvider}/${normalizedModelId}`;
+}
+
 async function configureModels(ctx: ExtensionCommandContext, prefs: Record<string, unknown>): Promise<void> {
-  const modelPhases = ["research", "planning", "execution", "completion"] as const;
-  const models: Record<string, string> = (prefs.models as Record<string, string>) ?? {};
+  const modelPhases = [
+    "research",
+    "planning",
+    "discuss",
+    "execution",
+    "execution_simple",
+    "completion",
+    "validation",
+    "subagent",
+  ] as const;
+  const models: Record<string, unknown> = (prefs.models as Record<string, unknown>) ?? {};
 
   const availableModels = ctx.modelRegistry.getAvailable();
   if (availableModels.length > 0) {
@@ -292,7 +321,7 @@ async function configureModels(ctx: ExtensionCommandContext, prefs: Record<strin
     providerOptions.push("(keep current)", "(clear)", "(type manually)");
 
     for (const phase of modelPhases) {
-      const current = models[phase] ?? "";
+      const current = formatConfiguredModel(models[phase]);
       const phaseLabel = `Model for ${phase} phase${current ? ` (current: ${current})` : ""}`;
 
       // Step 1: pick provider
@@ -329,13 +358,13 @@ async function configureModels(ctx: ExtensionCommandContext, prefs: Record<strin
         if (modelChoice === "(clear)") {
           delete models[phase];
         } else {
-          models[phase] = modelChoice;
+          models[phase] = toPersistedModelId(providerName, modelChoice);
         }
       }
     }
   } else {
     for (const phase of modelPhases) {
-      const current = models[phase] ?? "";
+      const current = formatConfiguredModel(models[phase]);
       const input = await ctx.ui.input(
         `Model for ${phase} phase${current ? ` (current: ${current})` : ""}:`,
         current || "e.g. claude-sonnet-4-20250514",
@@ -352,6 +381,8 @@ async function configureModels(ctx: ExtensionCommandContext, prefs: Record<strin
   }
   if (Object.keys(models).length > 0) {
     prefs.models = models;
+  } else {
+    delete prefs.models;
   }
 }
 
