@@ -13,6 +13,7 @@ import {
 } from "@gsd/pi-tui";
 import type { AuthStorage } from "../../../core/auth-storage.js";
 import { getDiscoverableProviders } from "../../../core/model-discovery.js";
+import { providerDisplayName } from "./model-selector.js";
 import type { ModelRegistry } from "../../../core/model-registry.js";
 import { ModelsJsonWriter } from "../../../core/models-json-writer.js";
 import { theme } from "../theme/theme.js";
@@ -149,7 +150,7 @@ export class ProviderManagerComponent extends Container implements Focusable {
 			const countBadge = theme.fg("muted", `(${p.modelCount} models)`);
 
 			const prefix = isSelected ? theme.fg("accent", "> ") : "  ";
-			const nameText = isSelected ? theme.fg("accent", p.name) : p.name;
+			const nameText = isSelected ? theme.fg("accent", providerDisplayName(p.name)) : providerDisplayName(p.name);
 
 			const parts = [prefix, nameText, " ", authBadge];
 			if (discoveryBadge) parts.push(" ", discoveryBadge);

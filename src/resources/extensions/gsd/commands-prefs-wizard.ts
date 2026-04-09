@@ -277,10 +277,17 @@ async function configureModels(ctx: ExtensionCommandContext, prefs: Record<strin
       group.sort((a, b) => a.id.localeCompare(b.id));
     }
 
-    // Build provider menu with model counts
+    // Display names for providers in the preferences wizard UI.
+    const PROVIDER_DISPLAY_NAMES: Record<string, string> = { anthropic: "anthropic-api" };
+    const displayName = (p: string) => PROVIDER_DISPLAY_NAMES[p] ?? p;
+
+    // Build provider menu with model counts (display name → real name lookup)
+    const displayToReal = new Map<string, string>();
     const providerOptions = providers.map(p => {
       const count = byProvider.get(p)!.length;
-      return `${p} (${count} models)`;
+      const label = `${displayName(p)} (${count} models)`;
+      displayToReal.set(label, p);
+      return label;
     });
     providerOptions.push("(keep current)", "(clear)", "(type manually)");
 
@@ -310,14 +317,14 @@ async function configureModels(ctx: ExtensionCommandContext, prefs: Record<strin
       }
 
       // Step 2: pick model within provider
-      const providerName = providerChoice.replace(/ \(\d+ models?\)$/, "");
+      const providerName = displayToReal.get(providerChoice) ?? providerChoice.replace(/ \(\d+ models?\)$/, "");
       const group = byProvider.get(providerName);
       if (!group) continue;
 
       const modelOptions = group.map(m => m.id);
       modelOptions.push("(keep current)", "(clear)");
 
-      const modelChoice = await ctx.ui.select(`${phaseLabel} — ${providerName}:`, modelOptions);
+      const modelChoice = await ctx.ui.select(`${phaseLabel} — ${displayName(providerName)}:`, modelOptions);
       if (modelChoice && typeof modelChoice === "string" && modelChoice !== "(keep current)") {
         if (modelChoice === "(clear)") {
           delete models[phase];

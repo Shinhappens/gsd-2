@@ -79,7 +79,7 @@ import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FooterComponent } from "./components/footer.js";
 import { appKey, appKeyHint, editorKey, formatKeyForDisplay, keyHint, rawKeyHint } from "./components/keybinding-hints.js";
 import { LoginDialogComponent } from "./components/login-dialog.js";
-import { ModelSelectorComponent } from "./components/model-selector.js";
+import { ModelSelectorComponent, providerDisplayName } from "./components/model-selector.js";
 import { OAuthSelectorComponent } from "./components/oauth-selector.js";
 import { ProviderManagerComponent } from "./components/provider-manager.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
@@ -338,7 +338,7 @@ export class InteractiveMode {
 				return filtered.map((item) => ({
 					value: item.label,
 					label: item.id,
-					description: item.provider,
+					description: providerDisplayName(item.provider),
 				}));
 			};
 		}

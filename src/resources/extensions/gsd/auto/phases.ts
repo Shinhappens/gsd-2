@@ -507,7 +507,13 @@ export async function runPreDispatch(
   }
 
   // Mid-merge safety check
-  if (deps.reconcileMergeState(s.basePath, ctx)) {
+  const mergeReconcileResult = deps.reconcileMergeState(s.basePath, ctx);
+  if (mergeReconcileResult === "blocked") {
+    await deps.pauseAuto(ctx, pi);
+    debugLog("autoLoop", { phase: "exit", reason: "merge-reconciliation-blocked" });
+    return { action: "break", reason: "merge-reconciliation-blocked" };
+  }
+  if (mergeReconcileResult === "reconciled") {
     deps.invalidateAllCaches();
     state = await deps.deriveState(s.basePath);
     mid = state.activeMilestone?.id;
@@ -1303,8 +1309,8 @@ export async function runUnitPhase(
       return { action: "break", reason: "provider-pause" };
     }
     // Session creation timeout (not a structural error): pause auto-mode
-    // and let the provider-error-resume timer handle recovery. This matches
-    // the provider-pause path — break out cleanly, don't hard-stop.
+    // and let the provider-error-resume timer handle recovery (#3767). This
+    // matches the provider-pause path — break out cleanly, don't hard-stop.
     // Structural errors (TypeError, is not a function) are NOT transient
     // and must hard-stop to avoid infinite retry loops.
     if (
@@ -1312,7 +1318,7 @@ export async function runUnitPhase(
       unitResult.errorContext?.category === "timeout"
     ) {
       ctx.ui.notify(
-        `Session creation timed out for ${unitType} ${unitId}. Will retry.`,
+        `Session creation timed out for ${unitType} ${unitId}. Pausing auto-mode (recoverable).`,
         "warning",
       );
       debugLog("autoLoop", { phase: "session-timeout-pause", unitType, unitId });
@@ -1639,4 +1645,3 @@ export async function runFinalize(
 
   return { action: "next", data: undefined as void };
 }
-
