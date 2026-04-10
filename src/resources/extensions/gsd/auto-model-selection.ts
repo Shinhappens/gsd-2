@@ -212,6 +212,13 @@ export async function selectAndApplyModel(
                 "info",
               );
             }
+            // ADR-005: Report tools filtered due to provider incompatibility
+            if (routingResult.filteredTools && routingResult.filteredTools.length > 0) {
+              ctx.ui.notify(
+                `Tool compatibility: ${routingResult.filteredTools.length} tools filtered for provider — ${routingResult.filteredTools.join(", ")}`,
+                "info",
+              );
+            }
           }
         }
         routingTierLabel = ` [${tierLabel(classification.tier)}]`;

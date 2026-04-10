@@ -1,6 +1,55 @@
 import type { Api, AssistantMessage, Message, Model, ToolCall, ToolResultMessage } from "../types.js";
 
 /**
+ * Report of context transformations during a cross-provider switch (ADR-005 Phase 3).
+ * Tracks what was lost or downgraded when replaying conversation history to a different provider.
+ */
+export interface ProviderSwitchReport {
+	/** API of the messages being transformed from */
+	fromApi: string;
+	/** API of the target model */
+	toApi: string;
+	/** Number of thinking blocks completely dropped (redacted/encrypted, cross-model) */
+	thinkingBlocksDropped: number;
+	/** Number of thinking blocks downgraded from structured to plain text */
+	thinkingBlocksDowngraded: number;
+	/** Number of tool call IDs that were remapped/normalized */
+	toolCallIdsRemapped: number;
+	/** Number of synthetic tool results inserted for orphaned tool calls */
+	syntheticToolResultsInserted: number;
+	/** Number of thought signatures dropped (Google-specific opaque context) */
+	thoughtSignaturesDropped: number;
+}
+
+/**
+ * Create an empty provider switch report.
+ */
+export function createEmptyReport(fromApi: string, toApi: string): ProviderSwitchReport {
+	return {
+		fromApi,
+		toApi,
+		thinkingBlocksDropped: 0,
+		thinkingBlocksDowngraded: 0,
+		toolCallIdsRemapped: 0,
+		syntheticToolResultsInserted: 0,
+		thoughtSignaturesDropped: 0,
+	};
+}
+
+/**
+ * Check if a provider switch report has any non-zero transformations.
+ */
+export function hasTransformations(report: ProviderSwitchReport): boolean {
+	return (
+		report.thinkingBlocksDropped > 0 ||
+		report.thinkingBlocksDowngraded > 0 ||
+		report.toolCallIdsRemapped > 0 ||
+		report.syntheticToolResultsInserted > 0 ||
+		report.thoughtSignaturesDropped > 0
+	);
+}
+
+/**
  * Normalize tool call ID for cross-provider compatibility.
  * OpenAI Responses API generates IDs that are 450+ chars with special characters like `|`.
  * Anthropic APIs require IDs matching ^[a-zA-Z0-9_-]+$ (max 64 chars).
@@ -9,6 +58,7 @@ export function transformMessages<TApi extends Api>(
 	messages: Message[],
 	model: Model<TApi>,
 	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
+	report?: ProviderSwitchReport,
 ): Message[] {
 	// Build a map of original tool call IDs to normalized IDs
 	const toolCallIdMap = new Map<string, string>();
@@ -42,14 +92,20 @@ export function transformMessages<TApi extends Api>(
 					// Redacted thinking is opaque encrypted content, only valid for the same model.
 					// Drop it for cross-model to avoid API errors.
 					if (block.redacted) {
+						if (!isSameModel && report) report.thinkingBlocksDropped++;
 						return isSameModel ? block : [];
 					}
 					// For same model: keep thinking blocks with signatures (needed for replay)
 					// even if the thinking text is empty (OpenAI encrypted reasoning)
 					if (isSameModel && block.thinkingSignature) return block;
 					// Skip empty thinking blocks, convert others to plain text
-					if (!block.thinking || block.thinking.trim() === "") return [];
+					if (!block.thinking || block.thinking.trim() === "") {
+						if (!isSameModel && report) report.thinkingBlocksDropped++;
+						return [];
+					}
 					if (isSameModel) return block;
+					// Downgrade: structured thinking → plain text
+					if (report) report.thinkingBlocksDowngraded++;
 					return {
 						type: "text" as const,
 						text: block.thinking,
@@ -71,6 +127,7 @@ export function transformMessages<TApi extends Api>(
 					if (!isSameModel && toolCall.thoughtSignature) {
 						normalizedToolCall = { ...toolCall };
 						delete (normalizedToolCall as { thoughtSignature?: string }).thoughtSignature;
+						if (report) report.thoughtSignaturesDropped++;
 					}
 
 					if (!isSameModel && normalizeToolCallId) {
@@ -78,6 +135,7 @@ export function transformMessages<TApi extends Api>(
 						if (normalizedId !== toolCall.id) {
 							toolCallIdMap.set(toolCall.id, normalizedId);
 							normalizedToolCall = { ...normalizedToolCall, id: normalizedId };
+							if (report) report.toolCallIdsRemapped++;
 						}
 					}
 
@@ -117,6 +175,7 @@ export function transformMessages<TApi extends Api>(
 							isError: true,
 							timestamp: Date.now(),
 						} as ToolResultMessage);
+						if (report) report.syntheticToolResultsInserted++;
 					}
 				}
 				pendingToolCalls = [];
@@ -157,6 +216,7 @@ export function transformMessages<TApi extends Api>(
 							isError: true,
 							timestamp: Date.now(),
 						} as ToolResultMessage);
+						if (report) report.syntheticToolResultsInserted++;
 					}
 				}
 				pendingToolCalls = [];
