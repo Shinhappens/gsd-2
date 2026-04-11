@@ -60,6 +60,8 @@ interface SdkElicitationFieldSchema {
 	type?: string;
 	title?: string;
 	description?: string;
+	format?: string;
+	writeOnly?: boolean;
 	oneOf?: SdkElicitationRequestOption[];
 	items?: {
 		anyOf?: SdkElicitationRequestOption[];
@@ -73,6 +75,7 @@ interface SdkElicitationRequest {
 	requestedSchema?: {
 		type?: string;
 		properties?: Record<string, SdkElicitationFieldSchema>;
+		required?: string[];
 	};
 }
 
@@ -85,7 +88,16 @@ interface ParsedElicitationQuestion extends Question {
 	noteFieldId?: string;
 }
 
+interface ParsedTextInputField {
+	id: string;
+	title: string;
+	description: string;
+	required: boolean;
+	secure: boolean;
+}
+
 const OTHER_OPTION_LABEL = "None of the above";
+const SENSITIVE_FIELD_PATTERN = /(password|passphrase|secret|token|api[_\s-]*key|private[_\s-]*key|credential)/i;
 
 // ---------------------------------------------------------------------------
 // Stream factory
@@ -274,6 +286,67 @@ export function parseAskUserQuestionsElicitation(
 	return questions.length > 0 ? questions : null;
 }
 
+function isSecureElicitationField(
+	requestMessage: string,
+	fieldId: string,
+	field: SdkElicitationFieldSchema,
+): boolean {
+	if (field.format === "password") return true;
+	if (field.writeOnly === true) return true;
+
+	const rawField = field as Record<string, unknown>;
+	if (rawField.sensitive === true || rawField["x-sensitive"] === true) return true;
+
+	const haystack = [
+		requestMessage,
+		fieldId.replace(/[_-]+/g, " "),
+		typeof field.title === "string" ? field.title : "",
+		typeof field.description === "string" ? field.description : "",
+	]
+		.join(" ")
+		.toLowerCase();
+
+	return SENSITIVE_FIELD_PATTERN.test(haystack);
+}
+
+export function parseTextInputElicitation(
+	request: Pick<SdkElicitationRequest, "message" | "mode" | "requestedSchema">,
+): ParsedTextInputField[] | null {
+	if (request.mode && request.mode !== "form") return null;
+	const schema = request.requestedSchema as
+		| ({ properties?: Record<string, SdkElicitationFieldSchema>; keys?: Record<string, SdkElicitationFieldSchema> } & Record<string, unknown>)
+		| undefined;
+	const fieldsSource = schema?.properties && typeof schema.properties === "object"
+		? schema.properties
+		: schema?.keys && typeof schema.keys === "object"
+			? schema.keys
+			: undefined;
+	if (!fieldsSource) return null;
+
+	const requiredSet = new Set(
+		Array.isArray(request.requestedSchema?.required)
+			? request.requestedSchema.required.filter((value): value is string => typeof value === "string")
+			: [],
+	);
+
+	const fields: ParsedTextInputField[] = [];
+	for (const [fieldId, field] of Object.entries(fieldsSource)) {
+		if (!field || typeof field !== "object") continue;
+		if (field.type !== "string") continue;
+		if (Array.isArray(field.oneOf) && field.oneOf.length > 0) continue;
+
+		fields.push({
+			id: fieldId,
+			title: typeof field.title === "string" && field.title.length > 0 ? field.title : fieldId,
+			description: typeof field.description === "string" ? field.description : "",
+			required: requiredSet.has(fieldId),
+			secure: isSecureElicitationField(request.message, fieldId, field),
+		});
+	}
+
+	return fields.length > 0 ? fields : null;
+}
+
 export function roundResultToElicitationContent(
 	questions: ParsedElicitationQuestion[],
 	result: RoundResult,
@@ -355,6 +428,52 @@ async function promptElicitationWithDialogs(
 	return { action: "accept", content };
 }
 
+function buildTextInputPromptTitle(request: SdkElicitationRequest, field: ParsedTextInputField): string {
+	const parts = [
+		request.serverName ? `[${request.serverName}]` : "",
+		field.title,
+		field.description,
+	].filter((part) => typeof part === "string" && part.trim().length > 0);
+	return parts.join("\n\n");
+}
+
+function buildTextInputPlaceholder(field: ParsedTextInputField): string | undefined {
+	const desc = field.description.trim();
+	if (!desc) return field.required ? "Required" : "Leave empty to skip";
+
+	const formatLine = desc
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.find((line) => /^format:/i.test(line));
+
+	if (!formatLine) return field.required ? "Required" : "Leave empty to skip";
+	const hint = formatLine.replace(/^format:\s*/i, "").trim();
+	return hint.length > 0 ? hint : field.required ? "Required" : "Leave empty to skip";
+}
+
+async function promptTextInputElicitation(
+	request: SdkElicitationRequest,
+	fields: ParsedTextInputField[],
+	ui: ExtensionUIContext,
+	signal: AbortSignal,
+): Promise<SdkElicitationResult> {
+	const content: Record<string, string | string[]> = {};
+
+	for (const field of fields) {
+		const value = await ui.input(
+			buildTextInputPromptTitle(request, field),
+			buildTextInputPlaceholder(field),
+			{ signal, ...(field.secure ? { secure: true } : {}) },
+		);
+		if (value === undefined) {
+			return { action: "cancel" };
+		}
+		content[field.id] = value;
+	}
+
+	return { action: "accept", content };
+}
+
 export function createClaudeCodeElicitationHandler(
 	ui: ExtensionUIContext | undefined,
 ): ((request: SdkElicitationRequest, options: { signal: AbortSignal }) => Promise<SdkElicitationResult>) | undefined {
@@ -366,19 +485,24 @@ export function createClaudeCodeElicitationHandler(
 		}
 
 		const questions = parseAskUserQuestionsElicitation(request);
-		if (!questions) {
-			return { action: "decline" };
+		if (questions) {
+			const interviewResult = await showInterviewRound(questions, { signal }, { ui } as any).catch(() => undefined);
+			if (interviewResult && Object.keys(interviewResult.answers).length > 0) {
+				return {
+					action: "accept",
+					content: roundResultToElicitationContent(questions, interviewResult),
+				};
+			}
+
+			return promptElicitationWithDialogs(request, questions, ui, signal);
 		}
 
-		const interviewResult = await showInterviewRound(questions, { signal }, { ui } as any).catch(() => undefined);
-		if (interviewResult && Object.keys(interviewResult.answers).length > 0) {
-			return {
-				action: "accept",
-				content: roundResultToElicitationContent(questions, interviewResult),
-			};
+		const textFields = parseTextInputElicitation(request);
+		if (textFields) {
+			return promptTextInputElicitation(request, textFields, ui, signal);
 		}
 
-		return promptElicitationWithDialogs(request, questions, ui, signal);
+		return { action: "decline" };
 	};
 }
 
@@ -508,15 +632,15 @@ export function extractToolResultsFromSdkUserMessage(message: SDKUserMessage): A
 	return extracted;
 }
 
-function attachExternalResultsToToolCalls(
-	toolCalls: AssistantMessage["content"],
+function attachExternalResultsToToolBlocks(
+	toolBlocks: AssistantMessage["content"],
 	toolResultsById: ReadonlyMap<string, ExternalToolResultPayload>,
 ): void {
-	for (const block of toolCalls) {
-		if (block.type !== "toolCall") continue;
+	for (const block of toolBlocks) {
+		if (block.type !== "toolCall" && block.type !== "serverToolUse") continue;
 		const externalResult = toolResultsById.get(block.id);
 		if (!externalResult) continue;
-		(block as ToolCallWithExternalResult).externalResult = externalResult;
+		(block as ToolCallWithExternalResult & { id: string }).externalResult = externalResult;
 	}
 }
 
@@ -554,8 +678,8 @@ async function pumpSdkMessages(
 	/** Track the last text content seen across all assistant turns for the final message. */
 	let lastTextContent = "";
 	let lastThinkingContent = "";
-	/** Collect tool calls from intermediate SDK turns for tool_execution events. */
-	const intermediateToolCalls: AssistantMessage["content"] = [];
+	/** Collect tool blocks from intermediate SDK turns for tool execution rendering. */
+	const intermediateToolBlocks: AssistantMessage["content"] = [];
 	/** Preserve real external tool results from Claude Code's synthetic user messages. */
 	const toolResultsById = new Map<string, ExternalToolResultPayload>();
 
@@ -666,9 +790,9 @@ async function pumpSdkMessages(
 								lastTextContent = block.text;
 							} else if (block.type === "thinking" && block.thinking) {
 								lastThinkingContent = block.thinking;
-							} else if (block.type === "toolCall") {
-								// Collect tool calls for externalToolExecution rendering
-								intermediateToolCalls.push(block);
+							} else if (block.type === "toolCall" || block.type === "serverToolUse") {
+								// Collect tool blocks for externalToolExecution rendering
+								intermediateToolBlocks.push(block);
 							}
 						}
 					}
@@ -678,24 +802,33 @@ async function pumpSdkMessages(
 					for (const { toolUseId, result } of extractToolResultsFromSdkUserMessage(msg as SDKUserMessage)) {
 						toolResultsById.set(toolUseId, result);
 					}
-					attachExternalResultsToToolCalls(intermediateToolCalls, toolResultsById);
+					attachExternalResultsToToolBlocks(intermediateToolBlocks, toolResultsById);
 
 					// Push a synthetic toolcall_end for each tool call from this turn
 					// so the TUI can render tool results in real-time during the SDK
 					// session instead of waiting until the entire session completes.
 					if (builder) {
 						for (const block of builder.message.content) {
-							if (block.type !== "toolCall") continue;
 							const extResult = (block as ToolCallWithExternalResult).externalResult;
 							if (!extResult) continue;
-							// Push a toolcall_end with result attached so the chat-controller
-							// can call updateResult on the pending ToolExecutionComponent.
-							stream.push({
-								type: "toolcall_end",
-								contentIndex: builder.message.content.indexOf(block),
-								toolCall: block,
-								partial: builder.message,
-							});
+							const contentIndex = builder.message.content.indexOf(block);
+							if (contentIndex < 0) continue;
+							// Push synthetic completion events with result attached so the
+							// chat-controller can update pending ToolExecutionComponents.
+							if (block.type === "toolCall") {
+								stream.push({
+									type: "toolcall_end",
+									contentIndex,
+									toolCall: block,
+									partial: builder.message,
+								});
+							} else if (block.type === "serverToolUse") {
+								stream.push({
+									type: "server_tool_use",
+									contentIndex,
+									partial: builder.message,
+								});
+							}
 						}
 					}
 
@@ -713,8 +846,8 @@ async function pumpSdkMessages(
 					const finalContent: AssistantMessage["content"] = [];
 
 					// Add tool calls from intermediate turns first (renders above text)
-					attachExternalResultsToToolCalls(intermediateToolCalls, toolResultsById);
-					finalContent.push(...intermediateToolCalls);
+					attachExternalResultsToToolBlocks(intermediateToolBlocks, toolResultsById);
+					finalContent.push(...intermediateToolBlocks);
 
 					// Add text/thinking from the last turn
 					if (builder && builder.message.content.length > 0) {

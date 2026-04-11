@@ -11,6 +11,7 @@ import {
 	extractToolResultsFromSdkUserMessage,
 	getClaudeLookupCommand,
 	parseAskUserQuestionsElicitation,
+	parseTextInputElicitation,
 	parseClaudeLookupOutput,
 	roundResultToElicitationContent,
 } from "../stream-adapter.ts";
@@ -513,6 +514,117 @@ describe("stream-adapter — MCP elicitation bridge", () => {
 				platform: ["Desktop", "Mobile"],
 			},
 		});
+	});
+
+	test("parseTextInputElicitation recognizes secure free-text MCP forms", () => {
+		const request = {
+			serverName: "gsd-workflow",
+			message: "Enter values for environment variables.",
+			mode: "form" as const,
+			requestedSchema: {
+				type: "object" as const,
+				properties: {
+					TEST_PASSWORD: {
+						type: "string",
+						title: "TEST_PASSWORD",
+						description: "Format: min 8 characters\nLeave empty to skip.",
+					},
+					PROJECT_NAME: {
+						type: "string",
+						title: "PROJECT_NAME",
+						description: "Human-readable project name.",
+					},
+				},
+			},
+		};
+
+		const parsed = parseTextInputElicitation(request as any);
+		assert.deepEqual(parsed, [
+			{
+				id: "TEST_PASSWORD",
+				title: "TEST_PASSWORD",
+				description: "Format: min 8 characters\nLeave empty to skip.",
+				required: false,
+				secure: true,
+			},
+			{
+				id: "PROJECT_NAME",
+				title: "PROJECT_NAME",
+				description: "Human-readable project name.",
+				required: false,
+				secure: false,
+			},
+		]);
+	});
+
+	test("parseTextInputElicitation accepts legacy keys schema and skips unsupported fields", () => {
+		const request = {
+			serverName: "gsd-workflow",
+			message: "Enter secure values",
+			mode: "form" as const,
+			requestedSchema: {
+				type: "object" as const,
+				keys: {
+					API_TOKEN: {
+						type: "string",
+						title: "API_TOKEN",
+						description: "Leave empty to skip.",
+					},
+					META: {
+						type: "object",
+						title: "metadata",
+					},
+				},
+			},
+		};
+
+		const parsed = parseTextInputElicitation(request as any);
+		assert.deepEqual(parsed, [
+			{
+				id: "API_TOKEN",
+				title: "API_TOKEN",
+				description: "Leave empty to skip.",
+				required: false,
+				secure: true,
+			},
+		]);
+	});
+
+	test("createClaudeCodeElicitationHandler collects secure_env_collect fields through input dialogs", async () => {
+		const secureRequest = {
+			serverName: "gsd-workflow",
+			message: "Enter values for environment variables.",
+			mode: "form" as const,
+			requestedSchema: {
+				type: "object" as const,
+				properties: {
+					TEST_PASSWORD: {
+						type: "string",
+						title: "TEST_PASSWORD",
+						description: "Format: Your secure testing password\nLeave empty to skip.",
+					},
+				},
+			},
+		};
+
+		const inputCalls: Array<{ opts?: { secure?: boolean } }> = [];
+		const handler = createClaudeCodeElicitationHandler({
+			input: async (_title: string, _placeholder?: string, opts?: { secure?: boolean }) => {
+				inputCalls.push({ opts });
+				return "super-secret";
+			},
+		} as any);
+		assert.ok(handler);
+
+		const result = await handler!(secureRequest as any, { signal: new AbortController().signal });
+		assert.deepEqual(result, {
+			action: "accept",
+			content: {
+				TEST_PASSWORD: "super-secret",
+			},
+		});
+		assert.equal(inputCalls.length, 1);
+		assert.equal(inputCalls[0]?.opts?.secure, true, "secure_env_collect fields should request secure input");
 	});
 });
 

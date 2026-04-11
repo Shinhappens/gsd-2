@@ -150,3 +150,71 @@ test("chat-controller keeps tool output ahead of delayed assistant text for exte
 	assert.equal(host.chatContainer.children[0]?.constructor?.name, "ToolExecutionComponent");
 	assert.equal(host.chatContainer.children[1]?.constructor?.name, "AssistantMessageComponent");
 });
+
+test("chat-controller keeps serverToolUse output ahead of assistant text when external results arrive", async () => {
+	(globalThis as any)[Symbol.for("@gsd/pi-coding-agent:theme")] = {
+		fg: (_key: string, text: string) => text,
+		bg: (_key: string, text: string) => text,
+		bold: (text: string) => text,
+		italic: (text: string) => text,
+		truncate: (text: string) => text,
+	};
+
+	const host = createHost();
+	const toolId = "mcp-secure-1";
+	const serverToolUse = {
+		type: "serverToolUse",
+		id: toolId,
+		name: "mcp__gsd-workflow__secure_env_collect",
+		input: { projectDir: "/tmp/project", keys: [{ key: "SECURE_PASSWORD" }], destination: "dotenv" },
+	};
+
+	await handleAgentEvent(host, { type: "message_start", message: makeAssistant([]) } as any);
+
+	await handleAgentEvent(
+		host,
+		{
+			type: "message_update",
+			message: makeAssistant([serverToolUse]),
+			assistantMessageEvent: {
+				type: "server_tool_use",
+				contentIndex: 0,
+				partial: makeAssistant([serverToolUse]),
+			},
+		} as any,
+	);
+
+	assert.equal(host.streamingComponent, undefined, "assistant content should stay deferred while only tool content streams");
+	assert.equal(host.chatContainer.children.length, 1, "server tool block should render immediately");
+	assert.equal(host.chatContainer.children[0]?.constructor?.name, "ToolExecutionComponent");
+
+	host.getMarkdownThemeWithSettings = () => ({});
+	const resultMessage = makeAssistant([
+		{
+			...serverToolUse,
+			externalResult: {
+				content: [{ type: "text", text: "secure_env_collect was cancelled by user." }],
+				details: {},
+				isError: true,
+			},
+		},
+		{ type: "text", text: "The secure password collection was cancelled." },
+	]);
+
+	await handleAgentEvent(
+		host,
+		{
+			type: "message_update",
+			message: resultMessage,
+			assistantMessageEvent: {
+				type: "server_tool_use",
+				contentIndex: 0,
+				partial: resultMessage,
+			},
+		} as any,
+	);
+
+	assert.equal(host.chatContainer.children.length, 2, "assistant text should render after existing server tool output");
+	assert.equal(host.chatContainer.children[0]?.constructor?.name, "ToolExecutionComponent");
+	assert.equal(host.chatContainer.children[1]?.constructor?.name, "AssistantMessageComponent");
+});

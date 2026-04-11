@@ -129,19 +129,6 @@ export async function handleAgentEvent(host: InteractiveModeStateHost & {
 				host.streamingMessage = event.message;
 				const innerEvent = event.assistantMessageEvent;
 
-				if (!host.streamingComponent && hasVisibleAssistantContent(host.streamingMessage)) {
-					host.streamingComponent = new AssistantMessageComponent(
-						undefined,
-						host.hideThinkingBlock,
-						host.getMarkdownThemeWithSettings(),
-						host.settingsManager.getTimestampFormat(),
-					);
-					host.chatContainer.addChild(host.streamingComponent);
-				}
-				if (host.streamingComponent) {
-					host.streamingComponent.updateContent(host.streamingMessage);
-				}
-
 				let externalToolResult:
 					| { toolCallId: string; content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>; details: Record<string, unknown>; isError: boolean }
 					| undefined;
@@ -151,6 +138,18 @@ export async function handleAgentEvent(host: InteractiveModeStateHost & {
 					if (ext) {
 						externalToolResult = {
 							toolCallId: tc.id,
+							content: ext.content ?? [{ type: "text", text: "" }],
+							details: ext.details ?? {},
+							isError: ext.isError ?? false,
+						};
+					}
+				} else if (innerEvent.type === "server_tool_use") {
+					const idx = typeof innerEvent.contentIndex === "number" ? innerEvent.contentIndex : -1;
+					const block = idx >= 0 ? (host.streamingMessage.content[idx] as any) : undefined;
+					const ext = block?.externalResult;
+					if (block?.id && ext) {
+						externalToolResult = {
+							toolCallId: block.id,
 							content: ext.content ?? [{ type: "text", text: "" }],
 							details: ext.details ?? {},
 							isError: ext.isError ?? false,
@@ -228,6 +227,26 @@ export async function handleAgentEvent(host: InteractiveModeStateHost & {
 							isError: externalToolResult.isError,
 						});
 					}
+				}
+
+				// Render assistant text/thinking after tool components so mixed
+				// streams keep chronological ordering in the chat container.
+				const hasToolBlocks = hasAssistantToolBlocks(host.streamingMessage);
+				if (!host.streamingComponent && hasVisibleAssistantContent(host.streamingMessage)) {
+					host.streamingComponent = new AssistantMessageComponent(
+						undefined,
+						host.hideThinkingBlock,
+						host.getMarkdownThemeWithSettings(),
+						host.settingsManager.getTimestampFormat(),
+					);
+					host.chatContainer.addChild(host.streamingComponent);
+				}
+				if (host.streamingComponent) {
+					if (hasToolBlocks) {
+						host.chatContainer.removeChild(host.streamingComponent);
+						host.chatContainer.addChild(host.streamingComponent);
+					}
+					host.streamingComponent.updateContent(host.streamingMessage);
 				}
 
 				// Update index: fully processed blocks won't need re-scanning.
