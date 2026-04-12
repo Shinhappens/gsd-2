@@ -2,8 +2,9 @@
  * MCP Server — registers GSD orchestration, project-state, and workflow tools.
  *
  * Session tools (6): gsd_execute, gsd_status, gsd_result, gsd_cancel, gsd_query, gsd_resolve_blocker
+ * Interactive tools (2): ask_user_questions, secure_env_collect via MCP form elicitation
  * Read-only tools (6): gsd_progress, gsd_roadmap, gsd_history, gsd_doctor, gsd_captures, gsd_knowledge
- * Workflow tools (17): planning, replanning, completion, validation, reassessment, gate result, and milestone status tools
+ * Workflow tools (29): headless-safe planning, metadata persistence, replanning, completion, validation, reassessment, gate result, status, and journal tools
  *
  * Uses dynamic imports for @modelcontextprotocol/sdk because TS Node16
  * cannot resolve the SDK's subpath exports statically (same pattern as
@@ -21,6 +22,7 @@ import { readCaptures } from './readers/captures.js';
 import { readKnowledge } from './readers/knowledge.js';
 import { runDoctorLite } from './readers/doctor-lite.js';
 import { registerWorkflowTools } from './workflow-tools.js';
+import { applySecrets, checkExistingEnvKeys, detectDestination } from './env-writer.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -42,6 +44,11 @@ function jsonContent(data: unknown): { content: Array<{ type: 'text'; text: stri
 /** Return an MCP error response. */
 function errorContent(message: string): { isError: true; content: Array<{ type: 'text'; text: string }> } {
   return { isError: true, content: [{ type: 'text' as const, text: message }] };
+}
+
+/** Return raw text content without JSON wrapping. */
+function textContent(text: string): { content: Array<{ type: 'text'; text: string }> } {
+  return { content: [{ type: 'text' as const, text }] };
 }
 
 // ---------------------------------------------------------------------------
@@ -106,10 +113,170 @@ async function fileExists(path: string): Promise<boolean> {
 // MCP Server type — minimal interface for the dynamically-imported McpServer
 // ---------------------------------------------------------------------------
 
+interface ElicitResult {
+  action: 'accept' | 'decline' | 'cancel';
+  content?: Record<string, string | number | boolean | string[]>;
+}
+
+interface ElicitRequestFormParams {
+  mode?: 'form';
+  message: string;
+  requestedSchema: {
+    type: 'object';
+    properties: Record<string, Record<string, unknown>>;
+    required?: string[];
+  };
+}
+
 interface McpServerInstance {
   tool(name: string, description: string, params: Record<string, unknown>, handler: (args: Record<string, unknown>) => Promise<unknown>): unknown;
+  server: {
+    elicitInput(
+      params: AskUserQuestionsElicitRequest | ElicitRequestFormParams,
+      options?: unknown,
+    ): Promise<AskUserQuestionsElicitResult>;
+  };
   connect(transport: unknown): Promise<void>;
   close(): Promise<void>;
+}
+
+interface AskUserQuestionOption {
+  label: string;
+  description: string;
+}
+
+interface AskUserQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: AskUserQuestionOption[];
+  allowMultiple?: boolean;
+}
+
+interface AskUserQuestionsParams {
+  questions: AskUserQuestion[];
+}
+
+type AskUserQuestionsContentValue = string | number | boolean | string[];
+
+interface AskUserQuestionsElicitResult {
+  action: 'accept' | 'decline' | 'cancel';
+  content?: Record<string, AskUserQuestionsContentValue>;
+}
+
+interface AskUserQuestionsElicitRequest {
+  mode: 'form';
+  message: string;
+  requestedSchema: {
+    type: 'object';
+    properties: Record<string, Record<string, unknown>>;
+    required?: string[];
+  };
+}
+
+const OTHER_OPTION_LABEL = 'None of the above';
+
+function normalizeAskUserQuestionsNote(value: AskUserQuestionsContentValue | undefined): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeAskUserQuestionsAnswers(
+  value: AskUserQuestionsContentValue | undefined,
+  allowMultiple: boolean,
+): string[] {
+  if (allowMultiple) {
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  }
+
+  return typeof value === 'string' && value.length > 0 ? [value] : [];
+}
+
+function validateAskUserQuestionsPayload(questions: AskUserQuestion[]): string | null {
+  if (questions.length === 0 || questions.length > 3) {
+    return 'Error: questions must contain 1-3 items';
+  }
+
+  for (const question of questions) {
+    if (!question.options || question.options.length === 0) {
+      return `Error: ask_user_questions requires non-empty options for every question (question "${question.id}" has none)`;
+    }
+  }
+
+  return null;
+}
+
+export function buildAskUserQuestionsElicitRequest(questions: AskUserQuestion[]): AskUserQuestionsElicitRequest {
+  const properties: Record<string, Record<string, unknown>> = {};
+  const required = questions.map((question) => question.id);
+
+  for (const question of questions) {
+    if (question.allowMultiple) {
+      properties[question.id] = {
+        type: 'array',
+        title: question.header,
+        description: question.question,
+        minItems: 1,
+        maxItems: question.options.length,
+        items: {
+          anyOf: question.options.map((option) => ({
+            const: option.label,
+            title: option.label,
+          })),
+        },
+      };
+      continue;
+    }
+
+    properties[question.id] = {
+      type: 'string',
+      title: question.header,
+      description: question.question,
+      oneOf: [...question.options, { label: OTHER_OPTION_LABEL, description: 'Choose this when the listed options do not fit.' }].map((option) => ({
+        const: option.label,
+        title: option.label,
+      })),
+    };
+
+    properties[`${question.id}__note`] = {
+      type: 'string',
+      title: `${question.header} Note`,
+      description: `Optional note for "${OTHER_OPTION_LABEL}".`,
+      maxLength: 500,
+    };
+  }
+
+  return {
+    mode: 'form',
+    message: 'Please answer the following question(s). For single-select questions, choose "None of the above" and add a note if the provided options do not fit.',
+    requestedSchema: {
+      type: 'object',
+      properties,
+      required,
+    },
+  };
+}
+
+export function formatAskUserQuestionsElicitResult(
+  questions: AskUserQuestion[],
+  result: AskUserQuestionsElicitResult,
+): string {
+  const answers: Record<string, { answers: string[] }> = {};
+  const content = result.content ?? {};
+
+  for (const question of questions) {
+    const answerList = normalizeAskUserQuestionsAnswers(content[question.id], !!question.allowMultiple);
+
+    if (!question.allowMultiple && answerList[0] === OTHER_OPTION_LABEL) {
+      const note = normalizeAskUserQuestionsNote(content[`${question.id}__note`]);
+      if (note) {
+        answerList.push(`user_note: ${note}`);
+      }
+    }
+
+    answers[question.id] = { answers: answerList };
+  }
+
+  return JSON.stringify({ answers });
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +298,7 @@ export async function createMcpServer(sessionManager: SessionManager): Promise<{
 
   const server: McpServerInstance = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
-    { capabilities: { tools: {} } },
+    { capabilities: { tools: {}, elicitation: {} } },
   );
 
   // -----------------------------------------------------------------------
@@ -279,6 +446,160 @@ export async function createMcpServer(sessionManager: SessionManager): Promise<{
       try {
         await sessionManager.resolveBlocker(sessionId, response);
         return jsonContent({ resolved: true });
+      } catch (err) {
+        return errorContent(err instanceof Error ? err.message : String(err));
+      }
+    },
+  );
+
+  // -----------------------------------------------------------------------
+  // ask_user_questions — structured user input via MCP form elicitation
+  // -----------------------------------------------------------------------
+  server.tool(
+    'ask_user_questions',
+    'Request user input for one to three short questions and wait for the response. Single-select questions include a free-form "None of the above" path. Multi-select questions allow multiple choices.',
+    {
+      questions: z.array(z.object({
+        id: z.string().describe('Stable identifier for mapping answers (snake_case)'),
+        header: z.string().describe('Short header label shown in the UI (12 or fewer chars)'),
+        question: z.string().describe('Single-sentence prompt shown to the user'),
+        options: z.array(z.object({
+          label: z.string().describe('User-facing label (1-5 words)'),
+          description: z.string().describe('One short sentence explaining impact/tradeoff if selected'),
+        })).describe('Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with "(Recommended)". Do not include an "Other" option for single-select questions.'),
+        allowMultiple: z.boolean().optional().describe('If true, the user can select multiple options. No "None of the above" option is added.'),
+      })).describe('Questions to show the user. Prefer 1 and do not exceed 3.'),
+    },
+    async (args: Record<string, unknown>) => {
+      const { questions } = args as unknown as AskUserQuestionsParams;
+      try {
+        const validationError = validateAskUserQuestionsPayload(questions);
+        if (validationError) return errorContent(validationError);
+
+        const elicitation = await server.server.elicitInput(buildAskUserQuestionsElicitRequest(questions));
+        if (elicitation.action !== 'accept' || !elicitation.content) {
+          return textContent('ask_user_questions was cancelled before receiving a response');
+        }
+
+        return textContent(formatAskUserQuestionsElicitResult(questions, elicitation));
+      } catch (err) {
+        return errorContent(err instanceof Error ? err.message : String(err));
+      }
+    },
+  );
+
+  // -----------------------------------------------------------------------
+  // secure_env_collect — collect secrets via MCP form elicitation
+  // -----------------------------------------------------------------------
+  server.tool(
+    'secure_env_collect',
+    'Collect environment variables securely via form input. Values are written directly to .env (or Vercel/Convex) and NEVER appear in tool output — only key names and applied/skipped status are returned. Use this instead of asking users to manually edit .env files or paste secrets into chat.',
+    {
+      projectDir: z.string().describe('Absolute path to the project directory'),
+      keys: z.array(z.object({
+        key: z.string().describe('Env var name, e.g. OPENAI_API_KEY'),
+        hint: z.string().optional().describe('Format hint shown to user, e.g. "starts with sk-"'),
+        guidance: z.array(z.string()).optional().describe('Step-by-step instructions for obtaining this key'),
+      })).min(1).describe('Environment variables to collect'),
+      destination: z.enum(['dotenv', 'vercel', 'convex']).optional().describe('Where to write secrets. Auto-detected from project files if omitted.'),
+      envFilePath: z.string().optional().describe('Path to .env file (dotenv only). Defaults to .env in projectDir.'),
+      environment: z.enum(['development', 'preview', 'production']).optional().describe('Target environment (vercel/convex only)'),
+    },
+    async (args: Record<string, unknown>) => {
+      const { projectDir, keys, destination, envFilePath, environment } = args as {
+        projectDir: string;
+        keys: Array<{ key: string; hint?: string; guidance?: string[] }>;
+        destination?: 'dotenv' | 'vercel' | 'convex';
+        envFilePath?: string;
+        environment?: 'development' | 'preview' | 'production';
+      };
+
+      try {
+        const resolvedProjectDir = resolve(projectDir);
+        const resolvedEnvPath = resolve(resolvedProjectDir, envFilePath ?? '.env');
+
+        // (1) Check which keys already exist
+        const allKeyNames = keys.map((k) => k.key);
+        const existingKeys = await checkExistingEnvKeys(allKeyNames, resolvedEnvPath);
+        const existingSet = new Set(existingKeys);
+        const pendingKeys = keys.filter((k) => !existingSet.has(k.key));
+
+        // If all keys already exist, return immediately
+        if (pendingKeys.length === 0) {
+          const lines = existingKeys.map((k) => `• ${k}: already set`);
+          return textContent(`All ${existingKeys.length} key(s) already set.\n${lines.join('\n')}`);
+        }
+
+        // (2) Build elicitation form — one string field per pending key
+        const properties: Record<string, Record<string, unknown>> = {};
+        const required: string[] = [];
+
+        for (const item of pendingKeys) {
+          const descParts: string[] = [];
+          if (item.hint) descParts.push(`Format: ${item.hint}`);
+          if (item.guidance && item.guidance.length > 0) {
+            descParts.push('How to get this:');
+            item.guidance.forEach((step, i) => descParts.push(`${i + 1}. ${step}`));
+          }
+          descParts.push('Leave empty to skip.');
+
+          properties[item.key] = {
+            type: 'string',
+            title: item.key,
+            description: descParts.join('\n'),
+          };
+          // Don't mark as required — empty string = skip
+        }
+
+        // (3) Elicit input from the MCP client
+        const elicitation = await server.server.elicitInput({
+          message: `Enter values for ${pendingKeys.length} environment variable(s). Values are written directly to the project and never shown to the AI.`,
+          requestedSchema: {
+            type: 'object',
+            properties,
+            required,
+          },
+        });
+
+        if (elicitation.action !== 'accept' || !elicitation.content) {
+          return textContent('secure_env_collect was cancelled by user.');
+        }
+
+        // (4) Separate provided vs skipped from form response
+        const provided: Array<{ key: string; value: string }> = [];
+        const skipped: string[] = [];
+
+        for (const item of pendingKeys) {
+          const raw = elicitation.content[item.key];
+          const value = typeof raw === 'string' ? raw.trim() : '';
+          if (value.length > 0) {
+            provided.push({ key: item.key, value });
+          } else {
+            skipped.push(item.key);
+          }
+        }
+
+        // (5) Auto-detect destination if not specified
+        const resolvedDestination = destination ?? detectDestination(resolvedProjectDir);
+
+        // (6) Write secrets to destination
+        const { applied, errors } = await applySecrets(provided, resolvedDestination, {
+          envFilePath: resolvedEnvPath,
+          environment,
+        });
+
+        // (7) Build result — NEVER include secret values
+        const lines: string[] = [
+          `destination: ${resolvedDestination}${!destination ? ' (auto-detected)' : ''}${environment ? ` (${environment})` : ''}`,
+        ];
+        for (const k of applied) lines.push(`✓ ${k}: applied`);
+        for (const k of skipped) lines.push(`• ${k}: skipped`);
+        for (const k of existingKeys) lines.push(`• ${k}: already set`);
+        for (const e of errors) lines.push(`✗ ${e}`);
+
+        return errors.length > 0 && applied.length === 0
+          ? errorContent(lines.join('\n'))
+          : textContent(lines.join('\n'));
       } catch (err) {
         return errorContent(err instanceof Error ? err.message : String(err));
       }

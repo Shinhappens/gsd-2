@@ -16,10 +16,12 @@ import type {
 	SimpleStreamOptions,
 	ToolCall,
 } from "@gsd/pi-ai";
+import type { ExtensionUIContext } from "@gsd/pi-coding-agent";
 import { EventStream } from "@gsd/pi-ai";
 import { execSync } from "node:child_process";
 import { PartialMessageBuilder, ZERO_USAGE, mapUsage } from "./partial-builder.js";
 import { buildWorkflowMcpServers } from "../gsd/workflow-mcp.js";
+import { showInterviewRound, type Question, type RoundResult } from "../shared/tui.js";
 import type {
 	SDKAssistantMessage,
 	SDKMessage,
@@ -44,6 +46,58 @@ export interface ExternalToolResultPayload {
 type ToolCallWithExternalResult = ToolCall & {
 	externalResult?: ExternalToolResultPayload;
 };
+
+interface ClaudeCodeStreamOptions extends SimpleStreamOptions {
+	extensionUIContext?: ExtensionUIContext;
+}
+
+interface SdkElicitationRequestOption {
+	const?: string;
+	title?: string;
+}
+
+interface SdkElicitationFieldSchema {
+	type?: string;
+	title?: string;
+	description?: string;
+	format?: string;
+	writeOnly?: boolean;
+	oneOf?: SdkElicitationRequestOption[];
+	items?: {
+		anyOf?: SdkElicitationRequestOption[];
+	};
+}
+
+interface SdkElicitationRequest {
+	serverName: string;
+	message: string;
+	mode?: "form" | "url";
+	requestedSchema?: {
+		type?: string;
+		properties?: Record<string, SdkElicitationFieldSchema>;
+		required?: string[];
+	};
+}
+
+interface SdkElicitationResult {
+	action: "accept" | "decline" | "cancel";
+	content?: Record<string, string | string[]>;
+}
+
+interface ParsedElicitationQuestion extends Question {
+	noteFieldId?: string;
+}
+
+interface ParsedTextInputField {
+	id: string;
+	title: string;
+	description: string;
+	required: boolean;
+	secure: boolean;
+}
+
+const OTHER_OPTION_LABEL = "None of the above";
+const SENSITIVE_FIELD_PATTERN = /(password|passphrase|secret|token|api[_\s-]*key|private[_\s-]*key|credential)/i;
 
 // ---------------------------------------------------------------------------
 // Stream factory
@@ -172,6 +226,286 @@ export function makeStreamExhaustedErrorMessage(model: string, lastTextContent: 
 	return message;
 }
 
+function readElicitationChoices(options: SdkElicitationRequestOption[] | undefined): string[] {
+	if (!Array.isArray(options)) return [];
+	return options
+		.map((option) => (typeof option?.const === "string" ? option.const : typeof option?.title === "string" ? option.title : ""))
+		.filter((option): option is string => option.length > 0);
+}
+
+export function parseAskUserQuestionsElicitation(
+	request: Pick<SdkElicitationRequest, "mode" | "requestedSchema">,
+): ParsedElicitationQuestion[] | null {
+	if (request.mode && request.mode !== "form") return null;
+	const properties = request.requestedSchema?.properties;
+	if (!properties || typeof properties !== "object") return null;
+
+	const questions: ParsedElicitationQuestion[] = [];
+
+	for (const [fieldId, rawField] of Object.entries(properties)) {
+		if (fieldId.endsWith("__note")) continue;
+		if (!rawField || typeof rawField !== "object") return null;
+
+		const header = typeof rawField.title === "string" && rawField.title.length > 0 ? rawField.title : fieldId;
+		const question = typeof rawField.description === "string" ? rawField.description : "";
+
+		if (rawField.type === "array") {
+			const options = readElicitationChoices(rawField.items?.anyOf).map((label) => ({ label, description: "" }));
+			if (options.length === 0) return null;
+			questions.push({
+				id: fieldId,
+				header,
+				question,
+				options,
+				allowMultiple: true,
+			});
+			continue;
+		}
+
+		if (rawField.type === "string") {
+			const noteFieldId = Object.prototype.hasOwnProperty.call(properties, `${fieldId}__note`)
+				? `${fieldId}__note`
+				: undefined;
+			const options = readElicitationChoices(rawField.oneOf)
+				.filter((label) => label !== OTHER_OPTION_LABEL)
+				.map((label) => ({ label, description: "" }));
+			if (options.length === 0) return null;
+			questions.push({
+				id: fieldId,
+				header,
+				question,
+				options,
+				noteFieldId,
+			});
+			continue;
+		}
+
+		return null;
+	}
+
+	return questions.length > 0 ? questions : null;
+}
+
+function isSecureElicitationField(
+	requestMessage: string,
+	fieldId: string,
+	field: SdkElicitationFieldSchema,
+): boolean {
+	if (field.format === "password") return true;
+	if (field.writeOnly === true) return true;
+
+	const rawField = field as Record<string, unknown>;
+	if (rawField.sensitive === true || rawField["x-sensitive"] === true) return true;
+
+	const haystack = [
+		requestMessage,
+		fieldId.replace(/[_-]+/g, " "),
+		typeof field.title === "string" ? field.title : "",
+		typeof field.description === "string" ? field.description : "",
+	]
+		.join(" ")
+		.toLowerCase();
+
+	return SENSITIVE_FIELD_PATTERN.test(haystack);
+}
+
+export function parseTextInputElicitation(
+	request: Pick<SdkElicitationRequest, "message" | "mode" | "requestedSchema">,
+): ParsedTextInputField[] | null {
+	if (request.mode && request.mode !== "form") return null;
+	const schema = request.requestedSchema as
+		| ({ properties?: Record<string, SdkElicitationFieldSchema>; keys?: Record<string, SdkElicitationFieldSchema> } & Record<string, unknown>)
+		| undefined;
+	const fieldsSource = schema?.properties && typeof schema.properties === "object"
+		? schema.properties
+		: schema?.keys && typeof schema.keys === "object"
+			? schema.keys
+			: undefined;
+	if (!fieldsSource) return null;
+
+	const requiredSet = new Set(
+		Array.isArray(request.requestedSchema?.required)
+			? request.requestedSchema.required.filter((value): value is string => typeof value === "string")
+			: [],
+	);
+
+	const fields: ParsedTextInputField[] = [];
+	for (const [fieldId, field] of Object.entries(fieldsSource)) {
+		if (!field || typeof field !== "object") continue;
+		if (field.type !== "string") continue;
+		if (Array.isArray(field.oneOf) && field.oneOf.length > 0) continue;
+
+		fields.push({
+			id: fieldId,
+			title: typeof field.title === "string" && field.title.length > 0 ? field.title : fieldId,
+			description: typeof field.description === "string" ? field.description : "",
+			required: requiredSet.has(fieldId),
+			secure: isSecureElicitationField(request.message, fieldId, field),
+		});
+	}
+
+	return fields.length > 0 ? fields : null;
+}
+
+export function roundResultToElicitationContent(
+	questions: ParsedElicitationQuestion[],
+	result: RoundResult,
+): Record<string, string | string[]> {
+	const content: Record<string, string | string[]> = {};
+
+	for (const question of questions) {
+		const answer = result.answers[question.id];
+		if (!answer) continue;
+
+		if (question.allowMultiple) {
+			const selected = Array.isArray(answer.selected) ? answer.selected : [answer.selected];
+			content[question.id] = selected;
+			continue;
+		}
+
+		const selected = Array.isArray(answer.selected) ? answer.selected[0] ?? "" : answer.selected;
+		content[question.id] = selected;
+		if (question.noteFieldId && selected === OTHER_OPTION_LABEL && answer.notes.trim().length > 0) {
+			content[question.noteFieldId] = answer.notes.trim();
+		}
+	}
+
+	return content;
+}
+
+function buildElicitationPromptTitle(request: SdkElicitationRequest, question: ParsedElicitationQuestion): string {
+	const parts = [
+		request.serverName ? `[${request.serverName}]` : "",
+		question.header,
+		question.question,
+	].filter((part) => part && part.trim().length > 0);
+	return parts.join("\n\n");
+}
+
+async function promptElicitationWithDialogs(
+	request: SdkElicitationRequest,
+	questions: ParsedElicitationQuestion[],
+	ui: ExtensionUIContext,
+	signal: AbortSignal,
+): Promise<SdkElicitationResult> {
+	const content: Record<string, string | string[]> = {};
+
+	for (const question of questions) {
+		const title = buildElicitationPromptTitle(request, question);
+
+		if (question.allowMultiple) {
+			const selected = await ui.select(title, question.options.map((option) => option.label), {
+				allowMultiple: true,
+				signal,
+			});
+			if (Array.isArray(selected)) {
+				if (selected.length === 0) return { action: "cancel" };
+				content[question.id] = selected;
+				continue;
+			}
+			if (typeof selected === "string" && selected.length > 0) {
+				content[question.id] = [selected];
+				continue;
+			}
+			return { action: "cancel" };
+		}
+
+		const selected = await ui.select(title, [...question.options.map((option) => option.label), OTHER_OPTION_LABEL], { signal });
+		if (typeof selected !== "string" || selected.length === 0) {
+			return { action: "cancel" };
+		}
+
+		content[question.id] = selected;
+		if (question.noteFieldId && selected === OTHER_OPTION_LABEL) {
+			const note = await ui.input(`${question.header} note`, "Explain your answer", { signal });
+			if (note === undefined) return { action: "cancel" };
+			if (note.trim().length > 0) {
+				content[question.noteFieldId] = note.trim();
+			}
+		}
+	}
+
+	return { action: "accept", content };
+}
+
+function buildTextInputPromptTitle(request: SdkElicitationRequest, field: ParsedTextInputField): string {
+	const parts = [
+		request.serverName ? `[${request.serverName}]` : "",
+		field.title,
+		field.description,
+	].filter((part) => typeof part === "string" && part.trim().length > 0);
+	return parts.join("\n\n");
+}
+
+function buildTextInputPlaceholder(field: ParsedTextInputField): string | undefined {
+	const desc = field.description.trim();
+	if (!desc) return field.required ? "Required" : "Leave empty to skip";
+
+	const formatLine = desc
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.find((line) => /^format:/i.test(line));
+
+	if (!formatLine) return field.required ? "Required" : "Leave empty to skip";
+	const hint = formatLine.replace(/^format:\s*/i, "").trim();
+	return hint.length > 0 ? hint : field.required ? "Required" : "Leave empty to skip";
+}
+
+async function promptTextInputElicitation(
+	request: SdkElicitationRequest,
+	fields: ParsedTextInputField[],
+	ui: ExtensionUIContext,
+	signal: AbortSignal,
+): Promise<SdkElicitationResult> {
+	const content: Record<string, string | string[]> = {};
+
+	for (const field of fields) {
+		const value = await ui.input(
+			buildTextInputPromptTitle(request, field),
+			buildTextInputPlaceholder(field),
+			{ signal, ...(field.secure ? { secure: true } : {}) },
+		);
+		if (value === undefined) {
+			return { action: "cancel" };
+		}
+		content[field.id] = value;
+	}
+
+	return { action: "accept", content };
+}
+
+export function createClaudeCodeElicitationHandler(
+	ui: ExtensionUIContext | undefined,
+): ((request: SdkElicitationRequest, options: { signal: AbortSignal }) => Promise<SdkElicitationResult>) | undefined {
+	if (!ui) return undefined;
+
+	return async (request, { signal }) => {
+		if (request.mode === "url") {
+			return { action: "decline" };
+		}
+
+		const questions = parseAskUserQuestionsElicitation(request);
+		if (questions) {
+			const interviewResult = await showInterviewRound(questions, { signal }, { ui } as any).catch(() => undefined);
+			if (interviewResult && Object.keys(interviewResult.answers).length > 0) {
+				return {
+					action: "accept",
+					content: roundResultToElicitationContent(questions, interviewResult),
+				};
+			}
+
+			return promptElicitationWithDialogs(request, questions, ui, signal);
+		}
+
+		const textFields = parseTextInputElicitation(request);
+		if (textFields) {
+			return promptTextInputElicitation(request, textFields, ui, signal);
+		}
+
+		return { action: "decline" };
+	};
+}
+
 // ---------------------------------------------------------------------------
 // SDK options builder
 // ---------------------------------------------------------------------------
@@ -182,8 +516,13 @@ export function makeStreamExhaustedErrorMessage(model: string, lastTextContent: 
  * Extracted for testability — callers can verify session persistence,
  * beta flags, and other configuration without mocking the full SDK.
  */
-export function buildSdkOptions(modelId: string, prompt: string): Record<string, unknown> {
+export function buildSdkOptions(
+	modelId: string,
+	prompt: string,
+	extraOptions: Record<string, unknown> = {},
+): Record<string, unknown> {
 	const mcpServers = buildWorkflowMcpServers();
+	const disallowedTools = ["AskUserQuestion"];
 	return {
 		pathToClaudeCodeExecutable: getClaudePath(),
 		model: modelId,
@@ -194,8 +533,10 @@ export function buildSdkOptions(modelId: string, prompt: string): Record<string,
 		allowDangerouslySkipPermissions: true,
 		settingSources: ["project"],
 		systemPrompt: { type: "preset", preset: "claude_code" },
+		disallowedTools,
 		...(mcpServers ? { mcpServers } : {}),
 		betas: modelId.includes("sonnet") ? ["context-1m-2025-08-07"] : [],
+		...extraOptions,
 	};
 }
 
@@ -291,15 +632,15 @@ export function extractToolResultsFromSdkUserMessage(message: SDKUserMessage): A
 	return extracted;
 }
 
-function attachExternalResultsToToolCalls(
-	toolCalls: AssistantMessage["content"],
+function attachExternalResultsToToolBlocks(
+	toolBlocks: AssistantMessage["content"],
 	toolResultsById: ReadonlyMap<string, ExternalToolResultPayload>,
 ): void {
-	for (const block of toolCalls) {
-		if (block.type !== "toolCall") continue;
+	for (const block of toolBlocks) {
+		if (block.type !== "toolCall" && block.type !== "serverToolUse") continue;
 		const externalResult = toolResultsById.get(block.id);
 		if (!externalResult) continue;
-		(block as ToolCallWithExternalResult).externalResult = externalResult;
+		(block as ToolCallWithExternalResult & { id: string }).externalResult = externalResult;
 	}
 }
 
@@ -337,8 +678,8 @@ async function pumpSdkMessages(
 	/** Track the last text content seen across all assistant turns for the final message. */
 	let lastTextContent = "";
 	let lastThinkingContent = "";
-	/** Collect tool calls from intermediate SDK turns for tool_execution events. */
-	const intermediateToolCalls: AssistantMessage["content"] = [];
+	/** Collect tool blocks from intermediate SDK turns for tool execution rendering. */
+	const intermediateToolBlocks: AssistantMessage["content"] = [];
 	/** Preserve real external tool results from Claude Code's synthetic user messages. */
 	const toolResultsById = new Map<string, ExternalToolResultPayload>();
 
@@ -359,7 +700,17 @@ async function pumpSdkMessages(
 		}
 
 		const prompt = buildPromptFromContext(context);
-		const sdkOpts = buildSdkOptions(modelId, prompt);
+		const sdkOpts = buildSdkOptions(
+			modelId,
+			prompt,
+			typeof (options as ClaudeCodeStreamOptions | undefined)?.extensionUIContext === "object"
+				? {
+						onElicitation: createClaudeCodeElicitationHandler(
+							(options as ClaudeCodeStreamOptions | undefined)?.extensionUIContext,
+						),
+					}
+				: {},
+		);
 
 		const queryResult = sdk.query({
 			prompt,
@@ -439,9 +790,9 @@ async function pumpSdkMessages(
 								lastTextContent = block.text;
 							} else if (block.type === "thinking" && block.thinking) {
 								lastThinkingContent = block.thinking;
-							} else if (block.type === "toolCall") {
-								// Collect tool calls for externalToolExecution rendering
-								intermediateToolCalls.push(block);
+							} else if (block.type === "toolCall" || block.type === "serverToolUse") {
+								// Collect tool blocks for externalToolExecution rendering
+								intermediateToolBlocks.push(block);
 							}
 						}
 					}
@@ -451,24 +802,33 @@ async function pumpSdkMessages(
 					for (const { toolUseId, result } of extractToolResultsFromSdkUserMessage(msg as SDKUserMessage)) {
 						toolResultsById.set(toolUseId, result);
 					}
-					attachExternalResultsToToolCalls(intermediateToolCalls, toolResultsById);
+					attachExternalResultsToToolBlocks(intermediateToolBlocks, toolResultsById);
 
 					// Push a synthetic toolcall_end for each tool call from this turn
 					// so the TUI can render tool results in real-time during the SDK
 					// session instead of waiting until the entire session completes.
 					if (builder) {
 						for (const block of builder.message.content) {
-							if (block.type !== "toolCall") continue;
 							const extResult = (block as ToolCallWithExternalResult).externalResult;
 							if (!extResult) continue;
-							// Push a toolcall_end with result attached so the chat-controller
-							// can call updateResult on the pending ToolExecutionComponent.
-							stream.push({
-								type: "toolcall_end",
-								contentIndex: builder.message.content.indexOf(block),
-								toolCall: block,
-								partial: builder.message,
-							});
+							const contentIndex = builder.message.content.indexOf(block);
+							if (contentIndex < 0) continue;
+							// Push synthetic completion events with result attached so the
+							// chat-controller can update pending ToolExecutionComponents.
+							if (block.type === "toolCall") {
+								stream.push({
+									type: "toolcall_end",
+									contentIndex,
+									toolCall: block,
+									partial: builder.message,
+								});
+							} else if (block.type === "serverToolUse") {
+								stream.push({
+									type: "server_tool_use",
+									contentIndex,
+									partial: builder.message,
+								});
+							}
 						}
 					}
 
@@ -486,8 +846,8 @@ async function pumpSdkMessages(
 					const finalContent: AssistantMessage["content"] = [];
 
 					// Add tool calls from intermediate turns first (renders above text)
-					attachExternalResultsToToolCalls(intermediateToolCalls, toolResultsById);
-					finalContent.push(...intermediateToolCalls);
+					attachExternalResultsToToolBlocks(intermediateToolBlocks, toolResultsById);
+					finalContent.push(...intermediateToolBlocks);
 
 					// Add text/thinking from the last turn
 					if (builder && builder.message.content.length > 0) {

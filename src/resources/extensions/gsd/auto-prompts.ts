@@ -997,7 +997,7 @@ export async function buildDiscussMilestonePrompt(mid: string, midTitle: string,
     milestoneId: mid,
     milestoneTitle: midTitle,
     inlinedTemplates: discussTemplates,
-    structuredQuestionsAvailable: "true",
+    structuredQuestionsAvailable: "false",
     commitInstruction: "Do not commit planning artifacts — .gsd/ is managed externally.",
     fastPathInstruction: "",
   });
@@ -1503,7 +1503,9 @@ export async function buildCompleteMilestonePrompt(
   try {
     const { isDbAvailable, getMilestoneSlices } = await import("./gsd-db.js");
     if (isDbAvailable()) {
-      sliceIds = getMilestoneSlices(mid).map(s => s.id);
+      sliceIds = getMilestoneSlices(mid)
+        .filter(s => s.status !== "skipped")
+        .map(s => s.id);
     }
   } catch (err) {
     logWarning("prompt", `buildCompleteMilestonePrompt DB lookup failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1597,7 +1599,9 @@ export async function buildValidateMilestonePrompt(
   try {
     const { isDbAvailable, getMilestoneSlices } = await import("./gsd-db.js");
     if (isDbAvailable()) {
-      valSliceIds = getMilestoneSlices(mid).map(s => s.id);
+      valSliceIds = getMilestoneSlices(mid)
+        .filter(s => s.status !== "skipped")
+        .map(s => s.id);
     }
   } catch (err) {
     logWarning("prompt", `buildValidateMilestonePrompt slice IDs lookup failed: ${err instanceof Error ? err.message : String(err)}`);

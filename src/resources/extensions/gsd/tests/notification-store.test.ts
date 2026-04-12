@@ -187,6 +187,23 @@ describe("notification-store", () => {
     assert.ok(!entries.some((e) => e.message === "suppressed"));
   });
 
+  test("appendNotification suppresses identical messages within the dedup window", (t) => {
+    initNotificationStore(tmp);
+    let now = 1_000;
+    t.mock.method(Date, "now", () => now);
+
+    appendNotification("same", "warning");
+    now += 1_000;
+    appendNotification("same", "warning");
+    now += 31_000;
+    appendNotification("same", "warning");
+
+    const entries = readNotifications();
+    assert.equal(entries.length, 2);
+    assert.equal(entries[0].message, "same");
+    assert.equal(entries[1].message, "same");
+  });
+
   test("suppressPersistence is ref-counted", () => {
     initNotificationStore(tmp);
     suppressPersistence();

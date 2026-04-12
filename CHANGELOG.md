@@ -6,6 +6,82 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.71.0] - 2026-04-11
+
+### Added
+- **mcp-server**: add secure_env_collect tool via MCP form elicitation
+
+### Fixed
+- **tui**: clear pinned output on message_end to prevent duplicate display
+- **tui**: clear pinned latest output on turn completion
+- **tui**: restore pinned output above editor during tool execution
+- TOCTOU file locking race conditions in event log and custom workflow graph
+- **tui**: mask secure extension input values in interactive mode
+- **claude-code**: harden MCP elicitation schema handling
+- **claude-code**: accept secure_env_collect MCP elicitation forms
+- **interactive**: keep MCP tool output ordered and restore secure prompt fallback
+- **interactive**: preserve MCP tool output stream ordering
+- **gsd**: resolve workflow MCP test typing regressions
+- **mcp**: return isError flag on workflow tool execution failures
+- **discuss**: add structuredQuestionsAvailable conditional to all gates
+- **discuss**: add multi-round questioning to new-project discuss phase
+- **gsd**: harden claude-code workflow MCP bootstrap
+- **web**: drop provisional pre-tool question text
+
+### Changed
+- extract deriveStateFromDb logic into composable helpers
+- **pr**: drop web-layer changes from MCP stream-order fix
+
+## [2.70.1] - 2026-04-11
+
+### Fixed
+- **routing**: address codex review — complete interactive bypass and accurate banner
+- **routing**: skip dynamic routing for interactive dispatches, always show model changes (#3962)
+- **ci**: trim windows portability integration load
+- **ci**: narrow windows portability coverage
+- **ci**: skip validate-pack in windows portability job
+- **ci**: unblock windows portability follow-up
+- **windows**: harden portability across runtime and tooling
+- **auto**: use pathToFileURL for cross-platform import and reconcile regression test
+- **auto**: resolve resource-loader.js from GSD_PKG_ROOT on resume (#3949)
+- **mcp-server**: importLocalModule resolves src/ paths from dist/ context
+- **gsd**: surface scoped doctor health warnings
+- **gsd**: skip skipped slices in milestone prompts
+- **gsd**: handle doubled-backtick pre-exec paths
+- **update**: fetch latest version from registry
+
+## [2.70.0] - 2026-04-10
+
+### Added
+- **mcp-server**: expose ask_user_questions via elicitation
+
+### Fixed
+- **pi-ai**: remove Anthropic OAuth flow for TOS compliance
+- **mcp-server**: hydrate model credentials into env
+- **mcp-server**: hydrate stored tool credentials on startup
+- **gsd**: auto-enable cmux when detected instead of prompting
+- **mcp-server**: URL scheme regex no longer matches Windows drive letters
+
+## [2.69.0] - 2026-04-10
+
+### Added
+- **gsd**: implement ADR-005 multi-model provider and tool strategy
+- **gsd**: complete ADR-004 capability-aware model routing implementation
+
+### Fixed
+- **gsd**: add missing directories to codebase generator exclude list
+- **gsd**: wire ADR-005 infrastructure into live paths
+- **gsd**: replace empty catch with logWarning for CI compliance
+- **gsd**: merge enhanced context sections into standard template, clean up stale gate patterns
+- **gsd**: remove broken discuss-prepared template, inject briefs into discuss.md
+
+## [2.68.1] - 2026-04-10
+
+### Fixed
+- **ci**: update FILE-SYSTEM-MAP.md path after docs reorganization
+- **test**: update discord invite test path after docs reorganization
+- **gsd**: resolve resource-loader import for deployed extensions
+
 ## [2.68.0] - 2026-04-10
 
 ### Added
@@ -2664,7 +2740,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - License updated to MIT
 
-[Unreleased]: https://github.com/gsd-build/gsd-2/compare/v2.68.0...HEAD
+[Unreleased]: https://github.com/gsd-build/gsd-2/compare/v2.71.0...HEAD
+[2.71.0]: https://github.com/gsd-build/gsd-2/compare/v2.70.1...v2.71.0
+[2.70.1]: https://github.com/gsd-build/gsd-2/compare/v2.70.0...v2.70.1
+[2.70.0]: https://github.com/gsd-build/gsd-2/compare/v2.69.0...v2.70.0
+[2.69.0]: https://github.com/gsd-build/gsd-2/compare/v2.68.1...v2.69.0
+[2.68.1]: https://github.com/gsd-build/gsd-2/compare/v2.68.0...v2.68.1
 [2.68.0]: https://github.com/gsd-build/gsd-2/compare/v2.67.0...v2.68.0
 [2.67.0]: https://github.com/gsd-build/gsd-2/compare/v2.66.1...v2.67.0
 [2.66.1]: https://github.com/gsd-build/gsd-2/compare/v2.66.0...v2.66.1

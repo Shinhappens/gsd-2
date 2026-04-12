@@ -7,9 +7,13 @@ import {
 	makeStreamExhaustedErrorMessage,
 	buildPromptFromContext,
 	buildSdkOptions,
+	createClaudeCodeElicitationHandler,
 	extractToolResultsFromSdkUserMessage,
 	getClaudeLookupCommand,
+	parseAskUserQuestionsElicitation,
+	parseTextInputElicitation,
 	parseClaudeLookupOutput,
+	roundResultToElicitationContent,
 } from "../stream-adapter.ts";
 import type { Context, Message } from "@gsd/pi-ai";
 import type { SDKUserMessage } from "../sdk-types.ts";
@@ -217,6 +221,35 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			assert.equal(srv.env.GSD_CLI_PATH, "/tmp/gsd");
 			assert.equal(srv.env.GSD_PERSIST_WRITE_GATE_STATE, "1");
 			assert.equal(srv.env.GSD_WORKFLOW_PROJECT_ROOT, "/tmp/project");
+			assert.deepEqual(options.disallowedTools, ["AskUserQuestion"]);
+		} finally {
+			process.env.GSD_WORKFLOW_MCP_COMMAND = prev.GSD_WORKFLOW_MCP_COMMAND;
+			process.env.GSD_WORKFLOW_MCP_NAME = prev.GSD_WORKFLOW_MCP_NAME;
+			process.env.GSD_WORKFLOW_MCP_ARGS = prev.GSD_WORKFLOW_MCP_ARGS;
+			process.env.GSD_WORKFLOW_MCP_ENV = prev.GSD_WORKFLOW_MCP_ENV;
+			process.env.GSD_WORKFLOW_MCP_CWD = prev.GSD_WORKFLOW_MCP_CWD;
+		}
+	});
+
+	test("buildSdkOptions disables AskUserQuestion for custom workflow MCP server names", () => {
+		const prev = {
+			GSD_WORKFLOW_MCP_COMMAND: process.env.GSD_WORKFLOW_MCP_COMMAND,
+			GSD_WORKFLOW_MCP_NAME: process.env.GSD_WORKFLOW_MCP_NAME,
+			GSD_WORKFLOW_MCP_ARGS: process.env.GSD_WORKFLOW_MCP_ARGS,
+			GSD_WORKFLOW_MCP_ENV: process.env.GSD_WORKFLOW_MCP_ENV,
+			GSD_WORKFLOW_MCP_CWD: process.env.GSD_WORKFLOW_MCP_CWD,
+		};
+		try {
+			process.env.GSD_WORKFLOW_MCP_COMMAND = "node";
+			process.env.GSD_WORKFLOW_MCP_NAME = "custom-workflow";
+			process.env.GSD_WORKFLOW_MCP_ARGS = JSON.stringify(["packages/mcp-server/dist/cli.js"]);
+			process.env.GSD_WORKFLOW_MCP_ENV = JSON.stringify({ GSD_CLI_PATH: "/tmp/gsd" });
+			process.env.GSD_WORKFLOW_MCP_CWD = "/tmp/project";
+
+			const options = buildSdkOptions("claude-sonnet-4-20250514", "test");
+			const mcpServers = options.mcpServers as Record<string, any>;
+			assert.ok(mcpServers?.["custom-workflow"], "expected custom workflow server config");
+			assert.deepEqual(options.disallowedTools, ["AskUserQuestion"]);
 		} finally {
 			process.env.GSD_WORKFLOW_MCP_COMMAND = prev.GSD_WORKFLOW_MCP_COMMAND;
 			process.env.GSD_WORKFLOW_MCP_NAME = prev.GSD_WORKFLOW_MCP_NAME;
@@ -252,6 +285,9 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			const mcpServers = (options as any).mcpServers;
 			if (mcpServers) {
 				assert.ok(mcpServers["gsd-workflow"], "if present, must be gsd-workflow");
+				assert.deepEqual((options as any).disallowedTools, ["AskUserQuestion"]);
+			} else {
+				assert.deepEqual((options as any).disallowedTools, ["AskUserQuestion"]);
 			}
 			rmSync(emptyDir, { recursive: true, force: true });
 		} finally {
@@ -298,6 +334,7 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			assert.equal(srv.env.GSD_CLI_PATH, "/tmp/gsd");
 			assert.equal(srv.env.GSD_PERSIST_WRITE_GATE_STATE, "1");
 			assert.equal(srv.env.GSD_WORKFLOW_PROJECT_ROOT, resolvedRepoDir);
+			assert.deepEqual(options.disallowedTools, ["AskUserQuestion"]);
 		} finally {
 			process.chdir(originalCwd);
 			rmSync(repoDir, { recursive: true, force: true });
@@ -308,6 +345,286 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			process.env.GSD_WORKFLOW_MCP_CWD = prev.GSD_WORKFLOW_MCP_CWD;
 			process.env.GSD_CLI_PATH = prev.GSD_CLI_PATH;
 		}
+	});
+
+	test("buildSdkOptions preserves runtime callbacks such as onElicitation", () => {
+		const prev = {
+			GSD_WORKFLOW_MCP_COMMAND: process.env.GSD_WORKFLOW_MCP_COMMAND,
+			GSD_WORKFLOW_MCP_NAME: process.env.GSD_WORKFLOW_MCP_NAME,
+			GSD_WORKFLOW_MCP_ARGS: process.env.GSD_WORKFLOW_MCP_ARGS,
+			GSD_WORKFLOW_MCP_ENV: process.env.GSD_WORKFLOW_MCP_ENV,
+			GSD_WORKFLOW_MCP_CWD: process.env.GSD_WORKFLOW_MCP_CWD,
+		};
+		const onElicitation = async () => ({ action: "decline" as const });
+		try {
+			delete process.env.GSD_WORKFLOW_MCP_COMMAND;
+			delete process.env.GSD_WORKFLOW_MCP_NAME;
+			delete process.env.GSD_WORKFLOW_MCP_ARGS;
+			delete process.env.GSD_WORKFLOW_MCP_ENV;
+			delete process.env.GSD_WORKFLOW_MCP_CWD;
+			const options = buildSdkOptions("claude-sonnet-4-20250514", "test", { onElicitation });
+			assert.equal(options.onElicitation, onElicitation);
+		} finally {
+			process.env.GSD_WORKFLOW_MCP_COMMAND = prev.GSD_WORKFLOW_MCP_COMMAND;
+			process.env.GSD_WORKFLOW_MCP_NAME = prev.GSD_WORKFLOW_MCP_NAME;
+			process.env.GSD_WORKFLOW_MCP_ARGS = prev.GSD_WORKFLOW_MCP_ARGS;
+			process.env.GSD_WORKFLOW_MCP_ENV = prev.GSD_WORKFLOW_MCP_ENV;
+			process.env.GSD_WORKFLOW_MCP_CWD = prev.GSD_WORKFLOW_MCP_CWD;
+		}
+	});
+});
+
+describe("stream-adapter — MCP elicitation bridge", () => {
+	const askUserQuestionsRequest = {
+		serverName: "gsd-workflow",
+		message: "Please answer the following question(s).",
+		mode: "form" as const,
+		requestedSchema: {
+			type: "object" as const,
+			properties: {
+				storage_scope: {
+					type: "string",
+					title: "Storage",
+					description: "Does this app need to sync across devices?",
+					oneOf: [
+						{ const: "Local-only (Recommended)", title: "Local-only (Recommended)" },
+						{ const: "Cloud-synced", title: "Cloud-synced" },
+						{ const: "None of the above", title: "None of the above" },
+					],
+				},
+				storage_scope__note: {
+					type: "string",
+					title: "Storage Note",
+					description: "Optional note for None of the above.",
+				},
+				platform: {
+					type: "array",
+					title: "Platform",
+					description: "Where should it run?",
+					items: {
+						anyOf: [
+							{ const: "Web", title: "Web" },
+							{ const: "Desktop", title: "Desktop" },
+							{ const: "Mobile", title: "Mobile" },
+						],
+					},
+				},
+			},
+		},
+	};
+
+	test("parseAskUserQuestionsElicitation rebuilds interview questions from the MCP schema", () => {
+		const questions = parseAskUserQuestionsElicitation(askUserQuestionsRequest);
+		assert.deepEqual(questions, [
+			{
+				id: "storage_scope",
+				header: "Storage",
+				question: "Does this app need to sync across devices?",
+				options: [
+					{ label: "Local-only (Recommended)", description: "" },
+					{ label: "Cloud-synced", description: "" },
+				],
+				noteFieldId: "storage_scope__note",
+			},
+			{
+				id: "platform",
+				header: "Platform",
+				question: "Where should it run?",
+				options: [
+					{ label: "Web", description: "" },
+					{ label: "Desktop", description: "" },
+					{ label: "Mobile", description: "" },
+				],
+				allowMultiple: true,
+			},
+		]);
+	});
+
+	test("roundResultToElicitationContent preserves notes for None of the above", () => {
+		const questions = parseAskUserQuestionsElicitation(askUserQuestionsRequest);
+		assert.ok(questions);
+
+		const content = roundResultToElicitationContent(questions, {
+			endInterview: false,
+			answers: {
+				storage_scope: {
+					selected: "None of the above",
+					notes: "Needs selective sync later",
+				},
+				platform: {
+					selected: ["Web", "Desktop"],
+					notes: "",
+				},
+			},
+		});
+
+		assert.deepEqual(content, {
+			storage_scope: "None of the above",
+			storage_scope__note: "Needs selective sync later",
+			platform: ["Web", "Desktop"],
+		});
+	});
+
+	test("createClaudeCodeElicitationHandler accepts interview-style answers from custom UI", async () => {
+		const handler = createClaudeCodeElicitationHandler({
+			custom: async (_factory: any) => ({
+				endInterview: false,
+				answers: {
+					storage_scope: {
+						selected: "Cloud-synced",
+						notes: "",
+					},
+					platform: {
+						selected: ["Web", "Mobile"],
+						notes: "",
+					},
+				},
+			}),
+		} as any);
+
+		assert.ok(handler);
+		const result = await handler!(askUserQuestionsRequest, { signal: new AbortController().signal });
+		assert.deepEqual(result, {
+			action: "accept",
+			content: {
+				storage_scope: "Cloud-synced",
+				platform: ["Web", "Mobile"],
+			},
+		});
+	});
+
+	test("createClaudeCodeElicitationHandler falls back to dialog prompts when custom UI is unavailable", async () => {
+		const ui = {
+			custom: async () => undefined,
+			select: async (_title: string, options: string[], opts?: { allowMultiple?: boolean }) => {
+				if (opts?.allowMultiple) return ["Desktop", "Mobile"];
+				return options.includes("None of the above") ? "None of the above" : options[0];
+			},
+			input: async () => "CLI-only deployment target",
+		};
+		const handler = createClaudeCodeElicitationHandler(ui as any);
+		assert.ok(handler);
+
+		const result = await handler!(askUserQuestionsRequest, { signal: new AbortController().signal });
+		assert.deepEqual(result, {
+			action: "accept",
+			content: {
+				storage_scope: "None of the above",
+				storage_scope__note: "CLI-only deployment target",
+				platform: ["Desktop", "Mobile"],
+			},
+		});
+	});
+
+	test("parseTextInputElicitation recognizes secure free-text MCP forms", () => {
+		const request = {
+			serverName: "gsd-workflow",
+			message: "Enter values for environment variables.",
+			mode: "form" as const,
+			requestedSchema: {
+				type: "object" as const,
+				properties: {
+					TEST_PASSWORD: {
+						type: "string",
+						title: "TEST_PASSWORD",
+						description: "Format: min 8 characters\nLeave empty to skip.",
+					},
+					PROJECT_NAME: {
+						type: "string",
+						title: "PROJECT_NAME",
+						description: "Human-readable project name.",
+					},
+				},
+			},
+		};
+
+		const parsed = parseTextInputElicitation(request as any);
+		assert.deepEqual(parsed, [
+			{
+				id: "TEST_PASSWORD",
+				title: "TEST_PASSWORD",
+				description: "Format: min 8 characters\nLeave empty to skip.",
+				required: false,
+				secure: true,
+			},
+			{
+				id: "PROJECT_NAME",
+				title: "PROJECT_NAME",
+				description: "Human-readable project name.",
+				required: false,
+				secure: false,
+			},
+		]);
+	});
+
+	test("parseTextInputElicitation accepts legacy keys schema and skips unsupported fields", () => {
+		const request = {
+			serverName: "gsd-workflow",
+			message: "Enter secure values",
+			mode: "form" as const,
+			requestedSchema: {
+				type: "object" as const,
+				keys: {
+					API_TOKEN: {
+						type: "string",
+						title: "API_TOKEN",
+						description: "Leave empty to skip.",
+					},
+					META: {
+						type: "object",
+						title: "metadata",
+					},
+				},
+			},
+		};
+
+		const parsed = parseTextInputElicitation(request as any);
+		assert.deepEqual(parsed, [
+			{
+				id: "API_TOKEN",
+				title: "API_TOKEN",
+				description: "Leave empty to skip.",
+				required: false,
+				secure: true,
+			},
+		]);
+	});
+
+	test("createClaudeCodeElicitationHandler collects secure_env_collect fields through input dialogs", async () => {
+		const secureRequest = {
+			serverName: "gsd-workflow",
+			message: "Enter values for environment variables.",
+			mode: "form" as const,
+			requestedSchema: {
+				type: "object" as const,
+				properties: {
+					TEST_PASSWORD: {
+						type: "string",
+						title: "TEST_PASSWORD",
+						description: "Format: Your secure testing password\nLeave empty to skip.",
+					},
+				},
+			},
+		};
+
+		const inputCalls: Array<{ opts?: { secure?: boolean } }> = [];
+		const handler = createClaudeCodeElicitationHandler({
+			input: async (_title: string, _placeholder?: string, opts?: { secure?: boolean }) => {
+				inputCalls.push({ opts });
+				return "super-secret";
+			},
+		} as any);
+		assert.ok(handler);
+
+		const result = await handler!(secureRequest as any, { signal: new AbortController().signal });
+		assert.deepEqual(result, {
+			action: "accept",
+			content: {
+				TEST_PASSWORD: "super-secret",
+			},
+		});
+		assert.equal(inputCalls.length, 1);
+		assert.equal(inputCalls[0]?.opts?.secure, true, "secure_env_collect fields should request secure input");
 	});
 });
 

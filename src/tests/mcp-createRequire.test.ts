@@ -1,12 +1,9 @@
 /**
- * Regression test for #3603 — MCP server subpath imports via createRequire
+ * Regression test for #3914 — MCP server uses explicit .js SDK subpaths.
  *
- * The ESM wildcard export map in @modelcontextprotocol/sdk does not resolve
- * subpath imports correctly. The fix uses createRequire from node:module to
- * resolve wildcard subpaths via the CJS resolver which auto-appends .js.
- *
- * Structural verification test — reads source to confirm createRequire import
- * and _require.resolve usage exist.
+ * Extensionless wildcard exports for `server/stdio` and `types` do not resolve
+ * reliably across current Node / SDK combinations. The runtime import strings
+ * must include `.js`.
  */
 
 import { describe, test } from 'node:test';
@@ -20,29 +17,19 @@ const __dirname = dirname(__filename);
 
 const source = readFileSync(join(__dirname, '..', 'mcp-server.ts'), 'utf-8');
 
-describe('MCP server createRequire subpath resolution (#3603)', () => {
-  test('createRequire is imported from node:module', () => {
-    assert.match(source, /import\s*\{\s*createRequire\s*\}\s*from\s*['"]node:module['"]/,
-      'createRequire should be imported from node:module');
+describe('MCP server SDK subpath imports (#3914)', () => {
+  test('server/stdio import uses explicit .js subpath', () => {
+    assert.match(source, /await import\(`\$\{MCP_PKG\}\/server\/stdio\.js`\)/,
+      'server/stdio import should include the .js suffix');
   });
 
-  test('_require is created from import.meta.url', () => {
-    assert.match(source, /createRequire\(import\.meta\.url\)/,
-      '_require should be created using createRequire(import.meta.url)');
+  test('types import uses explicit .js subpath', () => {
+    assert.match(source, /await import\(`\$\{MCP_PKG\}\/types\.js`\)/,
+      'types import should include the .js suffix');
   });
 
-  test('_require.resolve is used for subpath imports', () => {
-    assert.match(source, /_require\.resolve\(/,
-      '_require.resolve should be used for subpath resolution');
-  });
-
-  test('server/stdio subpath uses _require.resolve', () => {
-    assert.match(source, /_require\.resolve\(`\$\{MCP_PKG\}\/server\/stdio`\)/,
-      'server/stdio import should use _require.resolve');
-  });
-
-  test('types subpath uses _require.resolve', () => {
-    assert.match(source, /_require\.resolve\(`\$\{MCP_PKG\}\/types`\)/,
-      'types import should use _require.resolve');
+  test('legacy createRequire-based resolution is gone', () => {
+    assert.doesNotMatch(source, /createRequire|_require\.resolve/,
+      'legacy createRequire-based subpath resolution should not remain');
   });
 });

@@ -26,12 +26,15 @@ export interface NotificationEntry {
 const MAX_ENTRIES = 500;
 const FILENAME = "notifications.jsonl";
 const LOCKFILE = "notifications.lock";
+const DEDUP_WINDOW_MS = 30_000;
+const DEDUP_PRUNE_THRESHOLD = 200;
 
 // ─── Module State ───────────────────────────────────────────────────────
 
 let _basePath: string | null = null;
 let _lineCount = 0;  // Hint for rotation — not authoritative for public API
 let _suppressCount = 0;
+let _recentMessageTimestamps = new Map<string, number>();
 
 // ─── Public API ─────────────────────────────────────────────────────────
 
@@ -40,6 +43,9 @@ let _suppressCount = 0;
  * project root. Seeds in-memory counters from the existing file on disk.
  */
 export function initNotificationStore(basePath: string): void {
+  if (_basePath !== basePath) {
+    _recentMessageTimestamps.clear();
+  }
   _basePath = basePath;
   // Seed line count hint for rotation — public counters read from disk
   _lineCount = _readEntriesFromDisk(basePath).length;
@@ -56,12 +62,23 @@ export function appendNotification(
 ): void {
   if (!_basePath) return;
   if (_suppressCount > 0) return;
+  const persistedMessage = message.length > 500 ? message.slice(0, 500) + "…" : message;
+  const dedupKey = `${_basePath}:${severity}:${source}:${persistedMessage}`;
+  const now = Date.now();
+  const lastSeen = _recentMessageTimestamps.get(dedupKey);
+  if (lastSeen !== undefined && now - lastSeen < DEDUP_WINDOW_MS) return;
+  _recentMessageTimestamps.set(dedupKey, now);
+  if (_recentMessageTimestamps.size > DEDUP_PRUNE_THRESHOLD) {
+    for (const [key, ts] of _recentMessageTimestamps) {
+      if (now - ts > DEDUP_WINDOW_MS) _recentMessageTimestamps.delete(key);
+    }
+  }
 
   const entry: NotificationEntry = {
     id: randomUUID(),
     ts: new Date().toISOString(),
     severity,
-    message: message.length > 500 ? message.slice(0, 500) + "…" : message,
+    message: persistedMessage,
     source,
     read: false,
   };
@@ -181,6 +198,7 @@ export function _resetNotificationStore(): void {
   _basePath = null;
   _lineCount = 0;
   _suppressCount = 0;
+  _recentMessageTimestamps = new Map();
 }
 
 // ─── Internal ───────────────────────────────────────────────────────────

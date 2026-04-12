@@ -145,6 +145,33 @@ test("dispatch guard falls back to positional ordering when no dependencies decl
   );
 });
 
+test("dispatch guard ignores positionally-earlier reverse dependents for zero-dependency slices (#3720)", (t) => {
+  const repo = setupRepo();
+  t.after(() => teardownRepo(repo));
+
+  mkdirSync(join(repo, ".gsd", "milestones", "M015"), { recursive: true });
+
+  insertMilestone({ id: "M015", title: "Reverse dependency fallback" });
+  insertSlice({ id: "S03", milestoneId: "M015", title: "Complete prerequisite", status: "complete", depends: [], sequence: 0 });
+  insertSlice({ id: "S04", milestoneId: "M015", title: "Depends on S04A", status: "pending", depends: ["S03", "S04A"], sequence: 0 });
+  insertSlice({ id: "S04A", milestoneId: "M015", title: "No explicit deps", status: "pending", depends: [], sequence: 0 });
+
+  writeFileSync(join(repo, ".gsd", "milestones", "M015", "M015-ROADMAP.md"), "# M015\n");
+
+  // S04A has no declared dependencies and should not be blocked by S04, because
+  // S04 itself depends on S04A. With sequence=0, DB ordering falls back to id.
+  assert.equal(
+    getPriorSliceCompletionBlocker(repo, "main", "execute-task", "M015/S04A/T02"),
+    null,
+  );
+
+  // The reverse direction is still blocked normally.
+  assert.equal(
+    getPriorSliceCompletionBlocker(repo, "main", "execute-task", "M015/S04/T01"),
+    "Cannot dispatch execute-task M015/S04/T01: dependency slice M015/S04A is not complete.",
+  );
+});
+
 test("dispatch guard allows slice with all declared dependencies complete", (t) => {
   const repo = setupRepo();
   t.after(() => teardownRepo(repo));

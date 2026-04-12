@@ -5,12 +5,13 @@
  */
 
 import type { Api, Model } from "@gsd/pi-ai";
+import { getProviderCapabilities } from "@gsd/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@gsd/pi-coding-agent";
 import type { GSDPreferences } from "./preferences.js";
 import { resolveModelWithFallbacksForUnit, resolveDynamicRoutingConfig } from "./preferences.js";
 import type { ComplexityTier } from "./complexity-classifier.js";
 import { classifyUnitComplexity, tierLabel } from "./complexity-classifier.js";
-import { resolveModelForComplexity, escalateTier, getEligibleModels, loadCapabilityOverrides } from "./model-router.js";
+import { resolveModelForComplexity, escalateTier, getEligibleModels, loadCapabilityOverrides, adjustToolSet, filterToolsForProvider } from "./model-router.js";
 import { getLedger, getProjectTotals } from "./metrics.js";
 import { unitPhaseLabel } from "./auto-dashboard.js";
 
@@ -24,9 +25,16 @@ export interface ModelSelectionResult {
 export function resolvePreferredModelConfig(
   unitType: string,
   autoModeStartModel: { provider: string; id: string } | null,
+  /** When false, only return explicit per-phase model configs — do not
+   *  synthesize a routing ceiling from dynamic_routing.tier_models (#3962). */
+  isAutoMode = true,
 ) {
   const explicitConfig = resolveModelWithFallbacksForUnit(unitType);
   if (explicitConfig) return explicitConfig;
+
+  // In interactive mode, don't synthesize a routing-based model config.
+  // The user's session model (/model) should be used as-is (#3962).
+  if (!isAutoMode) return undefined;
 
   const routingConfig = resolveDynamicRoutingConfig();
   if (!routingConfig.enabled || !routingConfig.tier_models) return undefined;
@@ -61,8 +69,11 @@ export async function selectAndApplyModel(
   verbose: boolean,
   autoModeStartModel: { provider: string; id: string } | null,
   retryContext?: { isRetry: boolean; previousTier?: string },
+  /** When false (interactive/guided-flow), skip dynamic routing and use the session model.
+   *  Dynamic routing only applies in auto-mode where cost optimization is expected. (#3962) */
+  isAutoMode = true,
 ): Promise<ModelSelectionResult> {
-  const modelConfig = resolvePreferredModelConfig(unitType, autoModeStartModel);
+  const modelConfig = resolvePreferredModelConfig(unitType, autoModeStartModel, isAutoMode);
   let routing: { tier: string; modelDowngraded: boolean } | null = null;
   let appliedModel: Model<Api> | null = null;
 
@@ -70,7 +81,13 @@ export async function selectAndApplyModel(
     const availableModels = ctx.modelRegistry.getAvailable();
 
     // ─── Dynamic Model Routing ─────────────────────────────────────────
+    // Dynamic routing (complexity-based downgrading) only applies in auto-mode.
+    // Interactive/guided-flow dispatches use the user's session model directly,
+    // respecting their /model selection without silent downgrades (#3962).
     const routingConfig = resolveDynamicRoutingConfig();
+    if (!isAutoMode) {
+      routingConfig.enabled = false;
+    }
     let effectiveModelConfig = modelConfig;
     let routingTierLabel = "";
 
@@ -122,19 +139,16 @@ export async function selectAndApplyModel(
           const escalated = escalateTier(retryContext.previousTier as ComplexityTier);
           if (escalated) {
             classification = { ...classification, tier: escalated, reason: "escalated after failure" };
-            if (verbose) {
-              ctx.ui.notify(
-                `Tier escalation: ${retryContext.previousTier} → ${escalated} (retry after failure)`,
-                "info",
-              );
-            }
+            // Always notify on tier escalation — model changes should be visible (#3962)
+            ctx.ui.notify(
+              `Tier escalation: ${retryContext.previousTier} → ${escalated} (retry after failure)`,
+              "info",
+            );
           }
         }
 
         // Load user capability overrides from preferences (D-17: deep-merged with built-in profiles)
-        const capabilityOverrides = loadCapabilityOverrides(
-          (prefs as { modelOverrides?: Record<string, { capabilities?: Record<string, number> }> } | undefined) ?? {},
-        );
+        const capabilityOverrides = loadCapabilityOverrides(prefs ?? {});
 
         // Fire before_model_select hook (ADR-004, D-03)
         // Hook can override model selection entirely by returning { modelId }
@@ -196,24 +210,23 @@ export async function selectAndApplyModel(
             primary: routingResult.modelId,
             fallbacks: routingResult.fallbacks,
           };
-          if (verbose) {
-            if (routingResult.selectionMethod === "capability-scored" && routingResult.capabilityScores) {
-              // Verbose scoring breakdown for capability-scored decisions (D-20)
-              const tierLbl = tierLabel(classification.tier);
-              const scores = Object.entries(routingResult.capabilityScores)
-                .sort(([, a], [, b]) => b - a)
-                .map(([id, score]) => `${id}: ${score.toFixed(1)}`)
-                .join(", ");
-              ctx.ui.notify(
-                `Dynamic routing [${tierLbl}]: ${routingResult.modelId} (capability-scored) — ${scores}`,
-                "info",
-              );
-            } else {
-              ctx.ui.notify(
-                `Dynamic routing [${tierLabel(classification.tier)}]: ${routingResult.modelId} (${classification.reason})`,
-                "info",
-              );
-            }
+          // Always notify on model downgrade — users should see when their
+          // model selection is overridden, not just in verbose mode (#3962).
+          if (routingResult.selectionMethod === "capability-scored" && routingResult.capabilityScores) {
+            const tierLbl = tierLabel(classification.tier);
+            const scores = Object.entries(routingResult.capabilityScores)
+              .sort(([, a], [, b]) => b - a)
+              .map(([id, score]) => `${id}: ${score.toFixed(1)}`)
+              .join(", ");
+            ctx.ui.notify(
+              `Dynamic routing [${tierLbl}]: ${routingResult.modelId} (capability-scored) — ${scores}`,
+              "info",
+            );
+          } else {
+            ctx.ui.notify(
+              `Dynamic routing [${tierLabel(classification.tier)}]: ${routingResult.modelId} (${classification.reason})`,
+              "info",
+            );
           }
         }
         routingTierLabel = ` [${tierLabel(classification.tier)}]`;
@@ -246,12 +259,45 @@ export async function selectAndApplyModel(
       const ok = await pi.setModel(model, { persist: false });
       if (ok) {
         appliedModel = model;
+
+        // ADR-005: Adjust active tool set for the selected model's provider capabilities.
+        // Hard-filter incompatible tools, then let extensions override via adjust_tool_set hook.
+        const activeToolNames = pi.getActiveTools();
+        const { toolNames: compatibleTools, removedTools } = adjustToolSet(activeToolNames, model.api);
+        let finalToolNames = compatibleTools;
+
+        // Fire adjust_tool_set hook — extensions can override the filtered tool set
+        if (routingConfig.hooks !== false) {
+          const hookResult = await pi.emitAdjustToolSet({
+            selectedModelApi: model.api,
+            selectedModelProvider: model.provider,
+            selectedModelId: model.id,
+            activeToolNames,
+            filteredTools: removedTools,
+          });
+          if (hookResult?.toolNames) {
+            finalToolNames = hookResult.toolNames;
+          }
+        }
+
+        // Apply the filtered tool set if any tools were removed
+        if (removedTools.length > 0 || finalToolNames.length !== activeToolNames.length) {
+          pi.setActiveTools(finalToolNames);
+        }
+
         if (verbose) {
           const fallbackNote = modelId === effectiveModelConfig.primary
             ? ""
             : ` (fallback from ${effectiveModelConfig.primary})`;
           const phase = unitPhaseLabel(unitType);
           ctx.ui.notify(`Model [${phase}]${routingTierLabel}: ${model.provider}/${model.id}${fallbackNote}`, "info");
+          // ADR-005: Report tools filtered due to provider incompatibility
+          if (removedTools.length > 0) {
+            ctx.ui.notify(
+              `Tool compatibility: ${removedTools.length} tools filtered for ${model.api} — ${removedTools.join(", ")}`,
+              "info",
+            );
+          }
         }
         break;
       } else {

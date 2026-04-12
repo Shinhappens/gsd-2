@@ -25,7 +25,7 @@ export function buildNotificationWidgetLines(): string[] {
     ? latest.message.slice(0, msgMax - 1) + "…"
     : latest.message;
 
-  return [`  ${icon} [${badge}]  ${truncated}  (${formatShortcut("Ctrl+Alt+N")} to view)`];
+  return [`  ${icon} [${badge}]  ${truncated}  (${formatShortcut("Ctrl+Alt+N")} or /gsd notifications)`];
 }
 
 // ─── Widget init ────────────────────────────────────────────────────────

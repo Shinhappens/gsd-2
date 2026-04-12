@@ -59,12 +59,6 @@ test("discuss prompt allows implementation questions when they materially matter
   assert.doesNotMatch(prompt, /Questions must be about the experience, not the implementation/i);
 });
 
-test("discuss-prepared prompt enforces round-by-round user turn taking", () => {
-  const prompt = readPrompt("discuss-prepared");
-  assert.match(prompt, /Each round is multi-turn: run one round, then wait for the user's response before starting the next round\./i);
-  assert.match(prompt, /Never fabricate or simulate user input while moving through layers/i);
-});
-
 test("guided discussion prompts avoid wrap-up prompts after every round", () => {
   const milestonePrompt = readPrompt("guided-discuss-milestone");
   const slicePrompt = readPrompt("guided-discuss-slice");

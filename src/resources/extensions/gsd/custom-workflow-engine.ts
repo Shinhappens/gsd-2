@@ -34,6 +34,7 @@ import {
 import { injectContext } from "./context-injector.js";
 import type { WorkflowDefinition, StepDefinition } from "./definition-loader.js";
 import { parseUnitId } from "./unit-id.js";
+import { withFileLock } from "./file-lock.js";
 
 /** Read and parse the frozen DEFINITION.yaml from a run directory. */
 export function readFrozenDefinition(runDir: string): WorkflowDefinition {
@@ -179,24 +180,28 @@ export class CustomWorkflowEngine implements WorkflowEngine {
     state: EngineState,
     completedStep: CompletedStep,
   ): Promise<ReconcileResult> {
-    // Re-read the graph from disk so we do not overwrite concurrent
-    // workflow edits with a stale in-memory snapshot from deriveState().
-    const graph = readGraph(this.runDir);
+    const graphPath = join(this.runDir, "GRAPH.yaml");
 
-    // Extract stepId from "<workflowName>/<stepId>"
-    const { milestone, slice, task } = parseUnitId(completedStep.unitId);
-    const stepId = task ?? slice ?? milestone;
+    return await withFileLock(graphPath, () => {
+      // Re-read the graph from disk so we do not overwrite concurrent
+      // workflow edits with a stale in-memory snapshot from deriveState().
+      const graph = readGraph(this.runDir);
 
-    const updatedGraph = markStepComplete(graph, stepId);
-    writeGraph(this.runDir, updatedGraph);
+      // Extract stepId from "<workflowName>/<stepId>"
+      const { milestone, slice, task } = parseUnitId(completedStep.unitId);
+      const stepId = task ?? slice ?? milestone;
 
-    const allDone = updatedGraph.steps.every(
-      (s) => s.status === "complete" || s.status === "expanded",
-    );
+      const updatedGraph = markStepComplete(graph, stepId);
+      writeGraph(this.runDir, updatedGraph);
 
-    return {
-      outcome: allDone ? "milestone-complete" : "continue",
-    };
+      const allDone = updatedGraph.steps.every(
+        (s) => s.status === "complete" || s.status === "expanded",
+      );
+
+      return {
+        outcome: allDone ? "milestone-complete" : "continue",
+      };
+    });
   }
 
   /**

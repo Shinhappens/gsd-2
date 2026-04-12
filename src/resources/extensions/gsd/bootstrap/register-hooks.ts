@@ -45,6 +45,8 @@ export function registerHooks(pi: ExtensionAPI): void {
     resetToolCallLoopGuard();
     resetAskUserQuestionsCache();
     await syncServiceTierStatus(ctx);
+    const { prepareWorkflowMcpForProject } = await import("../workflow-mcp-auto-prep.js");
+    prepareWorkflowMcpForProject(ctx, process.cwd());
 
     // Apply show_token_cost preference (#1515)
     try {
@@ -85,6 +87,8 @@ export function registerHooks(pi: ExtensionAPI): void {
     resetAskUserQuestionsCache();
     clearDiscussionFlowState();
     await syncServiceTierStatus(ctx);
+    const { prepareWorkflowMcpForProject } = await import("../workflow-mcp-auto-prep.js");
+    prepareWorkflowMcpForProject(ctx, process.cwd());
     loadToolApiKeys();
   });
 
@@ -117,6 +121,8 @@ export function registerHooks(pi: ExtensionAPI): void {
       return { cancel: true };
     }
     const basePath = process.cwd();
+    const { ensureDbOpen } = await import("./dynamic-tools.js");
+    await ensureDbOpen();
     const state = await deriveState(basePath);
     if (!state.activeMilestone || !state.activeSlice || !state.activeTask) return;
     if (state.phase !== "executing") return;
@@ -444,6 +450,14 @@ export function registerHooks(pi: ExtensionAPI): void {
   // Return undefined to let the built-in capability scoring proceed.
   pi.on("before_model_select", async (_event) => {
     // Default: no override — let capability scoring handle selection
+    return undefined;
+  });
+
+  // Tool set adaptation hook (ADR-005 Phase 4)
+  // Extensions can override tool set after model selection by returning { toolNames: [...] }
+  // Return undefined to let the built-in provider compatibility filtering proceed.
+  pi.on("adjust_tool_set", async (_event) => {
+    // Default: no override — let provider capability filtering handle tool set
     return undefined;
   });
 }
