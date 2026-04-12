@@ -387,7 +387,7 @@ export function checkFilePathConsistency(
  */
 export function checkTaskOrdering(
   tasks: TaskRow[],
-  _basePath: string
+  basePath: string
 ): PreExecutionCheckJSON[] {
   const results: PreExecutionCheckJSON[] = [];
 
@@ -415,7 +415,9 @@ export function checkTaskOrdering(
 
       const normalizedFile = normalizeFilePath(file);
       const creator = fileCreators.get(normalizedFile);
-      if (creator && creator.index > i) {
+      const absolutePath = resolve(basePath, normalizedFile);
+      const existsOnDisk = existsSync(absolutePath);
+      if (creator && creator.index > i && !existsOnDisk) {
         // Task reads file that is created later — impossible ordering
         results.push({
           category: "file",
