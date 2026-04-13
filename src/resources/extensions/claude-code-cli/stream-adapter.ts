@@ -612,6 +612,13 @@ export function buildSdkOptions(
 	const mcpServers = buildWorkflowMcpServers();
 	const permissionMode = overrides?.permissionMode ?? "bypassPermissions";
 	const disallowedTools = ["AskUserQuestion"];
+	// Pre-authorize every registered workflow MCP server's tools. Without this,
+	// `acceptEdits` mode (the interactive default) auto-approves built-in
+	// Edit/Write/Bash but still gates MCP calls like `mcp__gsd-workflow__*`,
+	// surfacing "This command requires approval" on every GSD action (#4099).
+	const allowedTools = mcpServers
+		? Object.keys(mcpServers).map((serverName) => `mcp__${serverName}__*`)
+		: [];
 	return {
 		pathToClaudeCodeExecutable: getClaudePath(),
 		model: modelId,
@@ -623,6 +630,7 @@ export function buildSdkOptions(
 		settingSources: ["project"],
 		systemPrompt: { type: "preset", preset: "claude_code" },
 		disallowedTools,
+		...(allowedTools.length > 0 ? { allowedTools } : {}),
 		...(mcpServers ? { mcpServers } : {}),
 		betas: modelId.includes("sonnet") ? ["context-1m-2025-08-07"] : [],
 		...extraOptions,
