@@ -630,13 +630,39 @@ function resolveSliceDependencies(activeMilestoneSlices: SliceRow[]): { activeSl
     }
   }
 
+  // First pass: find a slice with ALL dependencies satisfied (strict)
+  let bestFallback: SliceRow | null = null;
+  let bestFallbackSatisfied = -1;
+
   for (const s of activeMilestoneSlices) {
     if (isStatusDone(s.status)) continue;
     if (isDeferredStatus(s.status)) continue;
     if (s.depends.every(dep => doneSliceIds.has(dep))) {
       return { activeSlice: { id: s.id, title: s.title }, activeSliceRow: s };
     }
+    // Track the slice with the most satisfied dependencies as fallback
+    const satisfied = s.depends.filter(dep => doneSliceIds.has(dep)).length;
+    if (satisfied > bestFallbackSatisfied || (satisfied === bestFallbackSatisfied && !bestFallback)) {
+      bestFallback = s;
+      bestFallbackSatisfied = satisfied;
+    }
   }
+
+  // Fallback: if no slice has all deps met but there ARE incomplete non-deferred
+  // slices, pick the one with the most deps satisfied. This prevents hard-blocking
+  // when dependency metadata is stale (e.g. after reassessment added/removed slices)
+  // or when deps reference slices from previous milestones.
+  if (bestFallback) {
+    const unmet = bestFallback.depends.filter(dep => !doneSliceIds.has(dep));
+    logWarning("state",
+      `No slice has all deps satisfied — falling back to ${bestFallback.id} ` +
+      `(${bestFallbackSatisfied}/${bestFallback.depends.length} deps met, ` +
+      `unmet: ${unmet.join(", ")})`,
+      { mid: activeMilestoneSlices[0]?.milestone_id, sid: bestFallback.id },
+    );
+    return { activeSlice: { id: bestFallback.id, title: bestFallback.title }, activeSliceRow: bestFallback };
+  }
+
   return { activeSlice: null, activeSliceRow: null };
 }
 
@@ -1431,12 +1457,32 @@ export async function _deriveStateImpl(basePath: string): Promise<GSDState> {
       };
     }
   } else {
+    let bestFallbackLegacy: { id: string; title: string; depends: string[] } | null = null;
+    let bestFallbackLegacySatisfied = -1;
+
     for (const s of activeRoadmap.slices) {
       if (s.done) continue;
       if (s.depends.every(dep => doneSliceIds.has(dep))) {
         activeSlice = { id: s.id, title: s.title };
         break;
       }
+      // Track best fallback
+      const satisfied = s.depends.filter(dep => doneSliceIds.has(dep)).length;
+      if (satisfied > bestFallbackLegacySatisfied) {
+        bestFallbackLegacy = s;
+        bestFallbackLegacySatisfied = satisfied;
+      }
+    }
+
+    // Fallback: if no slice has all deps met, pick the one with the most deps satisfied
+    if (!activeSlice && bestFallbackLegacy) {
+      const unmet = bestFallbackLegacy.depends.filter(dep => !doneSliceIds.has(dep));
+      logWarning("state",
+        `No slice has all deps satisfied — falling back to ${bestFallbackLegacy.id} ` +
+        `(${bestFallbackLegacySatisfied}/${bestFallbackLegacy.depends.length} deps met, ` +
+        `unmet: ${unmet.join(", ")})`,
+      );
+      activeSlice = { id: bestFallbackLegacy.id, title: bestFallbackLegacy.title };
     }
   }
 

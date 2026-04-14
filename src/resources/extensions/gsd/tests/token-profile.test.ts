@@ -263,6 +263,6 @@ test("dispatch: phase skip guards return null (not stop)", () => {
   const researchGuard = dispatchSrc.match(/skip_research\).*?return null/s);
   assert.ok(researchGuard, "skip_research guard should return null (fall-through)");
 
-  const reassessGuard = dispatchSrc.match(/reassess_after_slice\).*?return null/s);
+  const reassessGuard = dispatchSrc.match(/reassess_after_slice.*?return null/s);
   assert.ok(reassessGuard, "reassess_after_slice guard should return null (fall-through)");
 });

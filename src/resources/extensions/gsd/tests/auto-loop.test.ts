@@ -688,8 +688,8 @@ test("autoLoop exits on terminal blocked state", async (t) => {
 
   assert.ok(deps.callLog.includes("deriveState"), "should have derived state");
   assert.ok(
-    deps.callLog.includes("stopAuto"),
-    "should have called stopAuto for blocked state",
+    deps.callLog.includes("pauseAuto"),
+    "should have called pauseAuto for blocked state",
   );
   assert.ok(
     !deps.callLog.includes("resolveDispatch"),

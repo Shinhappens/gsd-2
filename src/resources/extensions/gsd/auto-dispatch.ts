@@ -307,8 +307,11 @@ export const DISPATCH_RULES: DispatchRule[] = [
   {
     name: "reassess-roadmap (post-completion)",
     match: async ({ state, mid, midTitle, basePath, prefs }) => {
-      if (prefs?.phases?.skip_reassess || !prefs?.phases?.reassess_after_slice)
-        return null;
+      if (prefs?.phases?.skip_reassess) return null;
+      // Default reassess_after_slice to true — reassessment after slice completion
+      // is essential for roadmap integrity. Opt-out via explicit `false`.
+      const reassessEnabled = prefs?.phases?.reassess_after_slice ?? true;
+      if (!reassessEnabled) return null;
       const needsReassess = await checkNeedsReassessment(basePath, mid, state);
       if (!needsReassess) return null;
       return {
@@ -877,11 +880,14 @@ export async function resolveDispatch(
     }
   }
 
-  // No rule matched — unhandled phase
+  // No rule matched — unhandled phase.
+  // Use level "warning" so the loop pauses (resumable) instead of hard-stopping.
+  // Hard-stop here was causing premature termination for transient phase gaps
+  // (e.g. after reassessment modifies the roadmap and state needs re-derivation).
   return {
     action: "stop",
     reason: `Unhandled phase "${ctx.state.phase}" — run /gsd doctor to diagnose.`,
-    level: "info",
+    level: "warning",
     matchedRule: "<no-match>",
   };
 }

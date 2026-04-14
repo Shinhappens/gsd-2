@@ -481,10 +481,13 @@ export async function runPreDispatch(
       );
     } else if (state.phase === "blocked") {
       const blockerMsg = `Blocked: ${state.blockers.join(", ")}`;
-      await deps.stopAuto(ctx, pi, blockerMsg);
-      ctx.ui.notify(`${blockerMsg}. Fix and run /gsd auto.`, "warning");
-      deps.sendDesktopNotification("GSD", blockerMsg, "error", "attention", basename(s.originalBasePath || s.basePath));
-      deps.logCmuxEvent(prefs, blockerMsg, "error");
+      // Pause instead of hard-stop so the session is resumable with `/gsd auto`.
+      // Hard-stop here was causing premature termination when slice dependencies
+      // were temporarily unresolvable (e.g. after reassessment added new slices).
+      await deps.pauseAuto(ctx, pi);
+      ctx.ui.notify(`${blockerMsg}. Fix and run /gsd auto to resume.`, "warning");
+      deps.sendDesktopNotification("GSD", blockerMsg, "warning", "attention", basename(s.originalBasePath || s.basePath));
+      deps.logCmuxEvent(prefs, blockerMsg, "warning");
     } else {
       const ids = incomplete.map((m: { id: string }) => m.id).join(", ");
       const diag = `basePath=${s.basePath}, milestones=[${state.registry.map((m: { id: string; status: string }) => `${m.id}:${m.status}`).join(", ")}], phase=${state.phase}`;
@@ -583,13 +586,23 @@ export async function runPreDispatch(
     return { action: "break", reason: "milestone-complete" };
   }
 
-  // Terminal: blocked
+  // Terminal: blocked — pause instead of hard-stop so the session is resumable.
   if (state.phase === "blocked") {
     const blockerMsg = `Blocked: ${state.blockers.join(", ")}`;
-    await closeoutAndStop(ctx, pi, s, deps, blockerMsg);
-    ctx.ui.notify(`${blockerMsg}. Fix and run /gsd auto.`, "warning");
-    deps.sendDesktopNotification("GSD", blockerMsg, "error", "attention", basename(s.originalBasePath || s.basePath));
-    deps.logCmuxEvent(prefs, blockerMsg, "error");
+    if (s.currentUnit) {
+      await deps.closeoutUnit(
+        ctx,
+        s.basePath,
+        s.currentUnit.type,
+        s.currentUnit.id,
+        s.currentUnit.startedAt,
+        deps.buildSnapshotOpts(s.currentUnit.type, s.currentUnit.id),
+      );
+    }
+    await deps.pauseAuto(ctx, pi);
+    ctx.ui.notify(`${blockerMsg}. Fix and run /gsd auto to resume.`, "warning");
+    deps.sendDesktopNotification("GSD", blockerMsg, "warning", "attention", basename(s.originalBasePath || s.basePath));
+    deps.logCmuxEvent(prefs, blockerMsg, "warning");
     debugLog("autoLoop", { phase: "exit", reason: "blocked" });
     deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "terminal", data: { reason: "blocked", blockers: state.blockers } });
     return { action: "break", reason: "blocked" };
