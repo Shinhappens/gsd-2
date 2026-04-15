@@ -7,6 +7,7 @@ import {
   loadDebugSession,
   updateDebugSession,
   type DebugTddGate,
+  type DebugSpecialistReview,
 } from "./debug-session-store.js";
 import { loadPrompt } from "./prompt-loader.js";
 
@@ -229,9 +230,10 @@ export async function handleDebug(args: string, ctx: ExtensionCommandContext, pi
         return;
       }
 
-      // Determine checkpoint/TDD dispatch context before updating session state.
+      // Determine checkpoint/TDD/specialist dispatch context before updating session state.
       const checkpoint = loaded.session.checkpoint;
       const tddGate = loaded.session.tddGate;
+      const specialistReview: DebugSpecialistReview | null | undefined = loaded.session.specialistReview;
       const hasCheckpoint = checkpoint != null && checkpoint.awaitingResponse;
       const hasTddGate = tddGate != null && tddGate.enabled;
 
@@ -240,6 +242,7 @@ export async function handleDebug(args: string, ctx: ExtensionCommandContext, pi
       let dispatchModeLabel = "find_and_fix";
       let checkpointContext = "";
       let tddContext = "";
+      let specialistContext = "";
       let tddGateUpdate: DebugTddGate | undefined;
 
       if (hasCheckpoint || hasTddGate) {
@@ -303,6 +306,18 @@ export async function handleDebug(args: string, ctx: ExtensionCommandContext, pi
         }
       }
 
+      // Build specialistContext from session's specialistReview field (null/undefined → empty string).
+      if (specialistReview != null) {
+        specialistContext = [
+          `## Prior Specialist Review`,
+          `- hint: ${specialistReview.hint}`,
+          `- skill: ${specialistReview.skill ?? ""}`,
+          `- verdict: ${specialistReview.verdict}`,
+          `- detail: ${specialistReview.detail}`,
+        ].join("\n");
+        dispatchModeLabel += ` specialistHint=${specialistReview.hint}`;
+      }
+
       // Update session state BEFORE dispatch — handler returns after sendMessage.
       const resumed = updateDebugSession(basePath, parsed.slug, {
         status: "active",
@@ -335,6 +350,7 @@ export async function handleDebug(args: string, ctx: ExtensionCommandContext, pi
           if (dispatchTemplate === "debug-session-manager") {
             promptVars.checkpointContext = checkpointContext;
             promptVars.tddContext = tddContext;
+            promptVars.specialistContext = specialistContext;
           }
           const prompt = loadPrompt(dispatchTemplate, promptVars);
           pi.sendMessage(

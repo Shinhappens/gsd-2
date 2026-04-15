@@ -19,6 +19,26 @@ Goal semantics:
 
 {{tddContext}}
 
+## Specialist Dispatch
+
+When `## ROOT CAUSE FOUND` includes a `specialist_hint` field, invoke the mapped skill for a specialist review before finalizing your analysis.
+
+| hint | skill |
+|------|-------|
+| typescript | typescript-expert |
+| react | typescript-expert |
+| database | supabase-postgres-best-practices |
+| supabase | supabase-postgres-best-practices |
+| sql | supabase-postgres-best-practices |
+
+Specialist review response format:
+- `LOOKS_GOOD (reason)` — no changes needed; include a brief rationale
+- `SUGGEST_CHANGE (improvement)` — include specific improvement details
+
+Persist specialist review results under `## Specialist Review` in the session artifact at `.gsd/debug/sessions/{{slug}}.json`.
+
+{{specialistContext}}
+
 ## Structured Return Protocol
 
 When your investigation reaches a decisive point, signal the outcome by placing exactly one of the following headers on its own line, followed by your analysis:

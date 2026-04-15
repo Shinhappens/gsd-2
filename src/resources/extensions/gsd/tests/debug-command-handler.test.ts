@@ -750,6 +750,7 @@ describe("debug-session-manager prompt template", () => {
       goal: "find_root_cause_only",
       checkpointContext: "",
       tddContext: "",
+      specialistContext: "",
     });
 
     assert.match(content, /## ROOT CAUSE FOUND/);
@@ -757,5 +758,148 @@ describe("debug-session-manager prompt template", () => {
     assert.match(content, /## CHECKPOINT REACHED/);
     assert.match(content, /## DEBUG COMPLETE/);
     assert.match(content, /## INVESTIGATION INCONCLUSIVE/);
+  });
+
+  test("template contains specialist mapping table keywords", () => {
+    const content = loadPrompt("debug-session-manager", {
+      slug: "auth-flake",
+      mode: "debug",
+      issue: "Login fails on Safari",
+      workingDirectory: "/repo",
+      goal: "find_root_cause_only",
+      checkpointContext: "",
+      tddContext: "",
+      specialistContext: "",
+    });
+
+    assert.match(content, /typescript-expert/);
+    assert.match(content, /supabase-postgres-best-practices/);
+    assert.match(content, /LOOKS_GOOD/);
+    assert.match(content, /SUGGEST_CHANGE/);
+  });
+});
+
+describe("continue handler — specialist review dispatch", () => {
+  test("continue with specialistReview present — dispatch payload contains specialist hint and verdict", async () => {
+    const base = makeBase();
+    const ctx = createMockCtx();
+    const dispatched: Array<{ customType: string; content: string; display: boolean }> = [];
+    const mockPi = {
+      sendMessage(msg: { customType: string; content: string; display: boolean }) {
+        dispatched.push(msg);
+      },
+    };
+    const saved = process.cwd();
+    process.chdir(base);
+
+    try {
+      createDebugSession(base, { issue: "Null pointer on login", createdAt: 10 });
+      updateDebugSession(base, "null-pointer-on-login", {
+        checkpoint: { type: "human-action", summary: "Check DB schema", awaitingResponse: true },
+        specialistReview: {
+          hint: "typescript",
+          skill: "typescript-expert",
+          verdict: "SUGGEST_CHANGE",
+          detail: "Use optional chaining instead of null checks",
+          reviewedAt: 1000,
+        },
+      });
+
+      await handleDebug("continue null-pointer-on-login", ctx as any, mockPi as any);
+
+      assert.equal(dispatched.length, 1);
+      const content = dispatched[0].content;
+      // specialistContext block appears in the dispatch
+      assert.match(content, /Prior Specialist Review/);
+      assert.match(content, /hint: typescript/);
+      assert.match(content, /verdict: SUGGEST_CHANGE/);
+      assert.match(content, /Use optional chaining/);
+      // Notification includes specialistHint label
+      assert.match(ctx.notifications[0].message, /specialistHint=typescript/);
+    } finally {
+      process.chdir(saved);
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("continue with specialistReview absent — specialistContext is empty and notification has no specialistHint", async () => {
+    const base = makeBase();
+    const ctx = createMockCtx();
+    const dispatched: Array<{ customType: string; content: string; display: boolean }> = [];
+    const mockPi = {
+      sendMessage(msg: { customType: string; content: string; display: boolean }) {
+        dispatched.push(msg);
+      },
+    };
+    const saved = process.cwd();
+    process.chdir(base);
+
+    try {
+      createDebugSession(base, { issue: "Slow query", createdAt: 10 });
+      updateDebugSession(base, "slow-query", {
+        checkpoint: { type: "human-action", summary: "Verify index exists", awaitingResponse: true },
+      });
+
+      await handleDebug("continue slow-query", ctx as any, mockPi as any);
+
+      assert.equal(dispatched.length, 1);
+      const content = dispatched[0].content;
+      // No specialist content
+      assert.doesNotMatch(content, /Prior Specialist Review/);
+      assert.doesNotMatch(ctx.notifications[0].message, /specialistHint/);
+    } finally {
+      process.chdir(saved);
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("continue with checkpoint + specialistReview — both contexts appear in dispatch", async () => {
+    const base = makeBase();
+    const ctx = createMockCtx();
+    const dispatched: Array<{ customType: string; content: string; display: boolean }> = [];
+    const mockPi = {
+      sendMessage(msg: { customType: string; content: string; display: boolean }) {
+        dispatched.push(msg);
+      },
+    };
+    const saved = process.cwd();
+    process.chdir(base);
+
+    try {
+      createDebugSession(base, { issue: "Memory leak in cache", createdAt: 10 });
+      updateDebugSession(base, "memory-leak-in-cache", {
+        checkpoint: {
+          type: "human-verify",
+          summary: "Verify heap snapshot shows leak",
+          awaitingResponse: true,
+          userResponse: "Yes, confirmed leak at line 42",
+        },
+        specialistReview: {
+          hint: "database",
+          skill: "supabase-postgres-best-practices",
+          verdict: "LOOKS_GOOD",
+          detail: "Query plan is optimal",
+          reviewedAt: 2000,
+        },
+      });
+
+      await handleDebug("continue memory-leak-in-cache", ctx as any, mockPi as any);
+
+      assert.equal(dispatched.length, 1);
+      const content = dispatched[0].content;
+      // Checkpoint context present
+      assert.match(content, /Active Checkpoint/);
+      assert.match(content, /Verify heap snapshot/);
+      // Specialist context present
+      assert.match(content, /Prior Specialist Review/);
+      assert.match(content, /hint: database/);
+      assert.match(content, /verdict: LOOKS_GOOD/);
+      // Notification includes both checkpoint type and specialist hint
+      assert.match(ctx.notifications[0].message, /checkpointType=human-verify/);
+      assert.match(ctx.notifications[0].message, /specialistHint=database/);
+    } finally {
+      process.chdir(saved);
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });
