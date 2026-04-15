@@ -611,3 +611,150 @@ test("/gsd debug S03: round-trip — checkpoint with userResponse dispatches res
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+// ── S04 tests: specialist review dispatch and disk-reload verification ────────
+
+test("/gsd debug S04: specialist review round-trip through continue dispatch", async () => {
+  const base = makeBase();
+  const saved = process.cwd();
+  process.chdir(base);
+
+  try {
+    const ctx = createMockCtx();
+    const { calls, pi } = createMockPiWithDispatch();
+
+    const created = createDebugSession(base, { issue: "Unsafe type assertion in auth flow" });
+    const slug = created.session.slug;
+
+    // Need checkpoint to trigger debug-session-manager template (which includes specialistContext)
+    updateDebugSession(base, slug, {
+      checkpoint: {
+        type: "human-verify",
+        summary: "Verify type guard is safe on all auth paths",
+        awaitingResponse: true,
+      },
+      specialistReview: {
+        hint: "typescript",
+        skill: "typescript-expert",
+        verdict: "SUGGEST_CHANGE (use type guard)",
+        detail: "The current implementation uses unsafe type assertion",
+        reviewedAt: 1700000000000,
+      },
+    });
+
+    await handleDebug(`continue ${slug}`, ctx as any, pi as any);
+
+    const n = lastNotification(ctx);
+    assert.equal(n.level, "info");
+    assert.match(n.message, new RegExp(`Resumed debug session: ${slug}`));
+    assert.match(n.message, /phase=continued/);
+    // Notification must carry specialistHint label
+    assert.match(n.message, /specialistHint=typescript/);
+
+    assert.equal(calls.length, 1, "should dispatch exactly one message");
+    const call = calls[0];
+    assert.equal(call.payload.customType, "gsd-debug-continue");
+    // debug-session-manager template marker confirms correct template was used
+    assert.match(call.payload.content, /Structured Return Protocol/);
+    // Specialist context embedded in payload
+    assert.match(call.payload.content, /Prior Specialist Review/);
+    assert.match(call.payload.content, /hint: typescript/);
+    assert.match(call.payload.content, /SUGGEST_CHANGE \(use type guard\)/);
+    assert.match(call.payload.content, /The current implementation uses unsafe type assertion/);
+    assert.equal(call.options.triggerTurn, true);
+  } finally {
+    process.chdir(saved);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("/gsd debug S04: backward compat — session without specialistReview continues normally", async () => {
+  const base = makeBase();
+  const saved = process.cwd();
+  process.chdir(base);
+
+  try {
+    const ctx = createMockCtx();
+    const { calls, pi } = createMockPiWithDispatch();
+
+    // Checkpoint-only session — triggers debug-session-manager but has NO specialistReview
+    const created = createDebugSession(base, { issue: "Memory leak in event bus" });
+    const slug = created.session.slug;
+
+    updateDebugSession(base, slug, {
+      checkpoint: {
+        type: "human-verify",
+        summary: "Confirm leak disappears after fix",
+        awaitingResponse: true,
+      },
+    });
+
+    await handleDebug(`continue ${slug}`, ctx as any, pi as any);
+
+    const n = lastNotification(ctx);
+    assert.equal(n.level, "info");
+    assert.match(n.message, new RegExp(`Resumed debug session: ${slug}`));
+    assert.match(n.message, /phase=continued/);
+    // No specialistHint label in notification
+    assert.doesNotMatch(n.message, /specialistHint=/);
+
+    assert.equal(calls.length, 1, "should dispatch exactly one message");
+    const call = calls[0];
+    assert.equal(call.payload.customType, "gsd-debug-continue");
+    // debug-session-manager template is still used (checkpoint triggers it)
+    assert.match(call.payload.content, /Structured Return Protocol/);
+    // No specialist context section in payload (template's own Specialist Dispatch docs don't count)
+    assert.doesNotMatch(call.payload.content, /Prior Specialist Review/);
+    assert.equal(call.options.triggerTurn, true);
+  } finally {
+    process.chdir(saved);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("/gsd debug S04: specialist review persists through continue with disk reload", async () => {
+  const base = makeBase();
+  const saved = process.cwd();
+  process.chdir(base);
+
+  try {
+    const ctx = createMockCtx();
+    const { calls, pi } = createMockPiWithDispatch();
+
+    const created = createDebugSession(base, { issue: "Race condition in payment finalizer" });
+    const slug = created.session.slug;
+
+    // Checkpoint + specialistReview — continue updates status/phase/lastError but must preserve specialistReview
+    updateDebugSession(base, slug, {
+      checkpoint: {
+        type: "root-cause-found",
+        summary: "Race between finalizer and GC hook confirmed",
+        awaitingResponse: true,
+      },
+      specialistReview: {
+        hint: "typescript",
+        skill: "typescript-expert",
+        verdict: "LOOKS_GOOD",
+        detail: "WeakRef pattern correctly avoids the GC race",
+        reviewedAt: 1700000001000,
+      },
+    });
+
+    await handleDebug(`continue ${slug}`, ctx as any, pi as any);
+
+    assert.equal(calls.length, 1, "should dispatch exactly one message");
+
+    // Reload the artifact from disk and verify specialistReview survived the handler's updateDebugSession call
+    const reloaded = loadDebugSession(base, slug);
+    assert.ok(reloaded, "session must still exist on disk after continue");
+    assert.equal(reloaded!.session.phase, "continued", "phase must be updated to continued");
+    assert.equal(reloaded!.session.status, "active", "status must be active");
+    assert.ok(reloaded!.session.specialistReview != null, "specialistReview must be preserved (not wiped by continue)");
+    assert.equal(reloaded!.session.specialistReview!.hint, "typescript");
+    assert.equal(reloaded!.session.specialistReview!.verdict, "LOOKS_GOOD");
+    assert.equal(reloaded!.session.specialistReview!.skill, "typescript-expert");
+  } finally {
+    process.chdir(saved);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
