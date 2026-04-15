@@ -294,8 +294,9 @@ function _push(
           },
         }),
       );
-    } catch {
+    } catch (auditEmitErr) {
       // Best-effort: unified audit projection must never block workflow logger.
+      _writeStderr(`[gsd:workflow-logger] unified-audit emit failed: ${(auditEmitErr as Error).message}\n`);
     }
   }
 
