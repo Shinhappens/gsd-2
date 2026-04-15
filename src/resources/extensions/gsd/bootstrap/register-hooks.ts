@@ -52,8 +52,12 @@ export function registerHooks(
     resetToolCallLoopGuard();
     resetAskUserQuestionsCache();
     await syncServiceTierStatus(ctx);
-    const { prepareWorkflowMcpForProject } = await import("../workflow-mcp-auto-prep.js");
-    prepareWorkflowMcpForProject(ctx, process.cwd());
+    // Skip MCP auto-prep when running inside an auto-worktree (see session_switch below).
+    const { isInAutoWorktree } = await import("../auto-worktree.js");
+    if (!isInAutoWorktree(process.cwd())) {
+      const { prepareWorkflowMcpForProject } = await import("../workflow-mcp-auto-prep.js");
+      prepareWorkflowMcpForProject(ctx, process.cwd());
+    }
 
     // Apply show_token_cost preference (#1515)
     try {
@@ -94,8 +98,15 @@ export function registerHooks(
     resetAskUserQuestionsCache();
     clearDiscussionFlowState();
     await syncServiceTierStatus(ctx);
-    const { prepareWorkflowMcpForProject } = await import("../workflow-mcp-auto-prep.js");
-    prepareWorkflowMcpForProject(ctx, process.cwd());
+    // Skip MCP auto-prep when running inside an auto-worktree. The worktree
+    // already has .mcp.json from createAutoWorktree, and re-running the writer
+    // post-chdir rewrites the file mid-run (non-idempotent due to cwd-relative
+    // CLI path resolution), dirtying the tree and breaking the milestone merge.
+    const { isInAutoWorktree } = await import("../auto-worktree.js");
+    if (!isInAutoWorktree(process.cwd())) {
+      const { prepareWorkflowMcpForProject } = await import("../workflow-mcp-auto-prep.js");
+      prepareWorkflowMcpForProject(ctx, process.cwd());
+    }
     loadToolApiKeys();
   });
 
@@ -314,7 +325,7 @@ export function registerHooks(
   // ── Safety harness: evidence collection + destructive command warnings ──
   pi.on("tool_call", async (event, ctx) => {
     if (!isAutoActive()) return;
-    safetyRecordToolCall(event.toolName, event.input as Record<string, unknown>);
+    safetyRecordToolCall(event.toolCallId, event.toolName, event.input as Record<string, unknown>);
 
     // Destructive command classification (warn only, never block)
     if (isToolCallEventType("bash", event)) {
