@@ -14,12 +14,15 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 import type { JournalEntry } from "../journal.js";
 import type { LoopDeps } from "../auto/loop-deps.js";
 import type { IterationContext, LoopState, PreDispatchData, IterationData } from "../auto/types.js";
 import type { SessionLockStatus } from "../session-lock.js";
-import { runDispatch, runUnitPhase, runPreDispatch } from "../auto/phases.js";
+import { runDispatch, runUnitPhase, runPreDispatch, runFinalize } from "../auto/phases.js";
+import { readUnitRuntimeRecord } from "../unit-runtime.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -773,4 +776,66 @@ test("session-failed cancellations close out and emit unit-end before hard stop"
   assert.equal((endEvents[0].data as any).status, "cancelled");
   assert.equal((endEvents[0].data as any).artifactVerified, false);
   assert.equal((endEvents[0].data as any).errorContext.category, "session-failed");
+});
+
+test("runFinalize pauses and emits unit-end when pre-verification times out", async () => {
+  const capture = createEventCapture();
+  let pauseCalls = 0;
+  const basePath = mkdtempSync(join(tmpdir(), "gsd-finalize-timeout-"));
+
+  const deps = makeMockDeps(capture, {
+    pauseAuto: async () => { pauseCalls++; },
+    postUnitPreVerification: async () => {
+      await new Promise(() => {});
+      return "continue" as const;
+    },
+  });
+
+  const ic = makeIC(deps, {
+    s: {
+      ...makeSession(),
+      basePath,
+      currentUnit: { type: "execute-task", id: "M001/S01/T01", startedAt: 1234 },
+    } as any,
+  });
+  const iterData: IterationData = {
+    unitType: "execute-task",
+    unitId: "M001/S01/T01",
+    prompt: "do stuff",
+    finalPrompt: "do stuff",
+    pauseAfterUatDispatch: false,
+    state: { phase: "executing", activeMilestone: { id: "M001" }, activeSlice: { id: "S01" }, registry: [], blockers: [] } as any,
+    mid: "M001",
+    midTitle: "Test",
+    isRetry: false,
+    previousTier: undefined,
+  };
+  const loopState: LoopState = { recentUnits: [], stuckRecoveryAttempts: 0, consecutiveFinalizeTimeouts: 0 };
+
+  const originalSetTimeout = globalThis.setTimeout;
+  try {
+    globalThis.setTimeout = ((handler: (...args: any[]) => void, _timeout?: number, ...args: any[]) =>
+      originalSetTimeout(handler, 0, ...args)) as typeof setTimeout;
+
+    const result = await runFinalize(ic, iterData, loopState);
+    assert.equal(result.action, "break");
+    assert.equal((result as any).reason, "finalize-pre-timeout");
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+
+  assert.equal(pauseCalls, 1, "pre-verification timeout should pause auto-mode");
+  assert.equal(loopState.consecutiveFinalizeTimeouts, 1, "timeout should increment finalize timeout counter");
+  assert.equal(ic.s.currentUnit, null, "timed-out finalize should detach currentUnit");
+
+  const runtime = readUnitRuntimeRecord(basePath, "execute-task", "M001/S01/T01");
+  assert.ok(runtime, "timed-out finalize should persist a runtime record");
+  assert.equal(runtime?.phase, "finalize-timeout");
+  assert.equal(runtime?.lastProgressKind, "finalize-pre-timeout");
+
+  const endEvents = capture.events.filter((e) => e.eventType === "unit-end");
+  assert.equal(endEvents.length, 1, "timed-out finalize should emit terminal unit-end");
+  assert.equal((endEvents[0].data as any).status, "timed-out-finalize");
+  assert.equal((endEvents[0].data as any).artifactVerified, false);
+  assert.equal((endEvents[0].data as any).finalizeStage, "pre");
 });

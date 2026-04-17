@@ -213,25 +213,42 @@ function getRunFinalizeBody(phasesSource: string): string {
 
   const fnBody = getRunFinalizeBody(phasesSource);
 
-  // Both timeout handlers should increment consecutiveFinalizeTimeouts
-  const incrementCount = (fnBody.match(/consecutiveFinalizeTimeouts\+\+/g) || []).length;
+  const helperCallCount = (fnBody.match(/failClosedOnFinalizeTimeout\(/g) || []).length;
   assertTrue(
-    incrementCount >= 2,
-    `should increment consecutiveFinalizeTimeouts in both pre and post handlers (found ${incrementCount})`,
+    helperCallCount >= 2,
+    `runFinalize should route both timeout branches through failClosedOnFinalizeTimeout (found ${helperCallCount})`,
   );
 
-  // Both timeout handlers should check MAX_FINALIZE_TIMEOUTS for escalation
-  const escalationCount = (fnBody.match(/MAX_FINALIZE_TIMEOUTS/g) || []).length;
+  const helperStart = phasesSource.indexOf("async function failClosedOnFinalizeTimeout");
+  assertTrue(helperStart > 0, "failClosedOnFinalizeTimeout helper should exist");
+  const helperEnd = phasesSource.indexOf("// ─── runPreDispatch", helperStart);
+  const helperBody = phasesSource.slice(helperStart, helperEnd > helperStart ? helperEnd : undefined);
+
+  const incrementCount = (helperBody.match(/consecutiveFinalizeTimeouts\+\+/g) || []).length;
   assertTrue(
-    escalationCount >= 2,
-    `should check MAX_FINALIZE_TIMEOUTS in both handlers (found ${escalationCount})`,
+    incrementCount >= 1,
+    `timeout helper should increment consecutiveFinalizeTimeouts (found ${incrementCount})`,
   );
 
-  // Both timeout handlers should null out s.currentUnit to prevent late mutations
-  const detachCount = (fnBody.match(/s\.currentUnit\s*=\s*null/g) || []).length;
+  const detachCount = (helperBody.match(/s\.currentUnit\s*=\s*null/g) || []).length;
   assertTrue(
-    detachCount >= 2,
-    `should detach s.currentUnit in both timeout handlers (found ${detachCount})`,
+    detachCount >= 1,
+    `timeout helper should detach s.currentUnit (found ${detachCount})`,
+  );
+
+  const pauseCount = (helperBody.match(/pauseAuto\(/g) || []).length;
+  assertTrue(
+    pauseCount >= 1,
+    `timeout helper should pause auto-mode (found ${pauseCount})`,
+  );
+
+  assertTrue(
+    helperBody.includes('eventType: "unit-end"'),
+    "timeout helper should emit a terminal unit-end event",
+  );
+  assertTrue(
+    helperBody.includes('phase: "finalize-timeout"'),
+    "timeout helper should persist finalize-timeout runtime state",
   );
 
   // Successful finalize should reset the counter
