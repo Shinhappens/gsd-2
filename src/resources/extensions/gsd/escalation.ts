@@ -248,8 +248,8 @@ export function claimOverrideForInjection(
   // needed — the override is effectively orphaned until a doctor/reset runs.
   if (!art) {
     logWarning(
-      "escalation",
-      `claim succeeded but artifact missing/malformed at ${unapplied.artifactPath} (task ${unapplied.taskId}); override will not be injected`,
+      "tool",
+      `escalation: claim succeeded but artifact missing/malformed at ${unapplied.artifactPath} (task ${unapplied.taskId}); override will not be injected`,
     );
     return null;
   }

@@ -1436,7 +1436,7 @@ export async function buildExecuteTaskPrompt(
       }
     } catch (escalationErr) {
       // Escalation module unavailable or threw — log and proceed.
-      logWarning("auto-prompts", `escalation override injection failed: ${(escalationErr as Error).message}`);
+      logWarning("prompt", `escalation override injection failed: ${(escalationErr as Error).message}`);
     }
   }
 
