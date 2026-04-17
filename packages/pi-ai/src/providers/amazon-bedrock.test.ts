@@ -42,11 +42,10 @@ function makeModel(id: string): Model<"bedrock-converse-stream"> {
 }
 
 // ---------------------------------------------------------------------------
-// supportsAdaptiveThinking — RED tests (#4392 / #4352)
+// supportsAdaptiveThinking — regression guards (#4392 / #4352)
 // ---------------------------------------------------------------------------
 
-describe("supportsAdaptiveThinking — Bug #4392 / #4352: missing models", () => {
-    // These two already pass (regression guard):
+describe("supportsAdaptiveThinking — regression guard #4392 / #4352: all supported models", () => {
     it("returns true for opus-4-6 (hyphen, Bedrock ARN style)", () => {
         assert.ok(supportsAdaptiveThinking("anthropic.claude-opus-4-6-20250514-v1:0"));
     });
@@ -55,37 +54,31 @@ describe("supportsAdaptiveThinking — Bug #4392 / #4352: missing models", () =>
         assert.ok(supportsAdaptiveThinking("anthropic.claude-sonnet-4-6-20250514-v1:0"));
     });
 
-    // --- RED: the following FAIL because opus-4-7 / sonnet-4-7 / haiku-4-5 are missing ---
-
     it("[#4392] returns true for opus-4-7 (hyphen, Bedrock ARN style)", () => {
-        // FAILS: supportsAdaptiveThinking does not include 'opus-4-7'
         assert.ok(
             supportsAdaptiveThinking("anthropic.claude-opus-4-7-20250514-v1:0"),
-            "opus-4-7 should support adaptive thinking (bug #4392)",
+            "opus-4-7 should support adaptive thinking (regression guard #4392)",
         );
     });
 
     it("[#4392] returns true for opus-4-7 (dot separator)", () => {
-        // FAILS: supportsAdaptiveThinking does not include 'opus-4.7'
         assert.ok(
             supportsAdaptiveThinking("anthropic.claude-opus-4.7-20250514-v1:0"),
-            "opus-4.7 (dot) should support adaptive thinking (bug #4392)",
+            "opus-4.7 (dot) should support adaptive thinking (regression guard #4392)",
         );
     });
 
     it("[#4352] returns true for sonnet-4-7 (hyphen)", () => {
-        // FAILS: supportsAdaptiveThinking does not include 'sonnet-4-7'
         assert.ok(
             supportsAdaptiveThinking("anthropic.claude-sonnet-4-7-20250514-v1:0"),
-            "sonnet-4-7 should support adaptive thinking (bug #4352)",
+            "sonnet-4-7 should support adaptive thinking (regression guard #4352)",
         );
     });
 
     it("[#4352] returns true for haiku-4-5 (hyphen)", () => {
-        // FAILS: supportsAdaptiveThinking does not include 'haiku-4-5'
         assert.ok(
             supportsAdaptiveThinking("anthropic.claude-haiku-4-5-20250514-v1:0"),
-            "haiku-4-5 should support adaptive thinking (bug #4352)",
+            "haiku-4-5 should support adaptive thinking (regression guard #4352)",
         );
     });
 });
@@ -101,8 +94,8 @@ describe("buildAdditionalModelRequestFields — Bug #4392: opus-4-7 must use ada
     it("[#4392] opus-4-7 Bedrock ARN → thinking.type === 'adaptive' (not budget_tokens)", () => {
         const model = makeModel("anthropic.claude-opus-4-7-20250514-v1:0");
         const fields = buildAdditionalModelRequestFields(model, options);
-        // FAILS: because supportsAdaptiveThinking returns false for opus-4-7,
-        // the function returns { thinking: { type: "enabled", budget_tokens: ... } }
+        // Regression guard: supportsAdaptiveThinking must return true for opus-4-7
+        // so the function produces thinking.type='adaptive', not budget_tokens.
         assert.equal(
             fields?.thinking?.type,
             "adaptive",
@@ -142,18 +135,14 @@ describe("buildAdditionalModelRequestFields — Bug #4392: opus-4-7 must use ada
 });
 
 // ---------------------------------------------------------------------------
-// mapThinkingLevelToEffort — RED test for xhigh on opus-4-7
-// The Bedrock version returns "max" (dead code path at line 411), whereas
-// the correct value is "xhigh" (as implemented in anthropic-shared.ts).
+// mapThinkingLevelToEffort — regression guard for xhigh on opus-4-7 (#4392)
+// Fixed: Bedrock provider now returns "xhigh" for 4.7+ models instead of "max".
 // ---------------------------------------------------------------------------
 
-describe("mapThinkingLevelToEffort — Bug #4392: opus-4-7 xhigh should return 'xhigh' not 'max'", () => {
+describe("mapThinkingLevelToEffort — regression guard #4392: opus-4-7 xhigh returns 'xhigh'", () => {
     it("[#4392] maps xhigh → 'xhigh' for opus-4-7 (native xhigh support)", () => {
-        // FAILS: current code returns "max" for opus-4-7 at line 411,
-        // and in any case this code path is unreachable because
-        // supportsAdaptiveThinking returns false for opus-4-7.
-        // After the fix, supportsAdaptiveThinking will return true AND
-        // mapThinkingLevelToEffort must return "xhigh" (not "max").
+        // Regression guard: mapThinkingLevelToEffort must return "xhigh" for opus-4-7,
+        // not "max". Ensures the fix in #4392 does not regress.
         const result = mapThinkingLevelToEffort("xhigh", "anthropic.claude-opus-4-7-20250514-v1:0");
         assert.equal(
             result,
