@@ -1216,10 +1216,28 @@ export async function buildResearchSlicePrompt(
   });
 }
 
-export async function buildPlanSlicePrompt(
-  mid: string, _midTitle: string, sid: string, sTitle: string, base: string, level?: InlineLevel,
-): Promise<string> {
-  const inlineLevel = level ?? resolveInlineLevel();
+/**
+ * Shared assembly for plan-slice and refine-slice prompts. Both builders need
+ * the same inlined context (roadmap excerpt, slice context, research, decisions,
+ * requirements, knowledge, graph subgraph, templates, dependency summaries,
+ * overrides). Extracted to prevent drift between the two sites.
+ *
+ * `prependBlocks` are pushed onto the start of the inlined array BEFORE any
+ * shared content, so callers can add unit-specific headers (e.g., the refine
+ * sketch-scope constraint).
+ */
+async function renderSlicePrompt(options: {
+  mid: string;
+  sid: string;
+  sTitle: string;
+  base: string;
+  level: InlineLevel;
+  promptTemplate: "plan-slice" | "refine-slice";
+  prependBlocks?: string[];
+  extraVars?: Record<string, string>;
+}): Promise<string> {
+  const { mid, sid, sTitle, base, level, promptTemplate, prependBlocks = [], extraVars = {} } = options;
+
   const roadmapPath = resolveMilestoneFile(base, mid, "ROADMAP");
   const roadmapRel = relMilestoneFile(base, mid, "ROADMAP");
   const researchPath = resolveSliceFile(base, mid, sid, "RESEARCH");
@@ -1227,18 +1245,17 @@ export async function buildPlanSlicePrompt(
   const sliceContextPath = resolveSliceFile(base, mid, sid, "CONTEXT");
   const sliceContextRel = relSliceFile(base, mid, sid, "CONTEXT");
 
-  const inlined: string[] = [];
+  const inlined: string[] = [...prependBlocks];
 
-  // Inject phase handoff anchor from research phase (if available)
+  // Phase handoff anchor from research phase (if available)
   const researchSliceAnchor = readPhaseAnchor(base, mid, "research-slice");
   if (researchSliceAnchor) inlined.push(formatAnchorForPrompt(researchSliceAnchor));
 
-  // Use roadmap excerpt instead of full roadmap for context reduction
-  const roadmapExcerptPS = await inlineRoadmapExcerpt(base, mid, sid);
-  if (roadmapExcerptPS) {
-    inlined.push(roadmapExcerptPS);
+  // Roadmap excerpt with full-roadmap fallback
+  const roadmapExcerpt = await inlineRoadmapExcerpt(base, mid, sid);
+  if (roadmapExcerpt) {
+    inlined.push(roadmapExcerpt);
   } else {
-    // Fall back to full roadmap if excerpt fails
     inlined.push(await inlineFile(roadmapPath, roadmapRel, "Milestone Roadmap"));
   }
 
@@ -1246,42 +1263,36 @@ export async function buildPlanSlicePrompt(
   if (sliceCtxInline) inlined.push(sliceCtxInline);
   const researchInline = await inlineFileOptional(researchPath, researchRel, "Slice Research");
   if (researchInline) inlined.push(researchInline);
-  if (inlineLevel !== "minimal") {
-    // Derive scope from slice title for decision filtering (R005)
-    const derivedScopePS = deriveSliceScope(sTitle);
-    const decisionsInline = await inlineDecisionsFromDb(base, mid, derivedScopePS, inlineLevel);
+
+  if (level !== "minimal") {
+    const derivedScope = deriveSliceScope(sTitle);
+    const decisionsInline = await inlineDecisionsFromDb(base, mid, derivedScope, level);
     if (decisionsInline) inlined.push(decisionsInline);
-    const requirementsInline = await inlineRequirementsFromDb(base, mid, sid, inlineLevel);
+    const requirementsInline = await inlineRequirementsFromDb(base, mid, sid, level);
     if (requirementsInline) inlined.push(requirementsInline);
   }
 
-  // Use scoped knowledge based on slice title keywords
-  const keywordsPS = extractKeywords(sTitle);
-  const knowledgeInlinePS = await inlineKnowledgeScoped(base, keywordsPS);
-  if (knowledgeInlinePS) inlined.push(knowledgeInlinePS);
+  const knowledgeInline = await inlineKnowledgeScoped(base, extractKeywords(sTitle));
+  if (knowledgeInline) inlined.push(knowledgeInline);
 
-  // Knowledge graph: subgraph for this slice (graceful — skipped if no graph.json)
-  const graphBlockPS = await inlineGraphSubgraph(base, `${sid} ${sTitle}`, { budget: 3000 });
-  if (graphBlockPS) inlined.push(graphBlockPS);
+  const graphBlock = await inlineGraphSubgraph(base, `${sid} ${sTitle}`, { budget: 3000 });
+  if (graphBlock) inlined.push(graphBlock);
 
   inlined.push(inlineTemplate("plan", "Slice Plan"));
-  if (inlineLevel === "full") {
+  if (level === "full") {
     inlined.push(inlineTemplate("task-plan", "Task Plan"));
   }
 
   const depContent = await inlineDependencySummaries(mid, sid, base);
-  const planActiveOverrides = await loadActiveOverrides(base);
-  const planOverridesInline = formatOverridesSection(planActiveOverrides);
-  if (planOverridesInline) inlined.unshift(planOverridesInline);
+  const overridesInline = formatOverridesSection(await loadActiveOverrides(base));
+  if (overridesInline) inlined.unshift(overridesInline);
 
   const inlinedContext = capPreamble(`## Inlined Context (preloaded — do not re-read these files)\n\n${inlined.join("\n\n---\n\n")}`);
-
-  // Build executor context constraints from the budget engine
   const executorContextConstraints = formatExecutorConstraints();
-
   const outputRelPath = relSliceFile(base, mid, sid, "PLAN");
   const commitInstruction = "Do not commit — .gsd/ planning docs are managed externally and not tracked in git.";
-  return loadPrompt("plan-slice", {
+
+  return loadPrompt(promptTemplate, {
     workingDirectory: base,
     milestoneId: mid, sliceId: sid, sliceTitle: sTitle,
     slicePath: relSlicePath(base, mid, sid),
@@ -1300,6 +1311,68 @@ export async function buildPlanSlicePrompt(
       sliceTitle: sTitle,
       extraContext: [inlinedContext, depContent],
     }),
+    ...extraVars,
+  });
+}
+
+export async function buildPlanSlicePrompt(
+  mid: string, _midTitle: string, sid: string, sTitle: string, base: string, level?: InlineLevel,
+  options?: { softScopeHint?: string },
+): Promise<string> {
+  const prependBlocks: string[] = [];
+  // ADR-011: when the refining-phase dispatch rule gracefully downgrades to
+  // plan-slice (progressive_planning was toggled off mid-milestone), it
+  // forwards the stored sketch_scope as a SOFT hint — context, not a hard
+  // constraint. The planner is free to expand beyond it.
+  if (options?.softScopeHint && options.softScopeHint.trim().length > 0) {
+    prependBlocks.push(
+      `## Prior Sketch Scope (soft hint — non-binding)\n\n${options.softScopeHint.trim()}\n\n` +
+      `This scope was captured during an earlier progressive-planning pass that was later disabled. Treat it as context only — you may plan beyond it if the work genuinely requires more scope. Do NOT treat this as a hard boundary.`,
+    );
+  }
+  return renderSlicePrompt({
+    mid, sid, sTitle, base,
+    level: level ?? resolveInlineLevel(),
+    promptTemplate: "plan-slice",
+    prependBlocks,
+  });
+}
+
+/**
+ * ADR-011 refine-slice: expand a sketch into a full plan using the current
+ * codebase state and prior slice summary. Mechanically similar to plan-slice
+ * but framed as a *transformation* (sketch → full plan) rather than a
+ * blank-sheet planning pass. Reuses inlineDependencySummaries for prior
+ * slice SUMMARY and inlines the stored sketch_scope as a hard constraint.
+ */
+export async function buildRefineSlicePrompt(
+  mid: string, _midTitle: string, sid: string, sTitle: string, base: string, level?: InlineLevel,
+): Promise<string> {
+  // Pull the stored sketch scope from the DB — the hard constraint we plan within.
+  let sketchScope = "";
+  try {
+    const { isDbAvailable, getSlice } = await import("./gsd-db.js");
+    if (isDbAvailable()) {
+      sketchScope = getSlice(mid, sid)?.sketch_scope ?? "";
+    }
+  } catch {
+    sketchScope = "";
+  }
+
+  const prependBlocks: string[] = [];
+  if (sketchScope.trim().length > 0) {
+    prependBlocks.push(
+      `## Sketch Scope (hard constraint)\n\n${sketchScope.trim()}\n\n` +
+      `Treat this as the authoritative boundary for the slice. Do not plan work outside this scope; if the scope is too narrow, surface it as a deviation rather than expanding silently.`,
+    );
+  }
+
+  return renderSlicePrompt({
+    mid, sid, sTitle, base,
+    level: level ?? resolveInlineLevel(),
+    promptTemplate: "refine-slice",
+    prependBlocks,
+    extraVars: { sketchScope },
   });
 }
 
@@ -1417,7 +1490,28 @@ export async function buildExecuteTaskPrompt(
     ? `### Runtime Context\nSource: \`.gsd/RUNTIME.md\`\n\n${runtimeContent.trim()}`
     : "";
 
-  const phaseAnchorSection = planAnchor ? formatAnchorForPrompt(planAnchor) : "";
+  let phaseAnchorSection = planAnchor ? formatAnchorForPrompt(planAnchor) : "";
+
+  // ADR-011 Phase 2: inject any resolved-but-unapplied escalation override
+  // into this task's prompt. Claim is atomic via DB UPDATE WHERE IS NULL, so
+  // if a parallel build already injected it, we skip. Feature-gated by
+  // phases.mid_execution_escalation. Prepended to phaseAnchorSection so it
+  // appears near the top of the prompt above planning anchors.
+  if (prefs?.preferences?.phases?.mid_execution_escalation === true) {
+    try {
+      const { claimOverrideForInjection } = await import("./escalation.js");
+      const claimed = claimOverrideForInjection(base, mid, sid);
+      if (claimed) {
+        const block = claimed.injectionBlock + "\n\n---\n\n";
+        phaseAnchorSection = phaseAnchorSection
+          ? `${block}${phaseAnchorSection}`
+          : block;
+      }
+    } catch (escalationErr) {
+      // Escalation module unavailable or threw — log and proceed.
+      logWarning("prompt", `escalation override injection failed: ${(escalationErr as Error).message}`);
+    }
+  }
 
   // Task-scoped gates owned by execute-task (Q5/Q6/Q7). Pull only the
   // gates that plan-slice actually seeded for this task — tasks with no

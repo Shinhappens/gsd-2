@@ -113,7 +113,8 @@ export type UokNodeKind =
   | "subagent"
   | "team-worker"
   | "verification"
-  | "reprocess";
+  | "reprocess"
+  | "refine";
 
 export interface UokGraphNode {
   id: string;

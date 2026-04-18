@@ -64,8 +64,9 @@ test("uok contracts include required DAG node kinds", () => {
     "team-worker",
     "verification",
     "reprocess",
+    "refine",
   ];
-  assert.deepEqual(required.length, 6);
+  assert.deepEqual(required.length, 7);
 });
 
 test("uok audit envelope includes trace/turn/causality fields", () => {

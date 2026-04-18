@@ -99,7 +99,7 @@ function enqueueSidecar(
  *  next actual task commit via `smartStage()`. */
 const LIFECYCLE_ONLY_UNITS = new Set([
   "research-milestone", "discuss-milestone", "discuss-slice", "plan-milestone",
-  "validate-milestone", "research-slice", "plan-slice",
+  "validate-milestone", "research-slice", "plan-slice", "refine-slice",
   "replan-slice", "complete-slice", "run-uat",
   "reassess-roadmap", "rewrite-docs",
 ]);
@@ -190,7 +190,7 @@ export function detectRogueFileWrites(
     if (!hasPlanningState) {
       rogues.push({ path: roadmapPath, unitType, unitId });
     }
-  } else if (unitType === "plan-slice" || unitType === "replan-slice") {
+  } else if (unitType === "plan-slice" || unitType === "refine-slice" || unitType === "replan-slice") {
     if (!mid || !sid) return [];
 
     const planPath = resolveSliceFile(basePath, mid, sid, "PLAN");
@@ -1020,10 +1020,12 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
     }
   }
 
-  // ── Pre-execution checks (after plan-slice completes) ──
+  // ── Pre-execution checks (after plan-slice or ADR-011 refine-slice completes) ──
+  // Both emit the same PLAN.md + task artifacts via gsd_plan_slice, so the
+  // same structural validation applies to both.
   if (
     s.currentUnit &&
-    s.currentUnit.type === "plan-slice"
+    (s.currentUnit.type === "plan-slice" || s.currentUnit.type === "refine-slice")
   ) {
     const currentUnit = s.currentUnit;
     let preExecPauseNeeded = false;

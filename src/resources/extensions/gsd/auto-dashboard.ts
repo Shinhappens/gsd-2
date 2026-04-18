@@ -96,6 +96,7 @@ export function unitVerb(unitType: string): string {
     case "research-slice": return "researching";
     case "plan-milestone":
     case "plan-slice": return "planning";
+    case "refine-slice": return "refining";
     case "execute-task": return "executing";
     case "complete-slice": return "completing";
     case "replan-slice": return "replanning";
@@ -116,6 +117,7 @@ export function unitPhaseLabel(unitType: string): string {
     case "research-slice": return "RESEARCH";
     case "plan-milestone": return "PLAN";
     case "plan-slice": return "PLAN";
+    case "refine-slice": return "REFINE";
     case "execute-task": return "EXECUTE";
     case "complete-slice": return "COMPLETE";
     case "replan-slice": return "REPLAN";
@@ -143,6 +145,7 @@ function peekNext(unitType: string, state: GSDState): string {
     case "plan-milestone": return "plan or execute first slice";
     case "research-slice": return `plan ${sid}`;
     case "plan-slice": return "execute first task";
+    case "refine-slice": return "execute first task";
     case "execute-task": return `continue ${sid}`;
     case "complete-slice": return "reassess roadmap";
     case "replan-slice": return `re-execute ${sid}`;

@@ -39,6 +39,7 @@ import {
   buildPlanMilestonePrompt,
   buildResearchSlicePrompt,
   buildPlanSlicePrompt,
+  buildRefineSlicePrompt,
   buildExecuteTaskPrompt,
   buildCompleteSlicePrompt,
   buildCompleteMilestonePrompt,
@@ -189,6 +190,25 @@ export function isVerificationNotApplicable(value: string): boolean {
 // ─── Rules ────────────────────────────────────────────────────────────────
 
 export const DISPATCH_RULES: DispatchRule[] = [
+  {
+    // ADR-011 Phase 2: pause-for-escalation must evaluate FIRST so phase-
+    // agnostic rules (rewrite-docs gate, UAT checks, reassess) cannot bypass
+    // the user's pending decision. Only fires for continueWithDefault=false
+    // escalations (those set escalation_pending=1); awaiting-review artifacts
+    // never enter the 'escalating-task' phase.
+    name: "escalating-task → pause-for-escalation",
+    match: async ({ state, mid }) => {
+      if (state.phase !== "escalating-task") return null;
+      if (!state.activeSlice) return missingSliceStop(mid, state.phase);
+      return {
+        action: "stop",
+        reason:
+          state.nextAction ||
+          `${mid}: task escalation awaits user resolution. Run /gsd escalate list to see pending items.`,
+        level: "info",
+      };
+    },
+  },
   {
     name: "rewrite-docs (override gate)",
     match: async ({ mid, midTitle, state, basePath, session }) => {
@@ -477,6 +497,58 @@ export const DISPATCH_RULES: DispatchRule[] = [
           sTitle,
           basePath,
         ),
+      };
+    },
+  },
+  {
+    // ADR-011: sketch-then-refine. When `refining` phase fires, expand the
+    // sketch into a full plan using the prior slice's SUMMARY and the current
+    // codebase. If the user flipped `progressive_planning` off mid-milestone
+    // while a slice is still `is_sketch=1`, fall through to a standard
+    // plan-slice so the loop doesn't dead-end.
+    //
+    // Note on the flag-OFF downgrade: plan-slice does not explicitly clear
+    // `is_sketch`. After it writes PLAN.md, the auto-heal in state.ts's
+    // `deriveStateFromDb` (via `autoHealSketchFlags`) flips the flag on the
+    // next iteration. That implicit coupling is the sole mechanism that
+    // reconciles `is_sketch=1` on the plan-slice path — do not remove the
+    // auto-heal without either adding an explicit `setSliceSketchFlag(..., false)`
+    // call here or doing so inside the plan-slice tool handler.
+    name: "refining → refine-slice",
+    match: async ({ state, mid, midTitle, basePath, prefs }) => {
+      if (state.phase !== "refining") return null;
+      if (!state.activeSlice) return missingSliceStop(mid, state.phase);
+      const sid = state.activeSlice.id;
+      const sTitle = state.activeSlice.title;
+      const progressiveOn = prefs?.phases?.progressive_planning === true;
+      if (!progressiveOn) {
+        // Graceful downgrade: treat the sketch as a normal slice needing a plan,
+        // but forward the stored sketch_scope as a SOFT hint so the scope
+        // signal isn't silently lost. The planner may expand beyond it.
+        let softScopeHint = "";
+        try {
+          const { isDbAvailable, getSlice } = await import("./gsd-db.js");
+          if (isDbAvailable()) {
+            softScopeHint = getSlice(mid, sid)?.sketch_scope ?? "";
+          }
+        } catch {
+          softScopeHint = "";
+        }
+        return {
+          action: "dispatch",
+          unitType: "plan-slice",
+          unitId: `${mid}/${sid}`,
+          prompt: await buildPlanSlicePrompt(
+            mid, midTitle, sid, sTitle, basePath, undefined,
+            softScopeHint ? { softScopeHint } : undefined,
+          ),
+        };
+      }
+      return {
+        action: "dispatch",
+        unitType: "refine-slice",
+        unitId: `${mid}/${sid}`,
+        prompt: await buildRefineSlicePrompt(mid, midTitle, sid, sTitle, basePath),
       };
     },
   },
