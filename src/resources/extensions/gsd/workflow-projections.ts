@@ -419,15 +419,16 @@ export async function renderAllProjections(basePath: string, milestoneId: string
 
 /**
  * Check if a projection file exists on disk. If missing, regenerate it from DB.
- * Returns true if the file was regenerated, false if it already existed.
+ * Returns true if the file was regenerated, false if it already existed or
+ * regeneration failed.
  * Satisfies PROJ-05 (corrupted/deleted projections regenerate on demand).
  */
-export function regenerateIfMissing(
+export async function regenerateIfMissing(
   basePath: string,
   milestoneId: string,
   sliceId: string,
   fileType: "PLAN" | "ROADMAP" | "SUMMARY" | "STATE",
-): boolean {
+): Promise<boolean> {
   let filePath: string;
 
   switch (fileType) {
@@ -474,23 +475,17 @@ export function regenerateIfMissing(
     switch (fileType) {
       case "PLAN":
         renderPlanProjection(basePath, milestoneId, sliceId);
-        break;
+        return true;
       case "ROADMAP":
         // Authoritative renderer keeps all sections the reduced projection
-        // would strip. Async fire-and-forget like STATE: file appears on
-        // the next post-mutation cycle.
-        void renderRoadmapFromDb(basePath, milestoneId).catch((err) => {
-          logWarning("projection", `regenerateIfMissing ROADMAP failed: ${(err as Error).message}`);
-        });
-        return false;
+        // would strip. Await so callers can rely on the "regenerate on demand"
+        // contract — returning true only when the file was actually written.
+        await renderRoadmapFromDb(basePath, milestoneId);
+        return true;
       case "STATE":
-        // renderStateProjection is async — fire-and-forget.
-        // Return false since the file isn't written yet; it will appear
-        // on the next post-mutation hook cycle.
-        void renderStateProjection(basePath);
-        return false;
+        await renderStateProjection(basePath);
+        return true;
     }
-    return true;
   } catch (err) {
     logWarning("projection", `regenerateIfMissing ${fileType} failed: ${(err as Error).message}`);
     return false;

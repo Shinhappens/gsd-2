@@ -12,6 +12,16 @@ const boundaryMap = [
   '|------|----|----------|----------|',
   '| S01 | S02 | roadmap | plan |',
   '| S02 | S03 | plan | tasks |',
+  '',
+  '### S01 → S02',
+  '',
+  '- Produces: roadmap',
+  '- Consumes: plan',
+  '',
+  '### S02 → S03',
+  '',
+  '- Produces: plan',
+  '- Consumes: tasks',
 ].join('\n');
 
 function planParams() {
@@ -99,4 +109,6 @@ test('#4402 plan-milestone preserves ## Boundary Map after post-mutation project
   );
   assert.match(roadmap, /\| S01 \| S02 \| roadmap \| plan \|/, 'boundary map row S01→S02 must survive');
   assert.match(roadmap, /\| S02 \| S03 \| plan \| tasks \|/, 'boundary map row S02→S03 must survive');
+  assert.match(roadmap, /^### S01 → S02$/m, 'boundary map edge subsection S01→S02 must survive');
+  assert.match(roadmap, /^### S02 → S03$/m, 'boundary map edge subsection S02→S03 must survive');
 });
