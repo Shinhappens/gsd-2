@@ -470,21 +470,20 @@ export async function regenerateIfMissing(
     return false;
   }
 
-  // Regenerate the missing file
+  // Regenerate the missing file. Each renderer may swallow its own errors
+  // (e.g. renderStateProjection), so confirm the file actually exists on
+  // disk before reporting success — true must mean "file is there now".
   try {
     switch (fileType) {
       case "PLAN":
         renderPlanProjection(basePath, milestoneId, sliceId);
-        return true;
+        return existsSync(filePath);
       case "ROADMAP":
-        // Authoritative renderer keeps all sections the reduced projection
-        // would strip. Await so callers can rely on the "regenerate on demand"
-        // contract — returning true only when the file was actually written.
         await renderRoadmapFromDb(basePath, milestoneId);
-        return true;
+        return existsSync(filePath);
       case "STATE":
         await renderStateProjection(basePath);
-        return true;
+        return existsSync(filePath);
     }
   } catch (err) {
     logWarning("projection", `regenerateIfMissing ${fileType} failed: ${(err as Error).message}`);
