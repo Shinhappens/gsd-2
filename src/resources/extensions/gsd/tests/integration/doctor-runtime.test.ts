@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
  *   state_file_stale, gitignore_missing_patterns
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, realpathSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
@@ -248,6 +248,37 @@ node_modules/
       const detect = await runGSDDoctor(dir);
       const gitignoreIssues = detect.issues.filter(i => i.code === "gitignore_missing_patterns");
       assert.deepStrictEqual(gitignoreIssues.length, 0, "no missing patterns when blanket .gsd/ present");
+    });
+    } else {
+    }
+
+    // ─── Test 8b: Symlinked .gsd without .gitignore entry (#4423) ─────
+    if (process.platform !== "win32") {
+    test('symlinked_gsd_unignored', async () => {
+      const dir = createGitProject();
+      cleanups.push(dir);
+
+      // Create .gsd as a symlink to an external directory (standard external
+      // state layout), and write a .gitignore that does NOT list .gsd.
+      const externalGsd = mkdtempSync(join(tmpdir(), "gsd-external-doctor-"));
+      cleanups.push(externalGsd);
+      writeFileSync(join(externalGsd, "STATE.md"), "# State\n");
+      symlinkSync(externalGsd, join(dir, ".gsd"));
+
+      writeFileSync(join(dir, ".gitignore"), "node_modules/\n");
+
+      const detect = await runGSDDoctor(dir);
+      const symlinkIssues = detect.issues.filter(i => i.code === "symlinked_gsd_unignored");
+      assert.ok(symlinkIssues.length > 0, "detects symlinked .gsd without gitignore entry");
+
+      const fixed = await runGSDDoctor(dir, { fix: true });
+      assert.ok(
+        fixed.fixesApplied.some(f => f.includes(".gitignore")),
+        "fix updates .gitignore",
+      );
+
+      const content = readFileSync(join(dir, ".gitignore"), "utf-8");
+      assert.ok(/^\.gsd\/?$/m.test(content), "gitignore now has .gsd entry");
     });
     } else {
     }

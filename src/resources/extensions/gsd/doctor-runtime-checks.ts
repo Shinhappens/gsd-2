@@ -8,7 +8,7 @@ import { deriveState } from "./state.js";
 import { saveFile } from "./files.js";
 import { nativeIsRepo, nativeForEachRef, nativeUpdateRef } from "./native-git-bridge.js";
 import { readCrashLock, isLockProcessAlive, clearLock } from "./crash-recovery.js";
-import { ensureGitignore } from "./gitignore.js";
+import { ensureGitignore, isGsdGitignored } from "./gitignore.js";
 import { readAllSessionStatuses, isSessionStale, removeSessionStatus } from "./session-status-io.js";
 import { recoverFailedMigration } from "./migrate-external.js";
 import { splitCompletedKey } from "./forensics.js";
@@ -380,6 +380,27 @@ export async function checkRuntimeHealth(
             file: ".gsd",
             fixable: false,
           });
+        }
+
+        // ── Symlinked .gsd without .gitignore entry (#4423) ──
+        // When `.gsd` is a symlink AND not gitignored, `git add -A -- :!.gsd/...`
+        // pathspecs fail with "beyond a symbolic link". Without self-heal this
+        // silently drops new user files during auto-commit.
+        if (nativeIsRepo(basePath) && !isGsdGitignored(basePath)) {
+          issues.push({
+            severity: "warning",
+            code: "symlinked_gsd_unignored",
+            scope: "project",
+            unitId: "project",
+            message: ".gsd is a symlink to external state but is not listed in .gitignore. This causes git pathspec exclusions to fail and can lead to silently dropped new files during auto-commit. Add `.gsd` to .gitignore.",
+            file: ".gitignore",
+            fixable: true,
+          });
+
+          if (shouldFix("symlinked_gsd_unignored")) {
+            const modified = ensureGitignore(basePath);
+            if (modified) fixesApplied.push("added .gsd to .gitignore (symlinked external state)");
+          }
         }
       }
     }
