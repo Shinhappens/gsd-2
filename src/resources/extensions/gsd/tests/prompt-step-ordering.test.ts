@@ -92,8 +92,9 @@ describe('register-hooks session_before_compact (#3696)', () => {
       registerHooksSrc.indexOf('const sliceDir', compactIdx),
     );
 
+    const normalized = preCheckpointSection.replace(/\/\/.*$/gm, '');
     assert.ok(
-      !/\n\s*if\s*\(state\.phase\s*!==\s*"executing"\)\s*return;/.test(preCheckpointSection),
+      !/if\s*\(\s*state\.phase\s*!==\s*['"]executing['"]\s*\)\s*\{?\s*return\b/.test(normalized),
       'session_before_compact should not early-return on non-executing phases',
     );
   });
