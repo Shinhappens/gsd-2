@@ -324,8 +324,14 @@ export function validateProjectDir(projectDir: string, env: NodeJS.ProcessEnv = 
 function safeRealpath(path: string): string {
   try {
     return realpathSync(path);
-  } catch {
-    return path;
+  } catch (err) {
+    // Only fall back for non-existent paths — a legitimate case when a worktree
+    // directory hasn't been created yet. Permission errors (EACCES), not-a-
+    // directory (ENOTDIR), etc. must propagate so we do not silently degrade
+    // to a lexical-only containment check that a restricted symlink could
+    // bypass.
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return path;
+    throw err;
   }
 }
 
@@ -610,6 +616,16 @@ async function runSerializedWorkflowOperation<T>(fn: () => Promise<T>): Promise<
   // workflow MCP mutations must not overlap within a single server process.
   // A per-operation deadline prevents a single stuck call from wedging every
   // subsequent write for the lifetime of the process.
+  //
+  // Known limitation: on timeout we surface an error and release the queue,
+  // but Promise.race cannot cancel the underlying `fn()` — it may continue
+  // running in the background and overlap with the next admitted operation.
+  // Proper cancellation requires threading an AbortSignal through every
+  // workflow executor (`workflow-tool-executors.ts` and friends), which is
+  // a larger change. The current trade-off: risk a theoretical overlap after
+  // a 5-minute wall-clock timeout vs permanently wedging the server. The
+  // overlap window is bounded by how long the zombie `fn()` keeps running;
+  // in practice DB writes complete quickly even when the caller gave up.
   const prior = workflowExecutionQueue;
   let release!: () => void;
   workflowExecutionQueue = new Promise<void>((resolve) => {
@@ -1253,7 +1269,15 @@ export function registerWorkflowTools(server: McpToolServer): void {
         const prefsMod = await importLocalModule<any>(
           "../../../src/resources/extensions/gsd/preferences.js",
         ).catch(() => null);
-        const uniqueEnabled = !!prefsMod?.loadEffectiveGSDPreferences?.()?.preferences?.unique_milestone_ids;
+        // Graceful degradation: a corrupt preferences file should not crash
+        // milestone-id generation. Fall back to non-unique IDs if anything
+        // throws here — matches the pre-fix behavior for missing prefs.
+        let uniqueEnabled = false;
+        try {
+          uniqueEnabled = !!prefsMod?.loadEffectiveGSDPreferences?.()?.preferences?.unique_milestone_ids;
+        } catch {
+          uniqueEnabled = false;
+        }
         const nextId = nextMilestoneId(allIds, uniqueEnabled);
         await ensureMilestoneDbRow(nextId);
         return nextId;
@@ -1285,7 +1309,15 @@ export function registerWorkflowTools(server: McpToolServer): void {
         const prefsMod = await importLocalModule<any>(
           "../../../src/resources/extensions/gsd/preferences.js",
         ).catch(() => null);
-        const uniqueEnabled = !!prefsMod?.loadEffectiveGSDPreferences?.()?.preferences?.unique_milestone_ids;
+        // Graceful degradation: a corrupt preferences file should not crash
+        // milestone-id generation. Fall back to non-unique IDs if anything
+        // throws here — matches the pre-fix behavior for missing prefs.
+        let uniqueEnabled = false;
+        try {
+          uniqueEnabled = !!prefsMod?.loadEffectiveGSDPreferences?.()?.preferences?.unique_milestone_ids;
+        } catch {
+          uniqueEnabled = false;
+        }
         const nextId = nextMilestoneId(allIds, uniqueEnabled);
         await ensureMilestoneDbRow(nextId);
         return nextId;
