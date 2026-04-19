@@ -21,6 +21,7 @@ import type { WorktreeResolver } from "../worktree-resolver.js";
 import type { CmuxLogLevel } from "../../cmux/index.js";
 import type { JournalEntry } from "../journal.js";
 import type { MergeReconcileResult } from "../auto-recovery.js";
+import type { UokTurnObserver } from "../uok/contracts.js";
 
 /**
  * Dependencies injected by the caller (auto.ts startAuto) so autoLoop
@@ -151,6 +152,7 @@ export interface LoopDeps {
     state: GSDState;
     prefs: GSDPreferences | undefined;
     session?: AutoSession;
+    structuredQuestionsAvailable?: "true" | "false";
   }) => Promise<DispatchAction>;
   runPreDispatchHooks: (
     unitType: string,
@@ -180,6 +182,12 @@ export interface LoopDeps {
     startedAt: number,
     opts?: CloseoutOptions & Record<string, unknown>,
   ) => Promise<void>;
+  autoCommitUnit?: (
+    basePath: string,
+    unitType: string,
+    unitId: string,
+    ctx?: ExtensionContext,
+  ) => Promise<string | null>;
   recordOutcome: (unitType: string, tier: string, success: boolean) => void;
   writeLock: (
     lockBase: string,
@@ -211,6 +219,8 @@ export interface LoopDeps {
     verbose: boolean,
     startModel: { provider: string; id: string } | null,
     retryContext?: { isRetry: boolean; previousTier?: string },
+    isAutoMode?: boolean,
+    sessionModelOverride?: { provider: string; id: string } | null,
   ) => Promise<{
     routing: { tier: string; modelDowngraded: boolean } | null;
     appliedModel: { provider: string; id: string } | null;
@@ -266,4 +276,7 @@ export interface LoopDeps {
 
   // Journal
   emitJournalEvent: (entry: JournalEntry) => void;
+
+  // UOK (optional, flag-gated)
+  uokObserver?: UokTurnObserver;
 }

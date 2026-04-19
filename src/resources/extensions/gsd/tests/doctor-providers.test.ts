@@ -14,7 +14,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -219,6 +219,9 @@ test("runProviderChecks returns error for Anthropic when no key present", () => 
     GH_TOKEN: undefined,
     GITHUB_TOKEN: undefined,
     HOME: tmpHome,
+    // Use a PATH that contains no AI CLI binaries (claude, codex, gemini, etc.)
+    // so the claude-code route is not considered available
+    PATH: tmpHome,
   }, () => {
     try {
       const results = runProviderChecks();
@@ -295,26 +298,33 @@ test("runProviderChecks detects key from auth.json", () => {
 });
 
 test("runProviderChecks ignores empty placeholder keys in auth.json", () => {
-  withEnv({ ANTHROPIC_API_KEY: undefined, ANTHROPIC_OAUTH_TOKEN: undefined, COPILOT_GITHUB_TOKEN: undefined, GH_TOKEN: undefined, GITHUB_TOKEN: undefined }, () => {
-    const tmpHome = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-test-")));
-    const agentDir = join(tmpHome, ".gsd", "agent");
-    mkdirSync(agentDir, { recursive: true });
+  const tmpHome = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-test-")));
+  const agentDir = join(tmpHome, ".gsd", "agent");
+  mkdirSync(agentDir, { recursive: true });
 
-    // Empty key — what onboarding writes when user skips
-    const authData = {
-      anthropic: { type: "api_key", key: "" },
-    };
-    writeFileSync(join(agentDir, "auth.json"), JSON.stringify(authData));
+  // Empty key — what onboarding writes when user skips
+  const authData = {
+    anthropic: { type: "api_key", key: "" },
+  };
+  writeFileSync(join(agentDir, "auth.json"), JSON.stringify(authData));
 
-    withEnv({ HOME: tmpHome }, () => {
-      const results = runProviderChecks();
-      const anthropic = results.find(r => r.name === "anthropic");
-      assert.ok(anthropic, "anthropic should be present");
-      assert.equal(anthropic!.status, "error", "empty placeholder key should count as not configured");
-    });
-
-    rmSync(tmpHome, { recursive: true, force: true });
+  withEnv({
+    ANTHROPIC_API_KEY: undefined,
+    ANTHROPIC_OAUTH_TOKEN: undefined,
+    COPILOT_GITHUB_TOKEN: undefined,
+    GH_TOKEN: undefined,
+    GITHUB_TOKEN: undefined,
+    HOME: tmpHome,
+    // Exclude AI CLI binaries so the claude-code route is not considered available
+    PATH: tmpHome,
+  }, () => {
+    const results = runProviderChecks();
+    const anthropic = results.find(r => r.name === "anthropic");
+    assert.ok(anthropic, "anthropic should be present");
+    assert.equal(anthropic!.status, "error", "empty placeholder key should count as not configured");
   });
+
+  rmSync(tmpHome, { recursive: true, force: true });
 });
 
 // ─── runProviderChecks — cross-provider routing ──────────────────────────────
@@ -572,6 +582,76 @@ test("runProviderChecks reports ok for OpenAI via openai-codex auth.json (#2922)
 
   rmSync(repo, { recursive: true, force: true });
   rmSync(tmpHome, { recursive: true, force: true });
+});
+
+test("runProviderChecks reports ok for claude-code without any API key", () => {
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-cc-repo-")));
+  mkdirSync(join(repo, ".gsd"), { recursive: true });
+  writeFileSync(
+    join(repo, ".gsd", "PREFERENCES.md"),
+    [
+      "---",
+      "models:",
+      "  execution:",
+      "    model: claude-sonnet-4-6",
+      "    provider: claude-code",
+      "---",
+      "",
+    ].join("\n"),
+  );
+
+  const tmpHome = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-cc-home-")));
+
+  withEnv({
+    HOME: tmpHome,
+    ANTHROPIC_API_KEY: undefined,
+    ANTHROPIC_OAUTH_TOKEN: undefined,
+  }, () => {
+    withCwd(repo, () => {
+      const results = runProviderChecks();
+      const cc = results.find(r => r.name === "claude-code");
+      assert.ok(cc, "claude-code result should exist");
+      assert.equal(cc!.status, "ok", "claude-code uses CLI auth — must be ok without API keys");
+      assert.ok(cc!.message.includes("CLI auth"), "should indicate CLI auth");
+    });
+  });
+
+  rmSync(repo, { recursive: true, force: true });
+  rmSync(tmpHome, { recursive: true, force: true });
+});
+
+test("runProviderChecks reports ok for Anthropic via claude-code binary in PATH", () => {
+  // Simulate a user who has no Anthropic API key but has the claude CLI installed.
+  // Their PREFERENCES use a claude model without an explicit provider, so the doctor
+  // infers "anthropic" — but the claude-code route should satisfy it.
+  const tmpHome = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-cc-route-home-")));
+  const binDir = join(tmpHome, "bin");
+  mkdirSync(binDir, { recursive: true });
+
+  // Create a fake `claude` binary so the PATH scan finds it
+  const fakeClaude = join(binDir, "claude");
+  writeFileSync(fakeClaude, "#!/bin/sh\necho mock\n");
+  chmodSync(fakeClaude, 0o755);
+
+  withEnv({
+    HOME: tmpHome,
+    ANTHROPIC_API_KEY: undefined,
+    ANTHROPIC_OAUTH_TOKEN: undefined,
+    COPILOT_GITHUB_TOKEN: undefined,
+    GH_TOKEN: undefined,
+    GITHUB_TOKEN: undefined,
+    PATH: `${binDir}:${process.env.PATH ?? ""}`,
+  }, () => {
+    try {
+      const results = runProviderChecks();
+      const anthropic = results.find(r => r.name === "anthropic");
+      assert.ok(anthropic, "anthropic result should exist");
+      assert.equal(anthropic!.status, "ok", "should be ok when claude CLI binary is in PATH");
+      assert.ok(anthropic!.message.toLowerCase().includes("claude"), "should mention claude-code as source");
+    } finally {
+      rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
 });
 
 test("PROVIDER_ROUTES includes google-gemini-cli as route for google (#2922)", async () => {

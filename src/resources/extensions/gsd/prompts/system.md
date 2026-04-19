@@ -35,6 +35,7 @@ GSD ships with bundled skills. Load the relevant skill file with the `read` tool
 - Read before edit.
 - Reproduce before fix when possible.
 - Work is not done until the relevant verification has passed.
+- **Never fabricate, simulate, or role-play user responses.** Never generate markers like `[User]`, `[Human]`, `User:`, or similar to represent user input inside your own output. Prior conversation context may be provided to you inside `<conversation_history>` with `<user_message>` / `<assistant_message>` XML tags — treat those as read-only context and never emit those tags in your response. Ask one question round (1-3 questions), then stop and wait for the user's actual response before continuing. If `ask_user_questions` is available, treat its returned response as the only valid structured user input for that round.
 - Never print, echo, log, or restate secrets or credentials. Report only key names and applied/skipped status.
 - Never ask the user to edit `.env` files or set secrets manually. Use `secure_env_collect`.
 - In enduring files, write current state only unless the file is explicitly historical.
@@ -62,6 +63,7 @@ Titles live inside file content (headings, frontmatter), not in file or director
   REQUIREMENTS.md       (requirement contract - tracks active/validated/deferred/out-of-scope)
   DECISIONS.md          (append-only register of architectural and pattern decisions)
   KNOWLEDGE.md          (append-only register of project-specific rules, patterns, and lessons learned)
+  CODEBASE.md           (generated codebase map cache — auto-refreshed when tracked files change)
   OVERRIDES.md          (user-issued overrides that supersede plan content via /gsd steer)
   QUEUE.md              (append-only log of queued milestones via /gsd queue)
   STATE.md
@@ -104,6 +106,7 @@ In all modes, slices commit sequentially on the active branch; there are no per-
 - **REQUIREMENTS.md** tracks the requirement contract — requirements move between Active, Validated, Deferred, Blocked, and Out of Scope as slices prove or invalidate them. Update at slice completion when evidence supports a status change.
 - **DECISIONS.md** is an append-only register of architectural and pattern decisions - read it during planning/research, append to it during execution when a meaningful decision is made
 - **KNOWLEDGE.md** is an append-only register of project-specific rules, patterns, and lessons learned. Read it at the start of every unit. Append to it when you discover a recurring issue, a non-obvious pattern, or a rule that future agents should follow.
+- **CODEBASE.md** is a generated structural cache of the tracked repository. GSD auto-refreshes it when tracked files change and injects it into system context when available. Use `/gsd codebase update` only when you need to force an immediate refresh.
 - **CONTEXT.md** files (milestone or slice level) capture the brief — scope, goals, constraints, and key decisions from discussion. When present, they are the authoritative source for what a milestone or slice is trying to achieve. Read them before planning or executing.
 - **Milestones** are major project phases (M001, M002, ...)
 - **Slices** are demoable vertical increments (S01, S02, ...) ordered by risk. After each slice completes, the roadmap is reassessed before the next slice begins.
@@ -131,6 +134,7 @@ Templates showing the expected format for each artifact type are in:
 - `/gsd status` - progress dashboard overlay
 - `/gsd queue` - queue future milestones (safe while auto-mode is running)
 - `/gsd quick <task>` - quick task with GSD guarantees (atomic commits, state tracking) but no milestone ceremony
+- `/gsd codebase [generate|update|stats]` - manage the `.gsd/CODEBASE.md` cache used for prompt context
 - `{{shortcutDashboard}}` - toggle dashboard overlay
 - `{{shortcutShell}}` - show shell processes
 

@@ -27,6 +27,18 @@ interface ToolKeyConfig {
   hint: string
 }
 
+type ApiKeyCredential = { type?: string; key?: string }
+type LoginProviderId = Parameters<AuthStorage["login"]>[0]
+type LoginCallbacks = Parameters<AuthStorage["login"]>[1]
+type SlackAuthTestResponse = { ok?: boolean; user?: string }
+type TelegramGetMeResponse = {
+  ok?: boolean
+  result?: { id?: string | number; first_name?: string; username?: string }
+  description?: string
+}
+type DiscordUserResponse = { id?: string; username?: string }
+type DiscordChannel = { id: string; name: string; type: number }
+
 type ClackModule = typeof import('@clack/prompts')
 type PicoModule = {
   cyan: (s: string) => string
@@ -100,8 +112,8 @@ const OTHER_PROVIDERS = [
 // ─── Dynamic imports ──────────────────────────────────────────────────────────
 
 /**
- * Dynamically import @clack/prompts and picocolors.
- * Dynamic import with fallback so the module doesn't crash if they're missing.
+ * Dynamically import @clack/prompts.
+ * Dynamic import with fallback so the module doesn't crash if it's missing.
  */
 async function loadClack(): Promise<ClackModule> {
   try {
@@ -111,10 +123,23 @@ async function loadClack(): Promise<ClackModule> {
   }
 }
 
+/**
+ * Build the PicoModule color surface from chalk. Chalk is already a
+ * dependency of the CLI; this adapter keeps the onboarding call sites stable
+ * while removing the redundant picocolors dep.
+ */
 async function loadPico(): Promise<PicoModule> {
   try {
-    const mod = await import('picocolors')
-    return mod.default ?? mod
+    const { default: chalk } = await import('chalk')
+    return {
+      cyan: (s: string) => chalk.cyan(s),
+      green: (s: string) => chalk.green(s),
+      yellow: (s: string) => chalk.yellow(s),
+      dim: (s: string) => chalk.dim(s),
+      bold: (s: string) => chalk.bold(s),
+      red: (s: string) => chalk.red(s),
+      reset: (s: string) => chalk.reset(s),
+    }
   } catch {
     // Fallback: return identity functions
     const identity = (s: string) => s
@@ -135,9 +160,53 @@ function openBrowser(url: string): void {
   }
 }
 
-/** Check if an error is a clack cancel signal */
-function isCancelError(p: ClackModule, err: unknown): boolean {
-  return p.isCancel(err)
+/**
+ * Persist the selected default provider to settings.json.
+ *
+ * This ensures first startup after onboarding prefers the provider the user
+ * just configured, instead of falling back to the first "available" provider
+ * (which can be influenced by unrelated env auth like AWS_PROFILE).
+ */
+function persistDefaultProvider(providerId: string): void {
+  const settingsPath = join(agentDir, 'settings.json')
+  try {
+    const raw = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf-8')) : {}
+    raw.defaultProvider = providerId
+    mkdirSync(dirname(settingsPath), { recursive: true })
+    writeFileSync(settingsPath, JSON.stringify(raw, null, 2), 'utf-8')
+  } catch {
+    // Non-fatal: startup fallback logic will still run.
+  }
+}
+
+/** Sentinel returned by runStep when the user cancels — tells the caller
+ *  to abort the entire wizard. */
+const STEP_CANCELLED = Symbol('step-cancelled')
+type StepCancelled = typeof STEP_CANCELLED
+
+/**
+ * Run a single onboarding step with shared error handling:
+ *   - user cancel (Ctrl+C) → p.cancel(cancelMessage), returns STEP_CANCELLED
+ *   - other error → p.log.warn + optional info follow-up, returns null
+ *   - success → the step's return value
+ */
+async function runStep<T>(
+  p: ClackModule,
+  warnLabel: string,
+  fn: () => Promise<T>,
+  opts: { cancelMessage?: string; errorInfo?: string } = {},
+): Promise<T | null | StepCancelled> {
+  try {
+    return await fn()
+  } catch (err) {
+    if (p.isCancel(err)) {
+      p.cancel(opts.cancelMessage ?? 'Setup cancelled.')
+      return STEP_CANCELLED
+    }
+    p.log.warn(`${warnLabel}: ${err instanceof Error ? err.message : String(err)}`)
+    if (opts.errorInfo) p.log.info(opts.errorInfo)
+    return null
+  }
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -191,54 +260,30 @@ export async function runOnboarding(authStorage: AuthStorage): Promise<void> {
   p.intro(pc.bold('Welcome to GSD — let\'s get you set up'))
 
   // ── LLM Provider Selection ────────────────────────────────────────────────
-  let llmConfigured = false
-  try {
-    llmConfigured = await runLlmStep(p, pc, authStorage)
-  } catch (err) {
-    // User cancelled (Ctrl+C in clack throws) or unexpected error
-    if (isCancelError(p, err)) {
-      p.cancel('Setup cancelled — you can run /login inside GSD later.')
-      return
-    }
-    p.log.warn(`LLM setup failed: ${err instanceof Error ? err.message : String(err)}`)
-    p.log.info('You can configure your LLM provider later with /login inside GSD.')
-  }
+  const llmResult = await runStep(p, 'LLM setup failed', () => runLlmStep(p, pc, authStorage), {
+    cancelMessage: 'Setup cancelled — you can run /login inside GSD later.',
+    errorInfo: 'You can configure your LLM provider later with /login inside GSD.',
+  })
+  if (llmResult === STEP_CANCELLED) return
+  const llmConfigured = llmResult ?? false
 
   // ── Web Search Provider ──────────────────────────────────────────────────
-  let searchConfigured: string | null = null
-  try {
-    searchConfigured = await runWebSearchStep(p, pc, authStorage, llmConfigured)
-  } catch (err) {
-    if (isCancelError(p, err)) {
-      p.cancel('Setup cancelled.')
-      return
-    }
-    p.log.warn(`Web search setup failed: ${err instanceof Error ? err.message : String(err)}`)
-  }
+  const searchResult = await runStep(p, 'Web search setup failed',
+    () => runWebSearchStep(p, pc, authStorage, llmConfigured))
+  if (searchResult === STEP_CANCELLED) return
+  const searchConfigured = searchResult
 
   // ── Remote Questions ─────────────────────────────────────────────────────
-  let remoteConfigured: string | null = null
-  try {
-    remoteConfigured = await runRemoteQuestionsStep(p, pc, authStorage)
-  } catch (err) {
-    if (isCancelError(p, err)) {
-      p.cancel('Setup cancelled.')
-      return
-    }
-    p.log.warn(`Remote questions setup failed: ${err instanceof Error ? err.message : String(err)}`)
-  }
+  const remoteResult = await runStep(p, 'Remote questions setup failed',
+    () => runRemoteQuestionsStep(p, pc, authStorage))
+  if (remoteResult === STEP_CANCELLED) return
+  const remoteConfigured = remoteResult
 
   // ── Tool API Keys ─────────────────────────────────────────────────────────
-  let toolKeyCount = 0
-  try {
-    toolKeyCount = await runToolKeysStep(p, pc, authStorage)
-  } catch (err) {
-    if (isCancelError(p, err)) {
-      p.cancel('Setup cancelled.')
-      return
-    }
-    p.log.warn(`Tool key setup failed: ${err instanceof Error ? err.message : String(err)}`)
-  }
+  const toolResult = await runStep(p, 'Tool key setup failed',
+    () => runToolKeysStep(p, pc, authStorage))
+  if (toolResult === STEP_CANCELLED) return
+  const toolKeyCount = toolResult ?? 0
 
   // ── Summary ───────────────────────────────────────────────────────────────
   const summaryLines: string[] = []
@@ -323,6 +368,8 @@ async function runLlmStep(p: ClackModule, pc: PicoModule, authStorage: AuthStora
     p.log.info('Your Claude subscription will be used for inference. No API key needed.')
     // Store sentinel so hasAuth('claude-code') returns true on future boots
     authStorage.set('claude-code', { type: 'api_key', key: 'cli' })
+    // Persist claude-code so startup does not keep users on anthropic direct API.
+    persistDefaultProvider('claude-code')
     return true
   }
 
@@ -386,7 +433,7 @@ async function runOAuthFlow(
   s.start(`Authenticating with ${providerName}...`)
 
   try {
-    await authStorage.login(providerId as any, {
+    const loginCallbacks: LoginCallbacks = {
       onAuth: (info: { url: string; instructions?: string }) => {
         s.stop(`Opening browser for ${providerName}`)
         openBrowser(info.url)
@@ -416,7 +463,10 @@ async function runOAuthFlow(
             return result as string
           }
         : undefined,
-    } as any)
+    }
+
+    await authStorage.login(providerId as LoginProviderId, loginCallbacks)
+    persistDefaultProvider(providerId)
 
     p.log.success(`Authenticated with ${pc.green(providerName)}`)
     return true
@@ -465,6 +515,7 @@ async function runApiKeyFlow(
   }
 
   authStorage.set(providerId, { type: 'api_key', key: trimmed })
+  persistDefaultProvider(providerId)
   p.log.success(`API key saved for ${pc.green(providerLabel)}`)
 
   // Provider-specific post-setup hints
@@ -498,6 +549,7 @@ async function runOllamaLocalFlow(
       s.stop(`Ollama is running at ${pc.green(host)}`)
       // Store a placeholder so the provider is recognized as authenticated
       authStorage.set('ollama', { type: 'api_key', key: 'ollama' })
+      persistDefaultProvider('ollama')
       p.log.success(`${pc.green('Ollama (Local)')} configured — no API key needed`)
       p.log.info(pc.dim('Models are discovered automatically from your local Ollama instance.'))
       return true
@@ -520,6 +572,7 @@ async function runOllamaLocalFlow(
   if (p.isCancel(proceed) || !proceed) return false
 
   authStorage.set('ollama', { type: 'api_key', key: 'ollama' })
+  persistDefaultProvider('ollama')
   p.log.success(`${pc.green('Ollama (Local)')} saved — models will appear when Ollama is running`)
   return true
 }
@@ -572,6 +625,7 @@ async function runCustomOpenAIFlow(
 
   // Save API key to auth storage
   authStorage.set('custom-openai', { type: 'api_key', key: trimmedKey })
+  persistDefaultProvider('custom-openai')
 
   // Write or merge into models.json
   const modelsJsonPath = join(agentDir, 'models.json')
@@ -755,7 +809,9 @@ async function runRemoteQuestionsStep(
 ): Promise<string | null> {
   // Check existing config — use getCredentialsForProvider to skip empty-key entries
   const hasValidKey = (provider: string) =>
-    authStorage.getCredentialsForProvider(provider).some((c: any) => c.type === 'api_key' && c.key)
+    authStorage
+      .getCredentialsForProvider(provider)
+      .some((c: ApiKeyCredential) => c.type === 'api_key' && typeof c.key === 'string' && c.key.length > 0)
   const hasDiscord = hasValidKey('discord_bot')
   const hasSlack = hasValidKey('slack_bot')
   const hasTelegram = hasValidKey('telegram_bot')
@@ -818,7 +874,7 @@ async function runRemoteQuestionsStep(
         headers: { Authorization: `Bearer ${trimmed}` },
         signal: AbortSignal.timeout(15_000),
       })
-      const data = await res.json() as any
+      const data = await res.json() as SlackAuthTestResponse
       if (!data?.ok) {
         s.stop('Slack token validation failed')
         return null
@@ -865,7 +921,7 @@ async function runRemoteQuestionsStep(
       const res = await fetch(`https://api.telegram.org/bot${trimmed}/getMe`, {
         signal: AbortSignal.timeout(15_000),
       })
-      const data = await res.json() as any
+      const data = await res.json() as TelegramGetMeResponse
       if (!data?.ok || !data?.result?.id) {
         s.stop('Telegram token validation failed')
         return null
@@ -898,7 +954,7 @@ async function runRemoteQuestionsStep(
         body: JSON.stringify({ chat_id: trimmedChatId, text: 'GSD remote questions connected.' }),
         signal: AbortSignal.timeout(15_000),
       })
-      const data = await res.json() as any
+      const data = await res.json() as TelegramGetMeResponse
       if (!data?.ok) {
         ts.stop(`Could not send to chat: ${data?.description ?? 'unknown error'}`)
         return null
@@ -924,7 +980,7 @@ async function runDiscordChannelStep(p: ClackModule, pc: PicoModule, token: stri
   // Validate token
   const s = p.spinner()
   s.start('Validating Discord bot token...')
-  let auth: any
+  let auth: DiscordUserResponse
   try {
     const res = await fetch('https://discord.com/api/v10/users/@me', { headers, signal: AbortSignal.timeout(15_000) })
     auth = await res.json()
@@ -972,11 +1028,19 @@ async function runDiscordChannelStep(p: ClackModule, pc: PicoModule, token: stri
   }
 
   // Fetch channels
-  let channels: Array<{ id: string; name: string; type: number }>
+  let channels: DiscordChannel[]
   try {
     const res = await fetch(`https://discord.com/api/v10/guilds/${guildId}/channels`, { headers, signal: AbortSignal.timeout(15_000) })
     const data = await res.json()
-    channels = Array.isArray(data) ? data.filter((ch: any) => ch.type === 0 || ch.type === 5) : []
+    channels = Array.isArray(data)
+      ? data.filter((ch): ch is DiscordChannel =>
+          typeof ch === 'object' &&
+          ch !== null &&
+          typeof (ch as { id?: unknown }).id === 'string' &&
+          typeof (ch as { name?: unknown }).name === 'string' &&
+          ((ch as { type?: unknown }).type === 0 || (ch as { type?: unknown }).type === 5),
+        )
+      : []
   } catch {
     p.log.warn('Could not fetch channels — configure later with /gsd remote discord')
     return null
@@ -1020,4 +1084,3 @@ async function runDiscordChannelStep(p: ClackModule, pc: PicoModule, token: stri
   p.log.success(`Discord channel: ${pc.green(channelName ? `#${channelName}` : channelId)}`)
   return channelName ?? null
 }
-

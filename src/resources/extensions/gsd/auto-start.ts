@@ -15,6 +15,7 @@ import type {
 } from "@gsd/pi-coding-agent";
 import { deriveState } from "./state.js";
 import { loadFile, getManifestStatus } from "./files.js";
+import type { InterruptedSessionAssessment } from "./interrupted-session.js";
 import {
   loadEffectiveGSDPreferences,
   resolveSkillDiscoveryMode,
@@ -23,16 +24,9 @@ import {
 import { ensureGsdSymlink, isInheritedRepo, validateProjectId } from "./repo-identity.js";
 import { migrateToExternalState, recoverFailedMigration } from "./migrate-external.js";
 import { collectSecretsFromManifest } from "../get-secrets-from-user.js";
-import { gsdRoot, resolveMilestoneFile, milestonesDir } from "./paths.js";
+import { gsdRoot, resolveMilestoneFile } from "./paths.js";
 import { invalidateAllCaches } from "./cache.js";
-import { synthesizeCrashRecovery } from "./session-forensics.js";
-import {
-  writeLock,
-  clearLock,
-  readCrashLock,
-  formatCrashInfo,
-  isLockProcessAlive,
-} from "./crash-recovery.js";
+import { writeLock, clearLock } from "./crash-recovery.js";
 import {
   acquireSessionLock,
   releaseSessionLock,
@@ -89,8 +83,13 @@ import { join } from "node:path";
 import { sep as pathSep } from "node:path";
 
 import { resolveProjectRootDbPath } from "./bootstrap/dynamic-tools.js";
-import { resolveDefaultSessionModel } from "./preferences-models.js";
+import {
+  isCustomProvider,
+  resolveDefaultSessionModel,
+  resolveDynamicRoutingConfig,
+} from "./preferences-models.js";
 import type { WorktreeResolver } from "./worktree-resolver.js";
+import { getSessionModelOverride } from "./session-model-override.js";
 
 export interface BootstrapDeps {
   shouldUseWorktreeIsolation: () => boolean;
@@ -248,6 +247,7 @@ export async function bootstrapAutoSession(
   verboseMode: boolean,
   requestedStepMode: boolean,
   deps: BootstrapDeps,
+  interrupted: InterruptedSessionAssessment,
 ): Promise<boolean> {
   const {
     shouldUseWorktreeIsolation,
@@ -271,13 +271,52 @@ export async function bootstrapAutoSession(
   // Capture the user's session model before guided-flow dispatch can apply a
   // phase-specific planning model for a discuss turn (#2829).
   //
-  // GSD PREFERENCES.md takes priority over the session model from settings.json
-  // (#3517).  The session model (ctx.model) comes from findInitialModel() which
-  // reads defaultProvider/defaultModel from ~/.gsd/agent/settings.json.  When
-  // the user has explicit model preferences in PREFERENCES.md, those should win.
-  const preferredModel = resolveDefaultSessionModel(ctx.model?.provider);
-  const startModelSnapshot = preferredModel
-    ?? (ctx.model
+  // Precedence:
+  // 1) Explicit session override via /gsd model (this session)
+  // 2) GSD model preferences from PREFERENCES.md (validated against live auth)
+  // 3) Current session model from settings/session restore (if provider ready)
+  //
+  // This preserves #3517 defaults while honoring explicit runtime model
+  // selection for subsequent /gsd runs in the same session.
+  //
+  // Exception (#4122): when the session provider is a custom provider declared
+  // in ~/.gsd/agent/models.json (Ollama, vLLM, OpenAI-compatible proxy, etc.),
+  // PREFERENCES.md is skipped entirely. PREFERENCES.md cannot reference custom
+  // providers, so honoring it would silently reroute auto-mode to a built-in
+  // provider the user is not logged into and surface as "Not logged in · Please
+  // run /login" before pausing and resetting to claude-code/claude-sonnet-4-6.
+  const manualSessionOverride = getSessionModelOverride(ctx.sessionManager.getSessionId());
+  const sessionProviderIsCustom = isCustomProvider(ctx.model?.provider);
+  const preferredModel = sessionProviderIsCustom
+    ? null
+    : resolveDefaultSessionModel(ctx.model?.provider);
+  // Validate the preferred model against the live registry + provider auth so
+  // an unconfigured PREFERENCES.md entry (no API key / OAuth) can't become the
+  // start-model snapshot. Without this, every subsequent unit would try to
+  // fall back to an unusable model.
+  let validatedPreferredModel: { provider: string; id: string } | undefined;
+  if (preferredModel) {
+    const { resolveModelId } = await import("./auto-model-selection.js");
+    const available = ctx.modelRegistry.getAvailable();
+    const match = resolveModelId(
+      `${preferredModel.provider}/${preferredModel.id}`,
+      available,
+      ctx.model?.provider,
+    );
+    if (match) {
+      validatedPreferredModel = { provider: match.provider, id: match.id };
+    } else {
+      ctx.ui.notify(
+        `Preferred model ${preferredModel.provider}/${preferredModel.id} from PREFERENCES.md is not configured; falling back to session default.`,
+        "warning",
+      );
+    }
+  }
+  const sessionModelReady =
+    ctx.model && ctx.modelRegistry.isProviderRequestReady(ctx.model.provider);
+  const startModelSnapshot = manualSessionOverride
+    ?? validatedPreferredModel
+    ?? (sessionModelReady && ctx.model
       ? { provider: ctx.model.provider, id: ctx.model.id }
       : null);
 
@@ -340,56 +379,16 @@ export async function bootstrapAutoSession(
       }
     }
 
+    {
+      const { prepareWorkflowMcpForProject } = await import("./workflow-mcp-auto-prep.js");
+      prepareWorkflowMcpForProject(ctx, base);
+    }
+
     // Initialize GitServiceImpl
     s.gitService = new GitServiceImpl(
       s.basePath,
       loadEffectiveGSDPreferences()?.preferences?.git ?? {},
     );
-
-    // Check for crash from previous session. Skip our own fresh bootstrap lock.
-    const crashLock = readCrashLock(base);
-    if (crashLock && crashLock.pid !== process.pid) {
-      if (isLockProcessAlive(crashLock)) {
-        ctx.ui.notify(
-          `Another auto-mode session (PID ${crashLock.pid}) appears to be running.\nStop it with \`kill ${crashLock.pid}\` before starting a new session.`,
-          "error",
-        );
-        return releaseLockAndReturn();
-      }
-      const recoveredMid = parseUnitId(crashLock.unitId).milestone;
-      const milestoneAlreadyComplete = recoveredMid
-        ? !!resolveMilestoneFile(base, recoveredMid, "SUMMARY")
-        : false;
-
-      if (milestoneAlreadyComplete) {
-        ctx.ui.notify(
-          `Crash recovery: discarding stale context for ${crashLock.unitId} — milestone ${recoveredMid} is already complete.`,
-          "info",
-        );
-      } else {
-        const activityDir = join(gsdRoot(base), "activity");
-        const recovery = synthesizeCrashRecovery(
-          base,
-          crashLock.unitType,
-          crashLock.unitId,
-          crashLock.sessionFile,
-          activityDir,
-        );
-        if (recovery && recovery.trace.toolCallCount > 0) {
-          s.pendingCrashRecovery = recovery.prompt;
-          ctx.ui.notify(
-            `${formatCrashInfo(crashLock)}\nRecovered ${recovery.trace.toolCallCount} tool calls from crashed session. Resuming with full context.`,
-            "warning",
-          );
-        } else {
-          ctx.ui.notify(
-            `${formatCrashInfo(crashLock)}\nNo session data recovered. Resuming from disk state.`,
-            "warning",
-          );
-        }
-      }
-      clearLock(base);
-    }
 
     // ── Debug mode ──
     if (!isDebugEnabled() && process.env.GSD_DEBUG === "1") {
@@ -408,6 +407,10 @@ export async function bootstrapAutoSession(
         cwd: base,
       });
       ctx.ui.notify(`Debug logging enabled → ${getDebugLogPath()}`, "info");
+    }
+
+    if (interrupted.classification !== "recoverable") {
+      s.pendingCrashRecovery = null;
     }
 
     // Invalidate caches before initial state derivation
@@ -461,11 +464,12 @@ export async function bootstrapAutoSession(
     // Detect survivor milestone branches in both pre-planning and complete phases.
     // In phase=complete, the milestone artifacts exist but finalization (merge,
     // worktree cleanup) was never run — the survivor branch must be merged.
+    // Applies to both worktree and branch isolation modes.
     let hasSurvivorBranch = false;
     if (
       state.activeMilestone &&
       (state.phase === "pre-planning" || state.phase === "complete") &&
-      shouldUseWorktreeIsolation() &&
+      getIsolationMode() !== "none" &&
       !detectWorktreeName(base) &&
       !base.includes(`${pathSep}.gsd${pathSep}worktrees${pathSep}`)
     ) {
@@ -635,6 +639,9 @@ export async function bootstrapAutoSession(
     s.consecutiveCompleteBootstraps = 0;
 
     // ── Initialize session state ──
+    // Notify shared phase state so subagent conflict checks can fire
+    const { activateGSD: activateGSDPhaseState } = await import("../shared/gsd-phase-state.js");
+    activateGSDPhaseState();
     s.active = true;
     s.stepMode = requestedStepMode;
     s.verbose = verboseMode;
@@ -705,7 +712,7 @@ export async function bootstrapAutoSession(
 
     if (
       s.currentMilestoneId &&
-      shouldUseWorktreeIsolation() &&
+      getIsolationMode() !== "none" &&
       !detectWorktreeName(base) &&
       !isUnderGsdWorktrees(base)
     ) {
@@ -719,7 +726,7 @@ export async function bootstrapAutoSession(
     }
 
     // ── DB lifecycle ──
-    const gsdDbPath = join(s.basePath, ".gsd", "gsd.db");
+    const gsdDbPath = resolveProjectRootDbPath(s.basePath);
     const gsdDirPath = join(s.basePath, ".gsd");
     if (existsSync(gsdDirPath) && !existsSync(gsdDbPath)) {
       const hasDecisions = existsSync(join(gsdDirPath, "DECISIONS.md"));
@@ -772,6 +779,7 @@ export async function bootstrapAutoSession(
         id: startModelSnapshot.id,
       };
     }
+    s.manualSessionModelOverride = manualSessionOverride ?? null;
 
     // Apply worker model override from parallel orchestrator (#worker-model).
     // GSD_WORKER_MODEL is injected by the coordinator when parallel.worker_model
@@ -799,6 +807,9 @@ export async function bootstrapAutoSession(
 
     ctx.ui.setStatus("gsd-auto", s.stepMode ? "next" : "auto");
     ctx.ui.setFooter(hideFooter);
+    // Hide gsd-health during AUTO — gsd-progress is the single source of truth
+    // for last-commit / cost / health signal while auto is running.
+    ctx.ui.setWidget("gsd-health", undefined);
     const modeLabel = s.stepMode ? "Step-mode" : "Auto-mode";
     const pendingCount = (state.registry ?? []).filter(
       (m) => m.status !== "complete" && m.status !== "parked",
@@ -808,6 +819,47 @@ export async function bootstrapAutoSession(
         ? `Will loop through ${pendingCount} milestones.`
         : "Will loop until milestone complete.";
     ctx.ui.notify(`${modeLabel} started. ${scopeMsg}`, "info");
+
+    // Show dynamic routing status so users know upfront if models will be
+    // downgraded for simple tasks (#3962).
+    // Use the same effective logic as selectAndApplyModel: check flat-rate
+    // provider suppression and resolve the actual ceiling model.
+    const routingConfig = resolveDynamicRoutingConfig();
+    const startModelLabel = s.autoModeStartModel
+      ? `${s.autoModeStartModel.provider}/${s.autoModeStartModel.id}`
+      : ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "default";
+
+    // Flat-rate providers (e.g. GitHub Copilot, claude-code, user-declared
+    // subscription proxies, externalCli CLIs) suppress routing at dispatch
+    // time (#3453) — reflect that in the banner.  Thread the same
+    // FlatRateContext used by selectAndApplyModel so user-declared
+    // flat-rate providers and externalCli auto-detection are respected.
+    const { isFlatRateProvider, buildFlatRateContext } = await import("./auto-model-selection.js");
+    const bannerPrefs = loadEffectiveGSDPreferences()?.preferences;
+    const effectiveProvider = s.autoModeStartModel?.provider ?? ctx.model?.provider;
+    const effectivelyEnabled = routingConfig.enabled
+      && (routingConfig.allow_flat_rate_providers
+        || !(effectiveProvider && isFlatRateProvider(
+          effectiveProvider,
+          buildFlatRateContext(effectiveProvider, ctx, bannerPrefs),
+        )));
+
+    // The actual ceiling may come from tier_models.heavy, not the start model.
+    const effectiveCeiling = (routingConfig.enabled && routingConfig.tier_models?.heavy)
+      ? routingConfig.tier_models.heavy
+      : startModelLabel;
+
+    if (effectivelyEnabled) {
+      ctx.ui.notify(
+        `Dynamic routing: enabled — simple tasks may use cheaper models (ceiling: ${effectiveCeiling})`,
+        "info",
+      );
+    } else {
+      ctx.ui.notify(
+        `Dynamic routing: disabled — all tasks will use ${startModelLabel}`,
+        "info",
+      );
+    }
 
     updateSessionLock(
       lockBase(),
@@ -909,4 +961,3 @@ export async function bootstrapAutoSession(
     throw err;
   }
 }
-

@@ -13,7 +13,8 @@ import type { GSDState } from "./types.js";
 import type { GSDPreferences } from "./preferences.js";
 import type { UatType } from "./files.js";
 import { loadFile, extractUatType, loadActiveOverrides } from "./files.js";
-import { isDbAvailable, getMilestoneSlices, getPendingGates, markAllGatesOmitted, getMilestone } from "./gsd-db.js";
+import { isDbAvailable, getMilestoneSlices, getPendingGates, markAllGatesOmitted, getMilestone, updateMilestoneStatus } from "./gsd-db.js";
+import { isClosedStatus } from "./status-guards.js";
 import { extractVerdict, isAcceptableUatVerdict } from "./verdict-parser.js";
 
 import {
@@ -38,6 +39,7 @@ import {
   buildPlanMilestonePrompt,
   buildResearchSlicePrompt,
   buildPlanSlicePrompt,
+  buildRefineSlicePrompt,
   buildExecuteTaskPrompt,
   buildCompleteSlicePrompt,
   buildCompleteMilestonePrompt,
@@ -52,6 +54,9 @@ import {
   checkNeedsReassessment,
   checkNeedsRunUat,
 } from "./auto-prompts.js";
+import { resolveModelWithFallbacksForUnit } from "./preferences-models.js";
+import { resolveUokFlags } from "./uok/flags.js";
+import { selectReactiveDispatchBatch } from "./uok/execution-graph.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -75,6 +80,7 @@ export interface DispatchContext {
   state: GSDState;
   prefs: GSDPreferences | undefined;
   session?: import("./auto/session.js").AutoSession;
+  structuredQuestionsAvailable?: "true" | "false";
 }
 
 export interface DispatchRule {
@@ -178,12 +184,31 @@ export function incrementUatCount(basePath: string, mid: string, sid: string): n
 export function isVerificationNotApplicable(value: string): boolean {
   const v = (value ?? "").toLowerCase().trim().replace(/[.\s]+$/, "");
   if (!v || v === "none") return true;
-  return /^(?:none[\s._-]*(?:required|needed|planned)?|n\/?a|not[\s._-]+(?:applicable|required|needed|provided)|no[\s._-]+operational[\s\S]*)$/i.test(v);
+  return /^(?:none(?:[\s._\u2014-]+[\s\S]*)?|n\/?a|not[\s._-]+(?:applicable|required|needed|provided)|no[\s._-]+operational[\s\S]*)$/i.test(v);
 }
 
 // ─── Rules ────────────────────────────────────────────────────────────────
 
 export const DISPATCH_RULES: DispatchRule[] = [
+  {
+    // ADR-011 Phase 2: pause-for-escalation must evaluate FIRST so phase-
+    // agnostic rules (rewrite-docs gate, UAT checks, reassess) cannot bypass
+    // the user's pending decision. Only fires for continueWithDefault=false
+    // escalations (those set escalation_pending=1); awaiting-review artifacts
+    // never enter the 'escalating-task' phase.
+    name: "escalating-task → pause-for-escalation",
+    match: async ({ state, mid }) => {
+      if (state.phase !== "escalating-task") return null;
+      if (!state.activeSlice) return missingSliceStop(mid, state.phase);
+      return {
+        action: "stop",
+        reason:
+          state.nextAction ||
+          `${mid}: task escalation awaits user resolution. Run /gsd escalate list to see pending items.`,
+        level: "info",
+      };
+    },
+  },
   {
     name: "rewrite-docs (override gate)",
     match: async ({ mid, midTitle, state, basePath, session }) => {
@@ -306,8 +331,11 @@ export const DISPATCH_RULES: DispatchRule[] = [
   {
     name: "reassess-roadmap (post-completion)",
     match: async ({ state, mid, midTitle, basePath, prefs }) => {
-      if (prefs?.phases?.skip_reassess || !prefs?.phases?.reassess_after_slice)
-        return null;
+      if (prefs?.phases?.skip_reassess) return null;
+      // Default reassess_after_slice to true — reassessment after slice completion
+      // is essential for roadmap integrity. Opt-out via explicit `false`.
+      const reassessEnabled = prefs?.phases?.reassess_after_slice ?? true;
+      if (!reassessEnabled) return null;
       const needsReassess = await checkNeedsReassessment(basePath, mid, state);
       if (!needsReassess) return null;
       return {
@@ -325,19 +353,24 @@ export const DISPATCH_RULES: DispatchRule[] = [
   },
   {
     name: "needs-discussion → discuss-milestone",
-    match: async ({ state, mid, midTitle, basePath }) => {
+    match: async ({ state, mid, midTitle, basePath, structuredQuestionsAvailable }) => {
       if (state.phase !== "needs-discussion") return null;
       return {
         action: "dispatch",
         unitType: "discuss-milestone",
         unitId: mid,
-        prompt: await buildDiscussMilestonePrompt(mid, midTitle, basePath),
+        prompt: await buildDiscussMilestonePrompt(
+          mid,
+          midTitle,
+          basePath,
+          structuredQuestionsAvailable,
+        ),
       };
     },
   },
   {
     name: "pre-planning (no context) → discuss-milestone",
-    match: async ({ state, mid, midTitle, basePath }) => {
+    match: async ({ state, mid, midTitle, basePath, structuredQuestionsAvailable }) => {
       if (state.phase !== "pre-planning") return null;
       const contextFile = resolveMilestoneFile(basePath, mid, "CONTEXT");
       const hasContext = !!(contextFile && (await loadFile(contextFile)));
@@ -346,7 +379,12 @@ export const DISPATCH_RULES: DispatchRule[] = [
         action: "dispatch",
         unitType: "discuss-milestone",
         unitId: mid,
-        prompt: await buildDiscussMilestonePrompt(mid, midTitle, basePath),
+        prompt: await buildDiscussMilestonePrompt(
+          mid,
+          midTitle,
+          basePath,
+          structuredQuestionsAvailable,
+        ),
       };
     },
   },
@@ -414,6 +452,12 @@ export const DISPATCH_RULES: DispatchRule[] = [
       // Only dispatch parallel if 2+ slices are ready
       if (researchReadySlices.length < 2) return null;
 
+      // #4414: If a previous parallel-research attempt escalated to a blocker
+      // placeholder, skip this rule and fall through to per-slice research
+      // (or other rules) rather than re-dispatching the same failing unit.
+      const parallelBlocker = resolveMilestoneFile(basePath, mid, "PARALLEL-BLOCKER");
+      if (parallelBlocker) return null;
+
       return {
         action: "dispatch",
         unitType: "research-slice",
@@ -423,6 +467,7 @@ export const DISPATCH_RULES: DispatchRule[] = [
           midTitle,
           researchReadySlices,
           basePath,
+          resolveModelWithFallbacksForUnit("subagent")?.primary,
         ),
       };
     },
@@ -458,6 +503,58 @@ export const DISPATCH_RULES: DispatchRule[] = [
           sTitle,
           basePath,
         ),
+      };
+    },
+  },
+  {
+    // ADR-011: sketch-then-refine. When `refining` phase fires, expand the
+    // sketch into a full plan using the prior slice's SUMMARY and the current
+    // codebase. If the user flipped `progressive_planning` off mid-milestone
+    // while a slice is still `is_sketch=1`, fall through to a standard
+    // plan-slice so the loop doesn't dead-end.
+    //
+    // Note on the flag-OFF downgrade: plan-slice does not explicitly clear
+    // `is_sketch`. After it writes PLAN.md, the auto-heal in state.ts's
+    // `deriveStateFromDb` (via `autoHealSketchFlags`) flips the flag on the
+    // next iteration. That implicit coupling is the sole mechanism that
+    // reconciles `is_sketch=1` on the plan-slice path — do not remove the
+    // auto-heal without either adding an explicit `setSliceSketchFlag(..., false)`
+    // call here or doing so inside the plan-slice tool handler.
+    name: "refining → refine-slice",
+    match: async ({ state, mid, midTitle, basePath, prefs }) => {
+      if (state.phase !== "refining") return null;
+      if (!state.activeSlice) return missingSliceStop(mid, state.phase);
+      const sid = state.activeSlice.id;
+      const sTitle = state.activeSlice.title;
+      const progressiveOn = prefs?.phases?.progressive_planning === true;
+      if (!progressiveOn) {
+        // Graceful downgrade: treat the sketch as a normal slice needing a plan,
+        // but forward the stored sketch_scope as a SOFT hint so the scope
+        // signal isn't silently lost. The planner may expand beyond it.
+        let softScopeHint = "";
+        try {
+          const { isDbAvailable, getSlice } = await import("./gsd-db.js");
+          if (isDbAvailable()) {
+            softScopeHint = getSlice(mid, sid)?.sketch_scope ?? "";
+          }
+        } catch {
+          softScopeHint = "";
+        }
+        return {
+          action: "dispatch",
+          unitType: "plan-slice",
+          unitId: `${mid}/${sid}`,
+          prompt: await buildPlanSlicePrompt(
+            mid, midTitle, sid, sTitle, basePath, undefined,
+            softScopeHint ? { softScopeHint } : undefined,
+          ),
+        };
+      }
+      return {
+        action: "dispatch",
+        unitType: "refine-slice",
+        unitId: `${mid}/${sid}`,
+        prompt: await buildRefineSlicePrompt(mid, midTitle, sid, sTitle, basePath),
       };
     },
   },
@@ -510,6 +607,7 @@ export const DISPATCH_RULES: DispatchRule[] = [
           sid,
           sTitle,
           basePath,
+          resolveModelWithFallbacksForUnit("subagent")?.primary,
         ),
       };
     },
@@ -548,6 +646,7 @@ export const DISPATCH_RULES: DispatchRule[] = [
       const sid = state.activeSlice.id;
       const sTitle = state.activeSlice.title;
       const maxParallel = reactiveConfig.max_parallel ?? 2;
+      const subagentModel = reactiveConfig.subagent_model ?? resolveModelWithFallbacksForUnit("subagent")?.primary;
 
       // Dry-run mode: max_parallel=1 means graph is derived and logged but
       // execution remains sequential
@@ -577,12 +676,20 @@ export const DISPATCH_RULES: DispatchRule[] = [
         // Only activate reactive dispatch when >1 task is ready
         if (readyIds.length <= 1) return null;
 
-        const selected = chooseNonConflictingSubset(
-          readyIds,
-          graph,
-          maxParallel,
-          new Set(),
-        );
+        const uokFlags = resolveUokFlags(prefs);
+        const selected = uokFlags.executionGraph
+          ? selectReactiveDispatchBatch({
+              graph,
+              readyIds,
+              maxParallel,
+              inFlightOutputs: new Set(),
+            }).selected
+          : chooseNonConflictingSubset(
+              readyIds,
+              graph,
+              maxParallel,
+              new Set(),
+            );
         if (selected.length <= 1) return null;
 
         // Log graph metrics for observability
@@ -618,6 +725,7 @@ export const DISPATCH_RULES: DispatchRule[] = [
             sTitle,
             selected,
             basePath,
+            subagentModel,
           ),
         };
       } catch (err) {
@@ -736,6 +844,34 @@ export const DISPATCH_RULES: DispatchRule[] = [
     name: "completing-milestone → complete-milestone",
     match: async ({ state, mid, midTitle, basePath }) => {
       if (state.phase !== "completing-milestone") return null;
+
+      // Defense-in-depth (#4324): skip dispatch if the DB already marks
+      // this milestone as complete. Prevents re-enqueue when the legacy
+      // filesystem state-derivation path runs (e.g. transient DB
+      // unavailability) and produces a stale completing-milestone phase.
+      if (isDbAvailable()) {
+        const milestone = getMilestone(mid);
+        if (milestone && isClosedStatus(milestone.status)) {
+          return { action: "skip" };
+        }
+      }
+
+      // Reconciliation guard (#4324): when the SUMMARY file already exists
+      // on disk but the DB says the milestone is not complete, the DB is
+      // out of sync (e.g. journal reset, partial merge, crash recovery).
+      // Reconcile the DB status directly instead of re-dispatching the
+      // tool, which would overwrite the richer on-disk SUMMARY with a
+      // thinner regenerated version — causing silent data loss.
+      const existingSummary = resolveMilestoneFile(basePath, mid, "SUMMARY");
+      if (existingSummary && isDbAvailable()) {
+        try {
+          updateMilestoneStatus(mid, "complete", new Date().toISOString());
+          logWarning("dispatch", `Milestone ${mid} has SUMMARY on disk but DB status was not complete — reconciled DB to complete (#4324)`);
+        } catch (err) {
+          logWarning("dispatch", `Failed to reconcile milestone ${mid} status: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return { action: "skip" };
+      }
 
       // Safety guard (#2675): block completion when VALIDATION verdict is
       // needs-remediation. The state machine treats needs-remediation as
@@ -872,11 +1008,14 @@ export async function resolveDispatch(
     }
   }
 
-  // No rule matched — unhandled phase
+  // No rule matched — unhandled phase.
+  // Use level "warning" so the loop pauses (resumable) instead of hard-stopping.
+  // Hard-stop here was causing premature termination for transient phase gaps
+  // (e.g. after reassessment modifies the roadmap and state needs re-derivation).
   return {
     action: "stop",
     reason: `Unhandled phase "${ctx.state.phase}" — run /gsd doctor to diagnose.`,
-    level: "info",
+    level: "warning",
     matchedRule: "<no-match>",
   };
 }

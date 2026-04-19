@@ -287,9 +287,9 @@ test("resolveModelForComplexity falls back to tier-only when capability_routing 
   assert.ok(!result.selectionMethod || result.selectionMethod === "tier-only");
 });
 
-test("MODEL_CAPABILITY_PROFILES has entries for core models", () => {
+test("MODEL_CAPABILITY_PROFILES has entries for all tier-mapped models", () => {
   const profiledModels = Object.keys(MODEL_CAPABILITY_PROFILES);
-  assert.ok(profiledModels.length >= 9, `Expected ≥9 profiles, got ${profiledModels.length}`);
+  assert.ok(profiledModels.length >= 30, `Expected ≥30 profiles, got ${profiledModels.length}`);
   assert.ok(MODEL_CAPABILITY_PROFILES["claude-opus-4-6"]);
   assert.ok(MODEL_CAPABILITY_PROFILES["claude-haiku-4-5"]);
 });
@@ -298,7 +298,7 @@ test("MODEL_CAPABILITY_PROFILES has entries for core models", () => {
 
 test("#2885: openai-codex light-tier models are recognized", () => {
   const config = { ...defaultRoutingConfig(), enabled: true };
-  const lightModels = ["gpt-4.1-mini", "gpt-4.1-nano", "gpt-5-mini", "gpt-5-nano", "gpt-5.1-codex-mini", "gpt-5.3-codex-spark"];
+  const lightModels = ["gpt-4.1-mini", "gpt-4.1-nano", "gpt-5-mini", "gpt-5-nano", "gpt-5.1-codex-mini", "gpt-5.3-codex-spark", "gpt-5.4-mini"];
   for (const model of lightModels) {
     const result = resolveModelForComplexity(
       makeClassification("light"),

@@ -9,8 +9,10 @@ import { debugTime } from "../debug-logger.js";
 import { loadPrompt, getTemplatesDir } from "../prompt-loader.js";
 import { readForensicsMarker } from "../forensics.js";
 import { resolveAllSkillReferences, renderPreferencesForSystemPrompt, loadEffectiveGSDPreferences } from "../preferences.js";
+import { resolveModelWithFallbacksForUnit } from "../preferences-models.js";
 import { resolveSkillReference } from "../preferences-skills.js";
 import { resolveGsdRootFile, resolveSliceFile, resolveSlicePath, resolveTaskFile, resolveTaskFiles, resolveTasksDir, relSliceFile, relSlicePath, relTaskFile } from "../paths.js";
+import { ensureCodebaseMapFresh, readCodebaseMap } from "../codebase-generator.js";
 import { hasSkillSnapshot, detectNewSkills, formatSkillsXml } from "../skill-discovery.js";
 import { getActiveAutoWorktreeContext } from "../auto-worktree.js";
 import { getActiveWorktreeName, getWorktreeOriginalCwd } from "../worktree-command.js";
@@ -18,6 +20,7 @@ import { deriveState } from "../state.js";
 import { formatOverridesSection, formatShortcut, loadActiveOverrides, loadFile, parseContinue, parseSummary } from "../files.js";
 import { toPosixPath } from "../../shared/mod.js";
 import { markCmuxPromptShown, shouldPromptToEnableCmux } from "../../cmux/index.js";
+import { autoEnableCmuxPreferences } from "../commands-cmux.js";
 
 const gsdHome = process.env.GSD_HOME || join(homedir(), ".gsd");
 
@@ -75,13 +78,16 @@ export async function buildBeforeAgentStartResult(
     shortcutDashboard: formatShortcut("Ctrl+Alt+G"),
     shortcutShell: formatShortcut("Ctrl+Alt+B"),
   });
-  const loadedPreferences = loadEffectiveGSDPreferences();
+  let loadedPreferences = loadEffectiveGSDPreferences();
   if (shouldPromptToEnableCmux(loadedPreferences?.preferences)) {
     markCmuxPromptShown();
-    ctx.ui.notify(
-      "cmux detected. Run /gsd cmux on to enable sidebar metadata, notifications, and visual subagent splits for this project.",
-      "info",
-    );
+    if (autoEnableCmuxPreferences()) {
+      loadedPreferences = loadEffectiveGSDPreferences();
+      ctx.ui.notify(
+        "cmux detected — auto-enabled. Run /gsd cmux off to disable.",
+        "info",
+      );
+    }
   }
 
   let preferenceBlock = "";
@@ -128,10 +134,24 @@ export async function buildBeforeAgentStartResult(
   }
 
   let codebaseBlock = "";
+  try {
+    const codebaseOptions = loadedPreferences?.preferences?.codebase
+      ? {
+          excludePatterns: loadedPreferences.preferences.codebase.exclude_patterns,
+          maxFiles: loadedPreferences.preferences.codebase.max_files,
+          collapseThreshold: loadedPreferences.preferences.codebase.collapse_threshold,
+        }
+      : undefined;
+    ensureCodebaseMapFresh(process.cwd(), codebaseOptions);
+  } catch (e) {
+    logWarning("bootstrap", `CODEBASE refresh failed: ${(e as Error).message}`);
+  }
+
   const codebasePath = resolveGsdRootFile(process.cwd(), "CODEBASE");
-  if (existsSync(codebasePath)) {
+  const rawCodebase = readCodebaseMap(process.cwd());
+  if (existsSync(codebasePath) && rawCodebase) {
     try {
-      const rawContent = readFileSync(codebasePath, "utf-8").trim();
+      const rawContent = rawCodebase.trim();
       if (rawContent) {
         // Cap injection size to ~2 000 tokens to avoid bloating every request.
         // Full map is always available at .gsd/CODEBASE.md.
@@ -141,7 +161,7 @@ export async function buildBeforeAgentStartResult(
         const content = rawContent.length > MAX_CODEBASE_CHARS
           ? rawContent.slice(0, MAX_CODEBASE_CHARS) + "\n\n*(truncated — see .gsd/CODEBASE.md for full map)*"
           : rawContent;
-        codebaseBlock = `\n\n[PROJECT CODEBASE — File structure and descriptions (generated ${generatedAt}, may be stale — run /gsd codebase update to refresh)]\n\n${content}`;
+        codebaseBlock = `\n\n[PROJECT CODEBASE — File structure and descriptions (generated ${generatedAt}, auto-refreshed when GSD detects tracked file changes; use /gsd codebase stats for status)]\n\n${content}`;
       }
     } catch (e) {
       logWarning("bootstrap", `CODEBASE file read failed: ${(e as Error).message}`);
@@ -153,10 +173,16 @@ export async function buildBeforeAgentStartResult(
   const injection = await buildGuidedExecuteContextInjection(event.prompt, process.cwd());
 
   // Re-inject forensics context on follow-up turns (#2941)
-  const forensicsInjection = !injection ? buildForensicsContextInjection(process.cwd()) : null;
+  const forensicsInjection = !injection ? buildForensicsContextInjection(process.cwd(), event.prompt) : null;
 
   const worktreeBlock = buildWorktreeContextBlock();
-  const fullSystem = `${event.systemPrompt}\n\n[SYSTEM CONTEXT — GSD]\n\n${systemContent}${preferenceBlock}${knowledgeBlock}${codebaseBlock}${memoryBlock}${newSkillsBlock}${worktreeBlock}`;
+
+  const subagentModelConfig = resolveModelWithFallbacksForUnit("subagent");
+  const subagentModelBlock = subagentModelConfig
+    ? `\n\n## Subagent Model\n\nWhen spawning subagents via the \`subagent\` tool, always pass \`model: "${subagentModelConfig.primary}"\` in the tool call parameters. Never omit this — always specify it explicitly.`
+    : "";
+
+  const fullSystem = `${event.systemPrompt}\n\n[SYSTEM CONTEXT — GSD]\n\n${systemContent}${preferenceBlock}${knowledgeBlock}${codebaseBlock}${memoryBlock}${newSkillsBlock}${worktreeBlock}${subagentModelBlock}`;
 
   stopContextTimer({
     systemPromptSize: fullSystem.length,
@@ -274,6 +300,11 @@ function buildWorktreeContextBlock(): string {
 const RESUME_INTENT_PATTERNS = /^(continue|resume|ok|go|go ahead|proceed|keep going|carry on|next|yes|yeah|yep|sure|do it|let's go|pick up where you left off)$/;
 
 async function buildGuidedExecuteContextInjection(prompt: string, basePath: string): Promise<string | null> {
+  const ensureStateDbOpen = async () => {
+    const { ensureDbOpen } = await import("./dynamic-tools.js");
+    await ensureDbOpen();
+  };
+
   const executeMatch = prompt.match(/Execute the next task:\s+(T\d+)\s+\("([^"]+)"\)\s+in slice\s+(S\d+)\s+of milestone\s+(M\d+(?:-[a-z0-9]{6})?)/i);
   if (executeMatch) {
     const [, taskId, taskTitle, sliceId, milestoneId] = executeMatch;
@@ -283,6 +314,7 @@ async function buildGuidedExecuteContextInjection(prompt: string, basePath: stri
   const resumeMatch = prompt.match(/Resume interrupted work\.[\s\S]*?slice\s+(S\d+)\s+of milestone\s+(M\d+(?:-[a-z0-9]{6})?)/i);
   if (resumeMatch) {
     const [, sliceId, milestoneId] = resumeMatch;
+    await ensureStateDbOpen();
     const state = await deriveState(basePath);
     if (state.activeMilestone?.id === milestoneId && state.activeSlice?.id === sliceId && state.activeTask) {
       return buildTaskExecutionContextInjection(basePath, milestoneId, sliceId, state.activeTask.id, state.activeTask.title);
@@ -298,6 +330,7 @@ async function buildGuidedExecuteContextInjection(prompt: string, basePath: stri
   // replanning, gate evaluation, or other non-execution phases.
   const trimmed = prompt.trim().toLowerCase().replace(/[.!?,]+$/g, "");
   if (RESUME_INTENT_PATTERNS.test(trimmed)) {
+    await ensureStateDbOpen();
     const state = await deriveState(basePath);
     if (state.phase === "executing" && state.activeTask && state.activeMilestone && state.activeSlice) {
       return buildTaskExecutionContextInjection(
@@ -466,13 +499,19 @@ function oneLine(text: string): string {
  * Check for an active forensics session and return the prompt content
  * so it can be re-injected on follow-up turns.
  */
-function buildForensicsContextInjection(basePath: string): string | null {
+export function buildForensicsContextInjection(basePath: string, prompt: string): string | null {
   const marker = readForensicsMarker(basePath);
   if (!marker) return null;
 
   // Expire markers older than 2 hours to avoid stale context
   const age = Date.now() - new Date(marker.createdAt).getTime();
   if (age > 2 * 60 * 60 * 1000) {
+    clearForensicsMarker(basePath);
+    return null;
+  }
+
+  const trimmed = prompt.trim().toLowerCase().replace(/[.!?,]+$/g, "");
+  if (trimmed && !RESUME_INTENT_PATTERNS.test(trimmed)) {
     clearForensicsMarker(basePath);
     return null;
   }
@@ -494,4 +533,3 @@ export function clearForensicsMarker(basePath: string): void {
     }
   }
 }
-

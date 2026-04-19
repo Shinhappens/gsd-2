@@ -90,6 +90,7 @@ import { ToolExecutionComponent } from "./components/tool-execution.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
+import { ContextualTips } from "../../core/contextual-tips.js";
 import { type SlashCommandContext, dispatchSlashCommand, getAppKeyDisplay } from "./slash-command-handlers.js";
 import { handleAgentEvent } from "./controllers/chat-controller.js";
 import { createExtensionUIContext as buildExtensionUIContext } from "./controllers/extension-ui-controller.js";
@@ -124,6 +125,45 @@ interface Expandable {
 
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
+}
+
+export type AssistantReplaySegment =
+	| { kind: "assistant"; startIndex: number; endIndex: number }
+	| { kind: "tool"; contentIndex: number };
+
+/**
+ * Build replay segments for historical assistant messages so rebuild paths
+ * preserve the original content[] ordering between assistant prose and tools.
+ */
+export function buildAssistantReplaySegments(contentBlocks: Array<any>): AssistantReplaySegment[] {
+	const segments: AssistantReplaySegment[] = [];
+	let runStart = -1;
+
+	for (let i = 0; i < contentBlocks.length; i++) {
+		const block = contentBlocks[i];
+		const isAssistantText = block?.type === "text" || block?.type === "thinking";
+		const isTool = block?.type === "toolCall" || block?.type === "serverToolUse";
+
+		if (isAssistantText) {
+			if (runStart === -1) runStart = i;
+			continue;
+		}
+
+		if (runStart !== -1) {
+			segments.push({ kind: "assistant", startIndex: runStart, endIndex: i - 1 });
+			runStart = -1;
+		}
+
+		if (isTool) {
+			segments.push({ kind: "tool", contentIndex: i });
+		}
+	}
+
+	if (runStart !== -1) {
+		segments.push({ kind: "assistant", startIndex: runStart, endIndex: contentBlocks.length - 1 });
+	}
+
+	return segments;
 }
 
 type CompactionQueuedMessage = {
@@ -167,6 +207,7 @@ export class InteractiveMode {
 	private chatContainer: Container;
 	private pendingMessagesContainer: Container;
 	private statusContainer: Container;
+	private pinnedMessageContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
 	private autocompleteProvider: CombinedAutocompleteProvider | undefined;
@@ -213,6 +254,9 @@ export class InteractiveMode {
 
 	// Track if editor is in bash mode (text starts with !)
 	private isBashMode = false;
+
+	// Contextual tips — session-scoped, non-intrusive hints
+	private contextualTips = new ContextualTips();
 
 	// Track current bash execution component
 	private bashComponent: BashExecutionComponent | undefined = undefined;
@@ -281,6 +325,7 @@ export class InteractiveMode {
 		this.chatContainer = new Container();
 		this.pendingMessagesContainer = new Container();
 		this.statusContainer = new Container();
+		this.pinnedMessageContainer = new Container();
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
 		this.keybindings = KeybindingsManager.create();
@@ -486,6 +531,7 @@ export class InteractiveMode {
 		this.ui.addChild(this.chatContainer);
 		this.ui.addChild(this.pendingMessagesContainer);
 		this.ui.addChild(this.statusContainer);
+		this.ui.addChild(this.pinnedMessageContainer);
 		this.renderWidgets(); // Initialize with default spacer
 		this.ui.addChild(this.widgetContainerAbove);
 		this.ui.addChild(this.editorContainer);
@@ -1392,7 +1438,21 @@ export class InteractiveMode {
 	 */
 	private renderWidgets(): void {
 		if (!this.widgetContainerAbove || !this.widgetContainerBelow) return;
-		this.renderWidgetContainer(this.widgetContainerAbove, this.extensionWidgetsAbove, true, true);
+
+		// widgetContainerAbove: spacer collapses when pinned content is visible
+		// so there's no extra blank line between pinned output and the editor border.
+		// Use detachChildren() (not clear()) — the extensionWidgetsAbove map owns
+		// disposal; clear() would dispose every mounted widget on every re-render.
+		this.widgetContainerAbove.detachChildren();
+		const pinned = this.pinnedMessageContainer;
+		this.widgetContainerAbove.addChild({
+			render: () => pinned.children.length > 0 ? [] : [""],
+			invalidate: () => {},
+		});
+		for (const component of this.extensionWidgetsAbove.values()) {
+			this.widgetContainerAbove.addChild(component);
+		}
+
 		this.renderWidgetContainer(this.widgetContainerBelow, this.extensionWidgetsBelow, false, false);
 		this.ui.requestRender();
 	}
@@ -1403,7 +1463,9 @@ export class InteractiveMode {
 		spacerWhenEmpty: boolean,
 		leadingSpacer: boolean,
 	): void {
-		container.clear();
+		// Detach without disposing — the widgets map owns lifecycle; disposing
+		// here would kill refresh timers and subscriptions on every re-render.
+		container.detachChildren();
 
 		if (widgets.size === 0) {
 			if (spacerWhenEmpty) {
@@ -1627,7 +1689,7 @@ export class InteractiveMode {
 					this.hideExtensionInput();
 					resolve(undefined);
 				},
-				{ tui: this.ui, timeout: opts?.timeout },
+				{ tui: this.ui, timeout: opts?.timeout, secure: opts?.secure },
 			);
 
 			this.editorContainer.clear();
@@ -1765,8 +1827,10 @@ export class InteractiveMode {
 			this.showError(message);
 		} else if (type === "warning") {
 			this.showWarning(message);
+		} else if (type === "success") {
+			this.showSuccess(message);
 		} else {
-			this.showStatus(message);
+			this.showStatus(message, { append: true });
 		}
 	}
 
@@ -2033,12 +2097,13 @@ export class InteractiveMode {
 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
 	 * we update the previous status line instead of appending new ones to avoid log spam.
 	 */
-	private showStatus(message: string): void {
+	private showStatus(message: string, options?: { append?: boolean }): void {
+		const append = options?.append ?? false;
 		const children = this.chatContainer.children;
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
 
-		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
+		if (!append && last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
 			this.lastStatusText.setText(theme.fg("dim", message));
 			this.ui.requestRender();
 			return;
@@ -2054,6 +2119,7 @@ export class InteractiveMode {
 	}
 
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
+		const timestampFormat = this.settingsManager.getTimestampFormat();
 		switch (message.role) {
 			case "bashExecution": {
 				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext);
@@ -2111,12 +2177,12 @@ export class InteractiveMode {
 								skillBlock.userMessage,
 								this.getMarkdownThemeWithSettings(),
 								message.timestamp,
-								this.settingsManager.getTimestampFormat(),
+								timestampFormat,
 							);
 							this.chatContainer.addChild(userComponent);
 						}
 					} else {
-						const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings(), message.timestamp, this.settingsManager.getTimestampFormat());
+						const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings(), message.timestamp, timestampFormat);
 						this.chatContainer.addChild(userComponent);
 					}
 					if (options?.populateHistory) {
@@ -2130,7 +2196,7 @@ export class InteractiveMode {
 					message,
 					this.hideThinkingBlock,
 					this.getMarkdownThemeWithSettings(),
-					this.settingsManager.getTimestampFormat(),
+					timestampFormat,
 				);
 				this.chatContainer.addChild(assistantComponent);
 				break;
@@ -2168,6 +2234,7 @@ export class InteractiveMode {
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
 		this.pendingTools.clear();
+		const timestampFormat = this.settingsManager.getTimestampFormat();
 
 		if (options.updateFooter) {
 			this.footer.invalidate();
@@ -2177,9 +2244,30 @@ export class InteractiveMode {
 		for (const message of sessionContext.messages) {
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
-				this.addMessageToChat(message);
-				// Render tool call components
-				for (const content of message.content) {
+				const hasToolBlocks = message.content.some((c) => c.type === "toolCall" || c.type === "serverToolUse");
+				if (!hasToolBlocks) {
+					this.addMessageToChat(message);
+					continue;
+				}
+
+				const assistantSegments: AssistantMessageComponent[] = [];
+				const replaySegments = buildAssistantReplaySegments(message.content);
+
+				for (const segment of replaySegments) {
+					if (segment.kind === "assistant") {
+						const assistantComponent = new AssistantMessageComponent(
+							message,
+							this.hideThinkingBlock,
+							this.getMarkdownThemeWithSettings(),
+							timestampFormat,
+							{ startIndex: segment.startIndex, endIndex: segment.endIndex },
+						);
+						this.chatContainer.addChild(assistantComponent);
+						assistantSegments.push(assistantComponent);
+						continue;
+					}
+
+					const content = message.content[segment.contentIndex];
 					if (content.type === "toolCall") {
 						const component = new ToolExecutionComponent(
 							content.name,
@@ -2235,6 +2323,11 @@ export class InteractiveMode {
 						}
 					}
 				}
+
+				// Match streaming-mode behavior: show metadata once on the final
+				// assistant prose segment for this message.
+				const lastAssistantSegment = assistantSegments[assistantSegments.length - 1];
+				lastAssistantSegment?.setShowMetadata(true);
 			} else if (message.role === "toolResult") {
 				// Match tool results to pending tool components
 				const component = this.pendingTools.get(message.toolCallId);
@@ -2248,6 +2341,12 @@ export class InteractiveMode {
 			}
 		}
 
+		// Any pendingTools entries left over after replay are historical tool
+		// calls whose results were squashed out of session context (commonly by
+		// compaction). Mark them finished so the frame stops showing "Running".
+		for (const component of this.pendingTools.values()) {
+			component.markHistoricalNoResult();
+		}
 		this.pendingTools.clear();
 		this.trimChatHistory();
 		this.ui.requestRender();
@@ -2260,6 +2359,7 @@ export class InteractiveMode {
 			updateFooter: true,
 			populateHistory: true,
 		});
+		this.populatePinnedFromMessages(context.messages);
 
 		// Show compaction info if session was compacted
 		const allEntries = this.sessionManager.getEntries();
@@ -2281,8 +2381,60 @@ export class InteractiveMode {
 
 	private rebuildChatFromMessages(): void {
 		this.chatContainer.clear();
+		this.pinnedMessageContainer.clear();
 		const context = this.sessionManager.buildSessionContext();
 		this.renderSessionContext(context);
+		// Pinned content NOT re-populated here — the streaming lifecycle in
+		// chat-controller.ts manages the pinned zone during active work.
+		// populatePinnedFromMessages() remains in renderInitialMessages()
+		// for the session-resume case at startup.
+	}
+
+	/**
+	 * After rebuilding chat from messages, pin the last assistant text above the
+	 * editor if tool results would otherwise push it out of the viewport.
+	 */
+	private populatePinnedFromMessages(messages: AgentMessage[]): void {
+		this.pinnedMessageContainer.clear();
+
+		// Walk backwards to find the last assistant message
+		let lastAssistant: AssistantMessage | undefined;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i];
+			if (msg && "role" in msg && msg.role === "assistant") {
+				lastAssistant = msg as AssistantMessage;
+				break;
+			}
+		}
+		if (!lastAssistant) return;
+
+		// Check if any tool calls follow the last text block
+		const content = lastAssistant.content;
+		let lastTextIndex = -1;
+		let hasToolAfterText = false;
+		for (let i = 0; i < content.length; i++) {
+			if (content[i].type === "text") lastTextIndex = i;
+		}
+		if (lastTextIndex >= 0) {
+			for (let i = lastTextIndex + 1; i < content.length; i++) {
+				if (content[i].type === "toolCall" || content[i].type === "serverToolUse") {
+					hasToolAfterText = true;
+					break;
+				}
+			}
+		}
+		if (!hasToolAfterText || lastTextIndex < 0) return;
+
+		const textBlock = content[lastTextIndex] as { type: "text"; text: string };
+		const text = textBlock.text?.trim();
+		if (!text) return;
+
+		this.pinnedMessageContainer.addChild(
+			new DynamicBorder((str: string) => theme.fg("dim", str), "Latest Output"),
+		);
+		this.pinnedMessageContainer.addChild(
+			new Markdown(text, 1, 0, this.getMarkdownThemeWithSettings()),
+		);
 	}
 
 	// =========================================================================
@@ -2591,6 +2743,27 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
 		this.ui.requestRender();
+	}
+
+	showSuccess(successMessage: string): void {
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("success", text)));
+		this.chatContainer.addChild(
+			new Text(theme.fg("success", successMessage), 1, 0),
+		);
+		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("success", text)));
+		this.chatContainer.addChild(new Spacer(1));
+		this.ui.requestRender();
+	}
+
+	showTip(message: string): void {
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(theme.fg("dim", `💡 ${message}`), 1, 0));
+		this.ui.requestRender();
+	}
+
+	getContextPercent(): number | undefined {
+		return this.session.getContextUsage()?.percent ?? undefined;
 	}
 
 	showNewVersionNotification(newVersion: string): void {
@@ -3678,6 +3851,9 @@ export class InteractiveMode {
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.pendingTools.clear();
+
+		// Reset contextual tips for the new session
+		this.contextualTips.reset();
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ New session started")}`, 1, 1));

@@ -1,3 +1,6 @@
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 const MILESTONE_CONTEXT_RE = /M\d+(?:-[a-z0-9]{6})?-CONTEXT\.md$/;
 const CONTEXT_MILESTONE_RE = /(?:^|[/\\])(M\d+(?:-[a-z0-9]{6})?)-CONTEXT\.md$/i;
 const DEPTH_VERIFICATION_MILESTONE_RE = /depth_verification[_-](M\d+(?:-[a-z0-9]{6})?)/i;
@@ -44,13 +47,9 @@ let pendingGateId: string | null = null;
 
 /**
  * Recognized gate question ID patterns.
- * These appear in both discuss-prepared.md (4-layer) and discuss.md (depth/requirements/roadmap).
+ * These appear in discuss.md (depth/requirements/roadmap).
  */
 const GATE_QUESTION_PATTERNS = [
-  "layer1_scope_gate",
-  "layer2_architecture_gate",
-  "layer3_error_gate",
-  "layer4_quality_gate",
   "depth_verification",
 ] as const;
 
@@ -65,6 +64,69 @@ const GATE_SAFE_TOOLS = new Set([
   "search_and_read",
 ]);
 
+export interface WriteGateSnapshot {
+  verifiedDepthMilestones: string[];
+  activeQueuePhase: boolean;
+  pendingGateId: string | null;
+}
+
+function shouldPersistWriteGateSnapshot(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.GSD_PERSIST_WRITE_GATE_STATE === "1";
+}
+
+function writeGateSnapshotPath(basePath: string = process.cwd()): string {
+  return join(basePath, ".gsd", "runtime", "write-gate-state.json");
+}
+
+function currentWriteGateSnapshot(): WriteGateSnapshot {
+  return {
+    verifiedDepthMilestones: [...verifiedDepthMilestones].sort(),
+    activeQueuePhase,
+    pendingGateId,
+  };
+}
+
+function persistWriteGateSnapshot(basePath: string = process.cwd()): void {
+  if (!shouldPersistWriteGateSnapshot()) return;
+  const path = writeGateSnapshotPath(basePath);
+  mkdirSync(join(basePath, ".gsd", "runtime"), { recursive: true });
+  const tempPath = `${path}.tmp`;
+  writeFileSync(tempPath, JSON.stringify(currentWriteGateSnapshot(), null, 2), "utf-8");
+  renameSync(tempPath, path);
+}
+
+function clearPersistedWriteGateSnapshot(basePath: string = process.cwd()): void {
+  if (!shouldPersistWriteGateSnapshot()) return;
+  const path = writeGateSnapshotPath(basePath);
+  try {
+    unlinkSync(path);
+  } catch {
+    // swallow
+  }
+}
+
+function normalizeWriteGateSnapshot(value: unknown): WriteGateSnapshot {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const verified = Array.isArray(record.verifiedDepthMilestones)
+    ? record.verifiedDepthMilestones.filter((item): item is string => typeof item === "string")
+    : [];
+  return {
+    verifiedDepthMilestones: [...new Set(verified)].sort(),
+    activeQueuePhase: record.activeQueuePhase === true,
+    pendingGateId: typeof record.pendingGateId === "string" ? record.pendingGateId : null,
+  };
+}
+
+export function loadWriteGateSnapshot(basePath: string = process.cwd()): WriteGateSnapshot {
+  const path = writeGateSnapshotPath(basePath);
+  if (!existsSync(path)) return currentWriteGateSnapshot();
+  try {
+    return normalizeWriteGateSnapshot(JSON.parse(readFileSync(path, "utf-8")));
+  } catch {
+    return currentWriteGateSnapshot();
+  }
+}
+
 export function isDepthVerified(): boolean {
   return verifiedDepthMilestones.size > 0;
 }
@@ -77,28 +139,40 @@ export function isMilestoneDepthVerified(milestoneId: string | null | undefined)
   return verifiedDepthMilestones.has(milestoneId);
 }
 
+export function isMilestoneDepthVerifiedInSnapshot(
+  snapshot: WriteGateSnapshot,
+  milestoneId: string | null | undefined,
+): boolean {
+  if (!milestoneId) return false;
+  return snapshot.verifiedDepthMilestones.includes(milestoneId);
+}
+
 export function isQueuePhaseActive(): boolean {
   return activeQueuePhase;
 }
 
 export function setQueuePhaseActive(active: boolean): void {
   activeQueuePhase = active;
+  persistWriteGateSnapshot();
 }
 
 export function resetWriteGateState(): void {
   verifiedDepthMilestones.clear();
   pendingGateId = null;
+  persistWriteGateSnapshot();
 }
 
 export function clearDiscussionFlowState(): void {
   verifiedDepthMilestones.clear();
   activeQueuePhase = false;
   pendingGateId = null;
+  clearPersistedWriteGateSnapshot();
 }
 
-export function markDepthVerified(milestoneId?: string | null): void {
+export function markDepthVerified(milestoneId?: string | null, basePath: string = process.cwd()): void {
   if (!milestoneId) return;
   verifiedDepthMilestones.add(milestoneId);
+  persistWriteGateSnapshot(basePath);
 }
 
 /**
@@ -130,6 +204,7 @@ function extractContextMilestoneId(inputPath: string): string | null {
  */
 export function setPendingGate(gateId: string): void {
   pendingGateId = gateId;
+  persistWriteGateSnapshot();
 }
 
 /**
@@ -137,6 +212,7 @@ export function setPendingGate(gateId: string): void {
  */
 export function clearPendingGate(): void {
   pendingGateId = null;
+  persistWriteGateSnapshot();
 }
 
 /**
@@ -155,10 +231,19 @@ export function getPendingGate(): string | null {
  */
 export function shouldBlockPendingGate(
   toolName: string,
+  milestoneId: string | null,
+  queuePhaseActive?: boolean,
+): { block: boolean; reason?: string } {
+  return shouldBlockPendingGateInSnapshot(currentWriteGateSnapshot(), toolName, milestoneId, queuePhaseActive);
+}
+
+export function shouldBlockPendingGateInSnapshot(
+  snapshot: WriteGateSnapshot,
+  toolName: string,
   _milestoneId: string | null,
   _queuePhaseActive?: boolean,
 ): { block: boolean; reason?: string } {
-  if (!pendingGateId) return { block: false };
+  if (!snapshot.pendingGateId) return { block: false };
 
   if (GATE_SAFE_TOOLS.has(toolName)) return { block: false };
 
@@ -168,7 +253,7 @@ export function shouldBlockPendingGate(
   return {
     block: true,
     reason: [
-      `HARD BLOCK: Discussion gate "${pendingGateId}" has not been confirmed by the user.`,
+      `HARD BLOCK: Discussion gate "${snapshot.pendingGateId}" has not been confirmed by the user.`,
       `You MUST re-call ask_user_questions with the gate question before making any other tool calls.`,
       `If the previous ask_user_questions call failed, errored, was cancelled, or the user's response`,
       `did not match a provided option, you MUST re-ask — never rationalize past the block.`,
@@ -183,10 +268,19 @@ export function shouldBlockPendingGate(
  */
 export function shouldBlockPendingGateBash(
   command: string,
+  milestoneId: string | null,
+  queuePhaseActive?: boolean,
+): { block: boolean; reason?: string } {
+  return shouldBlockPendingGateBashInSnapshot(currentWriteGateSnapshot(), command, milestoneId, queuePhaseActive);
+}
+
+export function shouldBlockPendingGateBashInSnapshot(
+  snapshot: WriteGateSnapshot,
+  command: string,
   _milestoneId: string | null,
   _queuePhaseActive?: boolean,
 ): { block: boolean; reason?: string } {
-  if (!pendingGateId) return { block: false };
+  if (!snapshot.pendingGateId) return { block: false };
 
   // Allow read-only bash commands
   if (BASH_READ_ONLY_RE.test(command)) return { block: false };
@@ -194,7 +288,7 @@ export function shouldBlockPendingGateBash(
   return {
     block: true,
     reason: [
-      `HARD BLOCK: Discussion gate "${pendingGateId}" has not been confirmed by the user.`,
+      `HARD BLOCK: Discussion gate "${snapshot.pendingGateId}" has not been confirmed by the user.`,
       `You MUST re-call ask_user_questions with the gate question before running mutating commands.`,
       `If the previous ask_user_questions call failed, errored, was cancelled, or the user's response`,
       `did not match a provided option, you MUST re-ask — never rationalize past the block.`,
@@ -276,6 +370,15 @@ export function shouldBlockContextArtifactSave(
   milestoneId: string | null,
   sliceId?: string | null,
 ): { block: boolean; reason?: string } {
+  return shouldBlockContextArtifactSaveInSnapshot(currentWriteGateSnapshot(), artifactType, milestoneId, sliceId);
+}
+
+export function shouldBlockContextArtifactSaveInSnapshot(
+  snapshot: WriteGateSnapshot,
+  artifactType: string,
+  milestoneId: string | null,
+  sliceId?: string | null,
+): { block: boolean; reason?: string } {
   if (artifactType !== "CONTEXT") return { block: false };
   if (sliceId) return { block: false };
   if (!milestoneId) {
@@ -287,7 +390,7 @@ export function shouldBlockContextArtifactSave(
       ].join(" "),
     };
   }
-  if (isMilestoneDepthVerified(milestoneId)) return { block: false };
+  if (isMilestoneDepthVerifiedInSnapshot(snapshot, milestoneId)) return { block: false };
 
   return {
     block: true,
@@ -317,6 +420,15 @@ export function shouldBlockQueueExecution(
   toolName: string,
   input: string,
   queuePhaseActive: boolean,
+): { block: boolean; reason?: string } {
+  return shouldBlockQueueExecutionInSnapshot(currentWriteGateSnapshot(), toolName, input, queuePhaseActive);
+}
+
+export function shouldBlockQueueExecutionInSnapshot(
+  snapshot: WriteGateSnapshot,
+  toolName: string,
+  input: string,
+  queuePhaseActive: boolean = snapshot.activeQueuePhase,
 ): { block: boolean; reason?: string } {
   if (!queuePhaseActive) return { block: false };
 

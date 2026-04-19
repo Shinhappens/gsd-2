@@ -84,6 +84,13 @@ export class AutoSession {
   // ── Paths ────────────────────────────────────────────────────────────────
   basePath = "";
   originalBasePath = "";
+  previousProjectRootEnv: string | null = null;
+  hadProjectRootEnv = false;
+  projectRootEnvCaptured = false;
+  previousMilestoneLockEnv: string | null = null;
+  hadMilestoneLockEnv = false;
+  milestoneLockEnvCaptured = false;
+  sessionMilestoneLock: string | null = null;
   gitService: GitServiceImpl | null = null;
 
   // ── Dispatch counters ────────────────────────────────────────────────────
@@ -99,11 +106,15 @@ export class AutoSession {
 
   // ── Current unit ─────────────────────────────────────────────────────────
   currentUnit: CurrentUnit | null = null;
+  currentTraceId: string | null = null;
+  currentTurnId: string | null = null;
   currentUnitRouting: UnitRouting | null = null;
   currentMilestoneId: string | null = null;
 
   // ── Model state ──────────────────────────────────────────────────────────
   autoModeStartModel: StartModel | null = null;
+  /** Explicit /gsd model pin captured at bootstrap (session-scoped policy override). */
+  manualSessionModelOverride: StartModel | null = null;
   currentUnitModel: Model<Api> | null = null;
   /** Fully-qualified model ID (provider/id) set after selectAndApplyModel + hook overrides (#2899). */
   currentDispatchedModelId: string | null = null;
@@ -116,6 +127,8 @@ export class AutoSession {
   pendingVerificationRetry: PendingVerificationRetry | null = null;
   readonly verificationRetryCount = new Map<string, number>();
   pausedSessionFile: string | null = null;
+  pausedUnitType: string | null = null;
+  pausedUnitId: string | null = null;
   resourceVersionOnStart: string | null = null;
   lastStateRebuildAt = 0;
 
@@ -126,6 +139,10 @@ export class AutoSession {
   /** Set when a GSD tool execution ends with isError due to malformed/truncated
    *  JSON arguments. Checked by postUnitPreVerification to break retry loops. */
   lastToolInvocationError: string | null = null;
+  /** Set when turn-level git action fails during closeout. */
+  lastGitActionFailure: string | null = null;
+  /** Last turn-level git action status captured during finalize. */
+  lastGitActionStatus: "ok" | "failed" | null = null;
 
   // ── Isolation degradation ────────────────────────────────────────────
   /** Set to true when worktree creation fails; prevents merge of nonexistent branch. */
@@ -154,6 +171,10 @@ export class AutoSession {
 
   // ── Signal handler ───────────────────────────────────────────────────────
   sigtermHandler: (() => void) | null = null;
+
+  // ── Remote command polling ───────────────────────────────────────────────
+  /** Cleanup function returned by startCommandPolling(); null when not running. */
+  commandPollingCleanup: (() => void) | null = null;
 
   // ── Loop promise state ──────────────────────────────────────────────────
   // Per-unit resolve function and session-switch guard live at module level
@@ -192,6 +213,13 @@ export class AutoSession {
     // Paths
     this.basePath = "";
     this.originalBasePath = "";
+    this.previousProjectRootEnv = null;
+    this.hadProjectRootEnv = false;
+    this.projectRootEnvCaptured = false;
+    this.previousMilestoneLockEnv = null;
+    this.hadMilestoneLockEnv = false;
+    this.milestoneLockEnvCaptured = false;
+    this.sessionMilestoneLock = null;
     this.gitService = null;
 
     // Dispatch
@@ -201,11 +229,14 @@ export class AutoSession {
 
     // Unit
     this.currentUnit = null;
+    this.currentTraceId = null;
+    this.currentTurnId = null;
     this.currentUnitRouting = null;
     this.currentMilestoneId = null;
 
     // Model
     this.autoModeStartModel = null;
+    this.manualSessionModelOverride = null;
     this.currentUnitModel = null;
     this.currentDispatchedModelId = null;
     this.originalModelId = null;
@@ -217,6 +248,8 @@ export class AutoSession {
     this.pendingVerificationRetry = null;
     this.verificationRetryCount.clear();
     this.pausedSessionFile = null;
+    this.pausedUnitType = null;
+    this.pausedUnitId = null;
     this.resourceVersionOnStart = null;
     this.lastStateRebuildAt = 0;
 
@@ -229,12 +262,17 @@ export class AutoSession {
     this.rewriteAttemptCount = 0;
     this.consecutiveCompleteBootstraps = 0;
     this.lastToolInvocationError = null;
+    this.lastGitActionFailure = null;
+    this.lastGitActionStatus = null;
     this.isolationDegraded = false;
     this.milestoneMergedInPhases = false;
     this.checkpointSha = null;
 
     // Signal handler
     this.sigtermHandler = null;
+
+    // Remote command polling — cleanup must be called before reset (auto.ts stopAuto)
+    this.commandPollingCleanup = null;
 
     // Loop promise state lives in auto-loop.ts module scope
   }

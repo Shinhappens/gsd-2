@@ -20,6 +20,8 @@ import { appendFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { appendNotification } from "./notification-store.js";
+import { buildAuditEnvelope, emitUokAuditEvent } from "./uok/audit.js";
+import { isUnifiedAuditEnabled } from "./uok/audit-toggle.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -51,7 +53,8 @@ export type LogComponent =
   | "guided"        // Guided flow (discuss, plan wizards)
   | "registry"      // Rule registry hook state
   | "renderer"      // Markdown renderer and projections
-  | "safety";       // LLM safety harness
+  | "safety"        // LLM safety harness
+  | "ecosystem";    // GSD ecosystem extension loader and dispatch
 
 export interface LogEntry {
   ts: string;
@@ -67,6 +70,7 @@ export interface LogEntry {
 const MAX_BUFFER = 100;
 let _buffer: LogEntry[] = [];
 let _auditBasePath: string | null = null;
+let _stderrEnabled = true;
 
 /**
  * Set the base path for persistent audit log writes.
@@ -75,6 +79,16 @@ let _auditBasePath: string | null = null;
  */
 export function setLogBasePath(basePath: string): void {
   _auditBasePath = basePath;
+}
+
+/**
+ * Enable or disable immediate stderr writes for workflow logs.
+ * Returns the previous setting so callers can restore it.
+ */
+export function setStderrLoggingEnabled(enabled: boolean): boolean {
+  const previous = _stderrEnabled;
+  _stderrEnabled = enabled;
+  return previous;
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────
@@ -245,7 +259,7 @@ function _push(
   // Always forward to stderr so terminal watchers see it (see module header for policy)
   const prefix = severity === "error" ? "ERROR" : "WARN";
   const ctxStr = context ? ` ${JSON.stringify(context)}` : "";
-  process.stderr.write(`[gsd:${component}] ${prefix}: ${message}${ctxStr}\n`);
+  _writeStderr(`[gsd:${component}] ${prefix}: ${message}${ctxStr}\n`);
 
   // Persist to notification store (both warnings and errors)
   try {
@@ -255,13 +269,36 @@ function _push(
       "workflow-logger",
     );
   } catch (notifErr) {
-    process.stderr.write(`[gsd:workflow-logger] notification-store append failed: ${(notifErr as Error).message}\n`);
+    _writeStderr(`[gsd:workflow-logger] notification-store append failed: ${(notifErr as Error).message}\n`);
   }
 
   // Buffer for auto-loop to drain
   _buffer.push(entry);
   if (_buffer.length > MAX_BUFFER) {
     _buffer.shift();
+  }
+
+  if (_auditBasePath && isUnifiedAuditEnabled()) {
+    try {
+      emitUokAuditEvent(
+        _auditBasePath,
+        buildAuditEnvelope({
+          traceId: `workflow-log:${component}`,
+          turnId: context?.id,
+          causedBy: context?.fn ?? context?.tool,
+          category: "orchestration",
+          type: severity === "error" ? "workflow-log-error" : "workflow-log-warn",
+          payload: {
+            component,
+            message,
+            context: context ?? {},
+          },
+        }),
+      );
+    } catch (auditEmitErr) {
+      // Best-effort: unified audit projection must never block workflow logger.
+      _writeStderr(`[gsd:workflow-logger] unified-audit emit failed: ${(auditEmitErr as Error).message}\n`);
+    }
   }
 
   // Persist errors to .gsd/audit-log.jsonl so they survive context resets.
@@ -275,9 +312,14 @@ function _push(
       appendFileSync(join(auditDir, "audit-log.jsonl"), JSON.stringify(sanitized) + "\n", "utf-8");
     } catch (auditErr) {
       // Best-effort — never let audit write failures bubble up
-      process.stderr.write(`[gsd:audit] failed to persist log entry: ${(auditErr as Error).message}\n`);
+      _writeStderr(`[gsd:audit] failed to persist log entry: ${(auditErr as Error).message}\n`);
     }
   }
+}
+
+function _writeStderr(message: string): void {
+  if (!_stderrEnabled) return;
+  process.stderr.write(message);
 }
 
 /**
