@@ -137,13 +137,14 @@ describe("Discovery TTL configuration", () => {
 
 describe("ModelRegistry discovery — OpenAI-compatible custom providers", () => {
 	it("discovers custom OpenAI-compatible providers and maps capability metadata", async () => {
+		const providerName = `minimax-openai-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 		const modelsPath = join(testDir, "models.json");
 		writeFileSync(
 			modelsPath,
 			JSON.stringify(
 				{
 					providers: {
-						"minimax-openai": {
+						[providerName]: {
 							baseUrl: "https://api.minimax.example",
 							apiKey: "minimax-test-key",
 							api: "openai-completions",
@@ -183,16 +184,18 @@ describe("ModelRegistry discovery — OpenAI-compatible custom providers", () =>
 
 		try {
 			const registry = new ModelRegistry(AuthStorage.inMemory({}), modelsPath);
-			const results = await registry.discoverModels(["minimax-openai"]);
+			// Guard against global cache leakage from prior test runs.
+			registry.getDiscoveryCache().clear(providerName);
+			const results = await registry.discoverModels([providerName]);
 
-			const discovery = results.find((r) => r.provider === "minimax-openai");
+			const discovery = results.find((r) => r.provider === providerName);
 			assert.ok(discovery, "discovery result should include custom provider");
 			assert.equal(discovery?.error, undefined, "custom provider discovery should succeed");
 			assert.equal(requestedUrl, "https://api.minimax.example/v1/models");
 
 			const discovered = registry
 				.getAllWithDiscovered()
-				.find((m) => m.provider === "minimax-openai" && m.id === "MiniMax-M2.7-highspeed");
+				.find((m) => m.provider === providerName && m.id === "MiniMax-M2.7-highspeed");
 			assert.ok(discovered, "discovered model should be merged into model list");
 			assert.equal(discovered?.api, "openai-completions");
 			assert.equal(discovered?.baseUrl, "https://api.minimax.example");
