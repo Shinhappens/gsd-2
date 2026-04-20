@@ -107,7 +107,6 @@ import {
   updateProgressWidget as _updateProgressWidget,
   updateSliceProgressCache,
   unitVerb,
-  hideFooter,
   describeNextUnit,
 } from "./auto-dashboard.js";
 import { existsSync, unlinkSync } from "node:fs";

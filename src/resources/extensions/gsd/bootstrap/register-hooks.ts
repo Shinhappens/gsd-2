@@ -18,7 +18,7 @@ import { loadToolApiKeys } from "../commands-config.js";
 import { loadFile, saveFile, formatContinue } from "../files.js";
 import { deriveState } from "../state.js";
 import { getAutoDashboardData, isAutoActive, isAutoPaused, markToolEnd, markToolStart, recordToolInvocationError } from "../auto.js";
-import { hideFooter } from "../auto-dashboard.js";
+
 import { isParallelActive, shutdownParallel } from "../parallel-orchestrator.js";
 import { checkToolCallLoop, resetToolCallLoopGuard } from "./tool-call-loop-guard.js";
 import { saveActivityLog } from "../activity-log.js";
@@ -48,7 +48,9 @@ export function registerHooks(
     initNotificationStore(process.cwd());
     installNotifyInterceptor(ctx);
     initNotificationWidget(ctx);
-    initHealthWidget(ctx);
+    if (!isAutoActive()) {
+      initHealthWidget(ctx);
+    }
     resetWriteGateState();
     resetToolCallLoopGuard();
     resetAskUserQuestionsCache();
@@ -90,7 +92,7 @@ export function registerHooks(
     }
     loadToolApiKeys();
     if (isAutoActive()) {
-      ctx.ui.setFooter(hideFooter);
+      ctx.ui.setWidget("gsd-health", undefined);
     }
   });
 
@@ -113,7 +115,7 @@ export function registerHooks(
     }
     loadToolApiKeys();
     if (isAutoActive()) {
-      ctx.ui.setFooter(hideFooter);
+      ctx.ui.setWidget("gsd-health", undefined);
     }
   });
 

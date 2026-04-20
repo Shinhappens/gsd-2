@@ -61,7 +61,7 @@ import { restoreHookState, resetHookState } from "./post-unit-hooks.js";
 import { resetProactiveHealing, setLevelChangeCallback } from "./doctor-proactive.js";
 import { snapshotSkills } from "./skill-discovery.js";
 import { isDbAvailable, getMilestone, openDatabase, getDbStatus } from "./gsd-db.js";
-import { hideFooter } from "./auto-dashboard.js";
+
 import {
   debugLog,
   enableDebug,
@@ -824,9 +824,6 @@ export async function bootstrapAutoSession(
     }
 
     ctx.ui.setStatus("gsd-auto", s.stepMode ? "next" : "auto");
-    ctx.ui.setFooter(hideFooter);
-    // Hide gsd-health during AUTO — gsd-progress is the single source of truth
-    // for last-commit / cost / health signal while auto is running.
     ctx.ui.setWidget("gsd-health", undefined);
     const modeLabel = s.stepMode ? "Step-mode" : "Auto-mode";
     const pendingCount = (state.registry ?? []).filter(

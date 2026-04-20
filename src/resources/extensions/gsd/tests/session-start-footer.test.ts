@@ -1,19 +1,15 @@
 /**
  * session-start-footer.test.ts
  *
- * Verifies that register-hooks.ts suppresses the built-in footer by calling
- * ctx.ui.setFooter(hideFooter) in both session_start and session_switch when
- * isAutoActive() is true.
+ * Verifies that register-hooks.ts suppresses the gsd-health widget (not the
+ * built-in footer) when isAutoActive() is true, and that setFooter is never
+ * called by the extension in either session_start or session_switch.
  *
  * Testing strategy:
- *   Two layers:
- *   1. Source-code regression guard: ensures the guard and setFooter call are
- *      structurally present in register-hooks.ts for both event handlers.
- *      (node:test does not support mock.module without --experimental-test-module-mocks,
- *       so structural analysis is the correct approach here.)
+ *   1. Source-code regression guards: structural checks on register-hooks.ts.
  *   2. Behavioral integration test: fires the live session_start handler with a
- *      fake ctx when isAutoActive() is false (its default at test time) and
- *      confirms setFooter is NOT called — verifying the guard is conditional.
+ *      fake ctx when isAutoActive() is false (default) and confirms neither
+ *      setFooter nor setWidget("gsd-health") is called.
  *
  * Relates to #4314.
  */
@@ -35,16 +31,14 @@ const HOOKS_SOURCE = readFileSync(
 
 // ─── Source-code regression guards ──────────────────────────────────────────
 
-test("register-hooks.ts imports hideFooter from auto-dashboard", () => {
+test("register-hooks.ts does NOT import hideFooter", () => {
   assert.ok(
-    HOOKS_SOURCE.includes('import { hideFooter } from "../auto-dashboard.js"') ||
-    HOOKS_SOURCE.includes("import { hideFooter } from '../auto-dashboard.js'"),
-    "register-hooks.ts must import hideFooter from auto-dashboard.js",
+    !HOOKS_SOURCE.includes("hideFooter"),
+    "register-hooks.ts must not reference hideFooter — footer is no longer swapped in auto mode",
   );
 });
 
-test("session_start handler calls ctx.ui.setFooter(hideFooter) when isAutoActive()", () => {
-  // Locate the session_start handler body (up to the next pi.on call)
+test("session_start handler guards initHealthWidget with !isAutoActive()", () => {
   const sessionStartIdx = HOOKS_SOURCE.indexOf('"session_start"');
   assert.ok(sessionStartIdx > -1, "session_start handler must exist");
 
@@ -58,20 +52,23 @@ test("session_start handler calls ctx.ui.setFooter(hideFooter) when isAutoActive
     "session_start handler must call isAutoActive()",
   );
   assert.ok(
-    sessionStartBody.includes("ctx.ui.setFooter(hideFooter)"),
-    "session_start handler must call ctx.ui.setFooter(hideFooter)",
+    sessionStartBody.includes("initHealthWidget"),
+    "session_start handler must reference initHealthWidget",
+  );
+  assert.ok(
+    !sessionStartBody.includes("setFooter"),
+    "session_start handler must NOT call setFooter",
   );
 
-  // Guard must wrap the setFooter call
   const guardIdx = sessionStartBody.indexOf("isAutoActive()");
-  const setFooterIdx = sessionStartBody.indexOf("ctx.ui.setFooter(hideFooter)");
+  const healthIdx = sessionStartBody.indexOf("initHealthWidget");
   assert.ok(
-    guardIdx < setFooterIdx,
-    "isAutoActive() guard must appear before ctx.ui.setFooter(hideFooter) in session_start",
+    guardIdx < healthIdx,
+    "isAutoActive() guard must appear before initHealthWidget in session_start",
   );
 });
 
-test("session_switch handler calls ctx.ui.setFooter(hideFooter) when isAutoActive()", () => {
+test("session_switch handler suppresses gsd-health when isAutoActive()", () => {
   const sessionSwitchIdx = HOOKS_SOURCE.indexOf('"session_switch"');
   assert.ok(sessionSwitchIdx > -1, "session_switch handler must exist");
 
@@ -85,21 +82,18 @@ test("session_switch handler calls ctx.ui.setFooter(hideFooter) when isAutoActiv
     "session_switch handler must call isAutoActive()",
   );
   assert.ok(
-    sessionSwitchBody.includes("ctx.ui.setFooter(hideFooter)"),
-    "session_switch handler must call ctx.ui.setFooter(hideFooter)",
+    sessionSwitchBody.includes('setWidget("gsd-health", undefined)'),
+    "session_switch handler must call setWidget(\"gsd-health\", undefined) when auto is active",
   );
-
-  const guardIdx = sessionSwitchBody.indexOf("isAutoActive()");
-  const setFooterIdx = sessionSwitchBody.indexOf("ctx.ui.setFooter(hideFooter)");
   assert.ok(
-    guardIdx < setFooterIdx,
-    "isAutoActive() guard must appear before ctx.ui.setFooter(hideFooter) in session_switch",
+    !sessionSwitchBody.includes("setFooter"),
+    "session_switch handler must NOT call setFooter",
   );
 });
 
-// ─── Behavioral test: setFooter NOT called when auto-mode is inactive ────────
+// ─── Behavioral test: neither setFooter nor health suppression when auto inactive ─
 
-test("session_start does NOT call setFooter when isAutoActive() is false (default)", async (t) => {
+test("session_start does NOT call setFooter or suppress gsd-health when isAutoActive() is false", async (t) => {
   const dir = join(
     tmpdir(),
     `gsd-footer-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -114,6 +108,7 @@ test("session_start does NOT call setFooter when isAutoActive() is false (defaul
   });
 
   let setFooterCallCount = 0;
+  let healthWidgetHideCount = 0;
 
   const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void> | void>();
   const pi = {
@@ -137,17 +132,14 @@ test("session_start does NOT call setFooter when isAutoActive() is false (defaul
       },
       setWorkingMessage: () => {},
       onTerminalInput: () => () => {},
-      setWidget: () => {},
+      setWidget: (key: string, value: unknown) => {
+        if (key === "gsd-health" && value === undefined) healthWidgetHideCount++;
+      },
     },
     sessionManager: { getSessionId: () => null },
     model: null,
   } as any);
 
-  // isAutoActive() is false at test time (no auto session started),
-  // so setFooter must not be called.
-  assert.equal(
-    setFooterCallCount,
-    0,
-    "setFooter must NOT be called when isAutoActive() returns false",
-  );
+  assert.equal(setFooterCallCount, 0, "setFooter must NOT be called when isAutoActive() is false");
+  assert.equal(healthWidgetHideCount, 0, "gsd-health must NOT be hidden when isAutoActive() is false");
 });

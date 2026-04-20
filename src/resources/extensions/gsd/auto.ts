@@ -182,7 +182,6 @@ import {
   unitVerb,
   formatAutoElapsed as _formatAutoElapsed,
   formatWidgetTokens,
-  hideFooter,
   type WidgetStateAccessors,
 } from "./auto-dashboard.js";
 import {
@@ -706,7 +705,6 @@ function handleLostSessionLock(
   );
   ctx?.ui.setStatus("gsd-auto", undefined);
   ctx?.ui.setWidget("gsd-progress", undefined);
-  ctx?.ui.setFooter(undefined);
   if (ctx) initHealthWidget(ctx);
 }
 
@@ -742,7 +740,6 @@ function cleanupAfterLoopExit(ctx: ExtensionContext): void {
   if (!s.paused) {
     ctx.ui.setStatus("gsd-auto", undefined);
     ctx.ui.setWidget("gsd-progress", undefined);
-    ctx.ui.setFooter(undefined);
     initHealthWidget(ctx);
   }
 
@@ -1018,7 +1015,6 @@ export async function stopAuto(
     // UI cleanup
     ctx?.ui.setStatus("gsd-auto", undefined);
     ctx?.ui.setWidget("gsd-progress", undefined);
-    ctx?.ui.setFooter(undefined);
     if (ctx) initHealthWidget(ctx);
     restoreProjectRootEnv();
     restoreMilestoneLockEnv();
@@ -1121,7 +1117,6 @@ export async function pauseAuto(
   s.verificationRetryCount.clear();
   ctx?.ui.setStatus("gsd-auto", "paused");
   ctx?.ui.setWidget("gsd-progress", undefined);
-  ctx?.ui.setFooter(undefined);
   if (ctx) initHealthWidget(ctx);
   const resumeCmd = s.stepMode ? "/gsd next" : "/gsd auto";
   ctx?.ui.notify(
@@ -1509,7 +1504,7 @@ export async function startAuto(
     registerSigtermHandler(lockBase());
 
     ctx.ui.setStatus("gsd-auto", s.stepMode ? "next" : "auto");
-    ctx.ui.setFooter(hideFooter);
+    ctx.ui.setWidget("gsd-health", undefined);
     ctx.ui.notify(
       s.stepMode ? "Step-mode resumed." : "Auto-mode resumed.",
       "info",
