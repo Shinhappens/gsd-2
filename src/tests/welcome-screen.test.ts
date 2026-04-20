@@ -4,6 +4,9 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { printWelcomeScreen } from '../../dist/welcome-screen.js'
 
@@ -87,6 +90,56 @@ test('omits remote channel when not provided', () => {
   assert.ok(!out.includes('Discord'), 'should not show Discord when no remote')
   assert.ok(!out.includes('Slack'), 'should not show Slack when no remote')
   assert.ok(!out.includes('Telegram'), 'should not show Telegram when no remote')
+})
+
+test('Active row truncates with ellipsis when milestone text overflows panel width', (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), 'gsd-welcome-test-'))
+  mkdirSync(join(tmp, '.gsd'))
+  writeFileSync(
+    join(tmp, '.gsd', 'STATE.md'),
+    [
+      '**Active Milestone:** M001: Todo App – Core add/complete/delete with localStorage persistence and offline sync support',
+      '**Phase:** evaluating-gates',
+      '**Active Slice:** S01: implement full persistence layer with IndexedDB fallback',
+    ].join('\n'),
+  )
+  const origCwd = process.cwd()
+  process.chdir(tmp)
+  const origColumns = (process.stderr as any).columns
+  ;(process.stderr as any).columns = 120
+
+  t.after(() => {
+    process.chdir(origCwd)
+    ;(process.stderr as any).columns = origColumns
+    rmSync(tmp, { recursive: true, force: true })
+  })
+
+  const out = strip(capture({ version: '1.0.0' }))
+  const activeLine = out.split('\n').find(l => /Active\s/.test(l))
+  assert.ok(activeLine, 'Active row should be present')
+  assert.ok(activeLine!.includes('…'), 'Active row should truncate long text with ellipsis')
+})
+
+test('Active row does not truncate short milestone text', (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), 'gsd-welcome-test-'))
+  mkdirSync(join(tmp, '.gsd'))
+  writeFileSync(join(tmp, '.gsd', 'STATE.md'), '**Active Milestone:** M001: Short title\n')
+  const origCwd = process.cwd()
+  process.chdir(tmp)
+  const origColumns = (process.stderr as any).columns
+  ;(process.stderr as any).columns = 120
+
+  t.after(() => {
+    process.chdir(origCwd)
+    ;(process.stderr as any).columns = origColumns
+    rmSync(tmp, { recursive: true, force: true })
+  })
+
+  const out = strip(capture({ version: '1.0.0' }))
+  const activeLine = out.split('\n').find(l => /Active\s/.test(l))
+  assert.ok(activeLine, 'Active row should be present')
+  assert.ok(activeLine!.includes('M001: Short title'), 'short title should appear in full')
+  assert.ok(!activeLine!.includes('…'), 'short title should not be truncated')
 })
 
 test('separator lines extend to full terminal width on wide terminals', (t) => {
