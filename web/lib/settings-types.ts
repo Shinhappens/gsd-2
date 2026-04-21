@@ -9,7 +9,7 @@
 
 export type SettingsWorkflowMode = "solo" | "team"
 
-export type SettingsTokenProfile = "budget" | "balanced" | "quality"
+export type SettingsTokenProfile = "budget" | "balanced" | "quality" | "burn-max"
 
 export type SettingsBudgetEnforcement = "warn" | "pause" | "halt"
 

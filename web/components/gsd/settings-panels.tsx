@@ -193,6 +193,7 @@ function useSettingsData() {
 
 function tokenProfileVariant(profile: string | undefined): "info" | "warning" | "success" {
   if (profile === "budget") return "warning"
+  if (profile === "burn-max") return "warning"
   if (profile === "quality") return "success"
   return "info"
 }
