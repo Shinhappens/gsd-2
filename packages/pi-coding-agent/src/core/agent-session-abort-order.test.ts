@@ -14,8 +14,9 @@ describe("#4243 — abort() must be called before _disconnectFromAgent()", () =>
 		const newSessionStart = source.indexOf("async newSession(options?:");
 		assert.ok(newSessionStart >= 0, "should find newSession method");
 
-		// Get a window that includes the abort/disconnect section
-		const window = source.slice(newSessionStart, newSessionStart + 1200);
+		// Get a window that includes the abort/disconnect section.
+		// Use 2000 chars to accommodate guard checks inserted between the two calls.
+		const window = source.slice(newSessionStart, newSessionStart + 2000);
 
 		// Find the abort and _disconnectFromAgent calls
 		const abortIdx = window.indexOf("await this.abort();");
