@@ -1910,9 +1910,10 @@ export async function buildCompleteSlicePrompt(
   if (knowledgeInlineCS && body) {
     // Splice knowledge right before the first "### Task Summary:" block
     // to preserve pre-migration ordering. If no task summaries exist,
-    // append after requirements (before templates).
+    // splice before the templates block (which inlineTemplate emits as
+    // "### Output Template: Slice Summary").
     const taskIdx = body.indexOf("### Task Summary:");
-    const templatesIdx = body.lastIndexOf("### Slice Summary");
+    const templatesIdx = body.lastIndexOf("### Output Template: Slice Summary");
     const spliceIdx = taskIdx > -1 ? taskIdx : templatesIdx;
     if (spliceIdx > 0) {
       const before = body.slice(0, spliceIdx).replace(/\n\n---\n\n$/, "");
@@ -2294,8 +2295,15 @@ export async function buildRunUatPrompt(
   const resolveArtifact: ArtifactResolver = async (key) => {
     switch (key) {
       case "slice-uat": {
-        const p = resolveSliceFile(base, mid, sliceId, "UAT");
-        return await inlineFile(p, uatPath, `${sliceId} UAT`);
+        // Use the in-memory snapshot the caller already loaded (#4925 review).
+        // Re-reading from disk via inlineFile(p, uatPath, ...) would risk
+        // drift between the inlined body and uatType (computed from
+        // uatContent below) if the file changes mid-dispatch.
+        const trimmed = uatContent.trim();
+        if (!trimmed) {
+          return `### ${sliceId} UAT\nSource: \`${uatPath}\`\n\n_(not found — file does not exist yet)_`;
+        }
+        return `### ${sliceId} UAT\nSource: \`${uatPath}\`\n\n${trimmed}`;
       }
       case "slice-summary": {
         const p = resolveSliceFile(base, mid, sliceId, "SUMMARY");
