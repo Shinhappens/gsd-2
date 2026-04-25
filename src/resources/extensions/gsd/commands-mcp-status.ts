@@ -120,7 +120,7 @@ export function formatMcpStatusReport(servers: McpServerStatus[]): string {
     return [
       "No MCP servers configured.",
       "",
-      "Add servers to .mcp.json, .gsd/mcp.json, or ~/.gsd/mcp.json to enable MCP integrations.",
+      "Add servers to .mcp.json, .gsd/mcp.json, or $GSD_HOME/mcp.json (default: ~/.gsd/mcp.json) to enable MCP integrations.",
       "Tip: run /gsd mcp init . to write the local GSD workflow MCP config.",
       "See: https://modelcontextprotocol.io/quickstart",
     ].join("\n");

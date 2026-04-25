@@ -29,23 +29,26 @@ before(() => {
 	cwdDir = realpathSync(mkdtempSync(join(tmpdir(), "mcp-cwd-")));
 	gsdHomeDir = realpathSync(mkdtempSync(join(tmpdir(), "mcp-gsdhome-")));
 
-	// Project-local fixture
+	// Project-local fixture (also defines `shared-server` for the precedence test)
 	writeFileSync(
 		join(cwdDir, ".mcp.json"),
 		JSON.stringify({
 			mcpServers: {
 				"project-server": { command: "echo", args: ["proj"] },
+				"shared-server": { command: "echo", args: ["from-project"] },
 			},
 		}),
 		"utf-8",
 	);
 
-	// Global fixture rooted at $GSD_HOME
+	// Global fixture rooted at $GSD_HOME (also defines `shared-server` to test
+	// that project-local takes precedence on name collision)
 	writeFileSync(
 		join(gsdHomeDir, "mcp.json"),
 		JSON.stringify({
 			mcpServers: {
 				"global-server": { command: "echo", args: ["glob"] },
+				"shared-server": { command: "echo", args: ["from-global"] },
 			},
 		}),
 		"utf-8",
@@ -74,4 +77,15 @@ test("#4757: project-local servers still resolve when global config exists", () 
 	const cfg = getServerConfig("project-server");
 	assert.ok(cfg, "project-local server must continue to resolve");
 	assert.equal(cfg?.sourcePath, join(cwdDir, ".mcp.json"));
+});
+
+test("#4757: project-local config wins on server-name collision", () => {
+	const cfg = getServerConfig("shared-server");
+	assert.ok(cfg, "shared server must resolve");
+	assert.equal(
+		cfg?.sourcePath,
+		join(cwdDir, ".mcp.json"),
+		"project-local config must take precedence over $GSD_HOME on name collision",
+	);
+	assert.deepEqual(cfg?.args, ["from-project"]);
 });
