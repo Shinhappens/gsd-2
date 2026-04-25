@@ -645,10 +645,10 @@ export function resolveModelForTier(
   }
 
   // Cross-provider tier search
-  return (
-    findModelForTier(tier, routingConfig, availableModelIds, allowCrossProvider)
-    ?? canonicalModelForTier(tier)
-  );
+  const resolved = findModelForTier(tier, routingConfig, availableModelIds, allowCrossProvider);
+  return resolved
+    ? normalizeResolvedTierModelId(resolved, tier, routingConfig)
+    : canonicalModelForTier(tier);
 }
 
 // ─── Internal ────────────────────────────────────────────────────────────────
@@ -707,6 +707,20 @@ function getModelCost(modelId: string): number {
 
   // Unknown cost — assume expensive to avoid routing to unknown cheap models
   return 999;
+}
+
+function normalizeResolvedTierModelId(
+  modelId: string,
+  tier: ComplexityTier,
+  routingConfig: DynamicRoutingConfig,
+): string {
+  const explicitModel = routingConfig.tier_models?.[tier];
+  if (explicitModel?.includes("/")) {
+    return modelId;
+  }
+
+  const bareId = bareModelId(modelId);
+  return MODEL_CAPABILITY_TIER[bareId] ? bareId : modelId;
 }
 
 function bareModelId(modelId: string): string {
