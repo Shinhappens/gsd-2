@@ -1030,8 +1030,19 @@ export class Editor implements Component, Focusable {
 		}, Editor.AUTOCOMPLETE_DEBOUNCE_MS);
 	}
 
-	/** Image file extensions recognized when pasted as a file path */
-	private static readonly IMAGE_EXTENSIONS = /\.(png|jpe?g|gif|webp|bmp|tiff?|svg|heic|heif|avif)$/i;
+	/**
+	 * Image file extensions recognized when pasted as a file path.
+	 *
+	 * Restricted to formats commonly accepted by AI vision APIs and that have
+	 * reliable magic-byte signatures for content verification. SVG is excluded
+	 * (XML/JS-bearing); BMP/TIFF/HEIC/HEIF/AVIF excluded for compatibility and
+	 * verification simplicity — users can convert before pasting.
+	 *
+	 * Detection assumes terminal emulators (iTerm2, Warp, etc.) paste a single
+	 * absolute file path on drag-drop. Multi-line pastes and bare extensions
+	 * are intentionally not matched.
+	 */
+	private static readonly IMAGE_EXTENSIONS = /\.(png|jpe?g|gif|webp)$/i;
 
 	private handlePaste(pastedText: string): void {
 		this.historyIndex = -1; // Exit history browsing mode

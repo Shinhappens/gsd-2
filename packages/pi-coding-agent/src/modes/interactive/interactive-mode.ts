@@ -1959,6 +1959,7 @@ export class InteractiveMode {
 				this.session.abortBash();
 			} else if (this.isBashMode) {
 				this.editor.setText("");
+				this.pendingImages.length = 0;
 				this.isBashMode = false;
 				this.updateEditorBorderColor();
 			} else if (!this.editor.getText().trim()) {
@@ -2014,8 +2015,9 @@ export class InteractiveMode {
 			this.handleClipboardImagePaste();
 		};
 
-		// Handle image file paths pasted via terminal emulator (e.g. iTerm2)
-		this.editor.onPasteImagePath = (filePath: string) => {
+		// Handle image file paths pasted via terminal emulator (e.g. iTerm2).
+		// Set on defaultEditor here; setCustomEditorComponent guards re-assignment for custom editors.
+		this.defaultEditor.onPasteImagePath = (filePath: string) => {
 			this.handlePastedImagePath(filePath);
 		};
 	}
@@ -2044,26 +2046,70 @@ export class InteractiveMode {
 		}
 	}
 
+	// MIME types restricted to formats commonly accepted by AI vision APIs.
+	// SVG is excluded — it is XML/JS-bearing and not safe to forward as image content.
+	// TIFF/HEIC/HEIF/AVIF are excluded for compatibility; users can convert before pasting.
 	private static readonly MIME_BY_EXT: Record<string, string> = {
 		png: "image/png",
 		jpg: "image/jpeg",
 		jpeg: "image/jpeg",
 		gif: "image/gif",
 		webp: "image/webp",
-		bmp: "image/bmp",
-		tiff: "image/tiff",
-		tif: "image/tiff",
-		svg: "image/svg+xml",
-		heic: "image/heic",
-		heif: "image/heif",
-		avif: "image/avif",
 	};
+
+	// Magic-byte signatures used to verify file content matches its extension,
+	// preventing arbitrary-file-read via crafted paste of e.g. "/etc/passwd.png".
+	private static matchesImageSignature(buf: Buffer, mimeType: string): boolean {
+		if (buf.length < 12) return false;
+		switch (mimeType) {
+			case "image/png":
+				return buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+			case "image/jpeg":
+				return buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+			case "image/gif":
+				return (
+					buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38 &&
+					(buf[4] === 0x37 || buf[4] === 0x39) && buf[5] === 0x61
+				);
+			case "image/webp":
+				return (
+					buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+					buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
+				);
+			default:
+				return false;
+		}
+	}
 
 	private handlePastedImagePath(filePath: string): void {
 		try {
-			const data = fs.readFileSync(filePath);
 			const ext = path.extname(filePath).slice(1).toLowerCase();
-			const mimeType = InteractiveMode.MIME_BY_EXT[ext] ?? "image/png";
+			const mimeType = InteractiveMode.MIME_BY_EXT[ext];
+			if (!mimeType) {
+				// Unsupported / unsafe extension — fall back to inserting raw path.
+				this.editor.insertTextAtCursor?.(filePath);
+				this.ui.requestRender();
+				return;
+			}
+
+			// Reject symlinks to prevent reading sensitive files via a symlinked
+			// `.png` that points at e.g. ~/.ssh/id_rsa.
+			const lst = fs.lstatSync(filePath);
+			if (!lst.isFile()) {
+				this.editor.insertTextAtCursor?.(filePath);
+				this.ui.requestRender();
+				return;
+			}
+
+			const data = fs.readFileSync(filePath);
+
+			// Magic-byte check — confirms file content actually matches the
+			// extension before we forward bytes to a model.
+			if (!InteractiveMode.matchesImageSignature(data, mimeType)) {
+				this.editor.insertTextAtCursor?.(filePath);
+				this.ui.requestRender();
+				return;
+			}
 
 			this.pendingImages.push({
 				type: "image",
@@ -3922,6 +3968,7 @@ export class InteractiveMode {
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.pendingTools.clear();
+		this.pendingImages.length = 0;
 
 		// Reset contextual tips for the new session
 		this.contextualTips.reset();
