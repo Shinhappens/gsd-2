@@ -99,39 +99,63 @@ const ROOT_STATE_FILES = [
 ] as const;
 
 /**
- * Pop a stash entry by tracking SHA so concurrent stash operations against
- * the same project root cannot cause us to pop the wrong entry.
+ * Pop a stash entry by tracking the unique marker embedded in its message so
+ * concurrent stash operations against the same project root cannot cause us to
+ * pop the wrong entry.
  *
- * If `stashSha` is null or no longer present in the stash list (e.g. a
- * concurrent process popped/dropped it), falls back to plain `git stash pop`
- * targeting `stash@{0}`.
+ * If `stashMarker` is null or no longer present in the stash list (e.g. a
+ * concurrent process popped/dropped it), leaves the stash list untouched and
+ * returns null.
  *
  * Throws on pop failure so callers can handle conflict cases the same way
- * they would with the prior `git stash pop` form.
+ * they would with the prior `git stash pop` form. When throwing after a
+ * targeted pop attempt, the error is annotated with the targeted stash ref.
  *
  * (Issue #4980 HIGH-6)
  */
-function popStashByRef(basePath: string, stashSha: string | null): void {
+function popStashByRef(basePath: string, stashMarker: string | null): string | null {
   let popArg: string | null = null;
-  if (stashSha) {
+  if (stashMarker) {
     try {
-      const list = execFileSync("git", ["stash", "list", "--format=%H"], {
+      const list = execFileSync("git", ["stash", "list", "--format=%gd%x00%s"], {
         cwd: basePath,
         stdio: ["ignore", "pipe", "pipe"],
         encoding: "utf-8",
       }).trim().split("\n").filter(Boolean);
-      const idx = list.indexOf(stashSha);
-      if (idx >= 0) popArg = `stash@{${idx}}`;
+      for (const entry of list) {
+        const [ref, subject] = entry.split("\0");
+        if (ref && subject?.includes(stashMarker)) {
+          popArg = ref;
+          break;
+        }
+      }
     } catch (err) {
-      logWarning("worktree", `stash list lookup failed, falling back to pop@0: ${err instanceof Error ? err.message : String(err)}`);
+      logWarning("worktree", `stash list lookup failed; leaving stash untouched: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  const args = popArg ? ["stash", "pop", popArg] : ["stash", "pop"];
-  execFileSync("git", args, {
-    cwd: basePath,
-    stdio: ["ignore", "pipe", "pipe"],
-    encoding: "utf-8",
-  });
+  if (!popArg) {
+    logWarning("worktree", "recorded stash entry could not be resolved; skipping automatic pop");
+    return null;
+  }
+  try {
+    execFileSync("git", ["stash", "pop", popArg], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    });
+  } catch (err) {
+    if (err && typeof err === "object") {
+      (err as { stashRef?: string }).stashRef = popArg;
+    }
+    throw err;
+  }
+  return popArg;
+}
+
+function stashRefFromError(err: unknown): string | null {
+  if (!err || typeof err !== "object") return null;
+  const stashRef = (err as { stashRef?: unknown }).stashRef;
+  return typeof stashRef === "string" && stashRef.length > 0 ? stashRef : null;
 }
 
 /**
@@ -1634,6 +1658,7 @@ export function mergeMilestoneToMain(
   // a tag, CI checkout-sha) without warning. (Issue #4980 HIGH-10)
   const currentBranchAtBase = nativeGetCurrentBranch(originalBasePath_);
   if (!currentBranchAtBase || currentBranchAtBase.length === 0) {
+    process.chdir(previousCwd);
     throw new GSDError(
       GSD_GIT_ERROR,
       `Project root is in detached HEAD state — cannot perform milestone merge. ` +
@@ -1831,11 +1856,11 @@ export function mergeMilestoneToMain(
   }
 
   let stashed = false;
-  // Capture the stash commit SHA so subsequent pop/drop targets the entry we
-  // created, not whatever happens to be at stash@{0} (concurrent milestone
-  // merges share the project-root stash list and can shift positions).
+  // Embed a unique marker in the stash message so subsequent pop/drop targets
+  // the entry we created, not whatever happens to be at stash@{0} (concurrent
+  // milestone merges share the project-root stash list and can shift positions).
   // (Issue #4980 HIGH-6)
-  let stashSha: string | null = null;
+  let stashMarker: string | null = null;
   try {
     const status = execFileSync("git", ["status", "--porcelain"], {
       cwd: originalBasePath_,
@@ -1843,21 +1868,13 @@ export function mergeMilestoneToMain(
       encoding: "utf-8",
     }).trim();
     if (status) {
+      stashMarker = `gsd-pre-merge:${milestoneId}:${process.pid}:${Date.now()}:${process.hrtime.bigint().toString(36)}`;
       execFileSync(
         "git",
-        ["stash", "push", "--include-untracked", "-m", `gsd: pre-merge stash for ${milestoneId}`],
+        ["stash", "push", "--include-untracked", "-m", `gsd: pre-merge stash for ${milestoneId} [${stashMarker}]`],
         { cwd: originalBasePath_, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
       );
       stashed = true;
-      try {
-        stashSha = execFileSync("git", ["rev-parse", "refs/stash"], {
-          cwd: originalBasePath_,
-          stdio: ["ignore", "pipe", "pipe"],
-          encoding: "utf-8",
-        }).trim();
-      } catch (refErr) {
-        logWarning("worktree", `failed to capture stash SHA: ${refErr instanceof Error ? refErr.message : String(refErr)}`);
-      }
     }
   } catch (err) {
     // Stash failure is non-fatal — proceed without stash and let the merge
@@ -1911,7 +1928,7 @@ export function mergeMilestoneToMain(
       // Pop stash before throwing so local work is not lost.
       if (stashed) {
         try {
-          popStashByRef(originalBasePath_, stashSha);
+          popStashByRef(originalBasePath_, stashMarker);
         } catch (err) { /* stash pop conflict is non-fatal */
           logWarning("worktree", `git stash pop failed: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -1983,7 +2000,7 @@ export function mergeMilestoneToMain(
         // Pop stash before throwing so local work is not lost (#2151).
         if (stashed) {
           try {
-            popStashByRef(originalBasePath_, stashSha);
+            popStashByRef(originalBasePath_, stashMarker);
           } catch (err) { /* stash pop conflict is non-fatal */
             logWarning("worktree", `git stash pop failed: ${err instanceof Error ? err.message : String(err)}`);
           }
@@ -2031,9 +2048,11 @@ export function mergeMilestoneToMain(
   // or the commit content.  Conflict on pop is non-fatal — the stash entry is
   // preserved and the user can resolve manually with `git stash pop`.
   if (stashed) {
+    let stashRefForDrop: string | null = null;
     try {
-      popStashByRef(originalBasePath_, stashSha);
+      stashRefForDrop = popStashByRef(originalBasePath_, stashMarker);
     } catch (e) {
+      stashRefForDrop = stashRefFromError(e);
       logWarning("worktree", `git stash pop failed, attempting conflict resolution: ${(e as Error).message}`);
       // Stash pop after squash merge can conflict on .gsd/ state files that
       // diverged between branches.  Left unresolved, these UU entries block
@@ -2064,14 +2083,18 @@ export function mergeMilestoneToMain(
 
       if (nonGsdUU.length === 0) {
         // All conflicts were .gsd/ files — safe to drop the stash
-        try {
-          execFileSync("git", ["stash", "drop"], {
-            cwd: originalBasePath_,
-            stdio: ["ignore", "pipe", "pipe"],
-            encoding: "utf-8",
-          });
-        } catch (err) { /* stash may already be consumed */
-          logWarning("worktree", `git stash drop failed: ${err instanceof Error ? err.message : String(err)}`);
+        if (stashRefForDrop) {
+          try {
+            execFileSync("git", ["stash", "drop", stashRefForDrop], {
+              cwd: originalBasePath_,
+              stdio: ["ignore", "pipe", "pipe"],
+              encoding: "utf-8",
+            });
+          } catch (err) { /* stash may already be consumed */
+            logWarning("worktree", `git stash drop failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        } else {
+          logWarning("worktree", "recorded stash entry could not be resolved; skipping automatic drop");
         }
       } else {
         // Non-.gsd conflicts remain — leave stash for manual resolution

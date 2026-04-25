@@ -110,7 +110,8 @@ function isSlicePidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EPERM") return true;
     return false;
   }
 }
@@ -177,12 +178,12 @@ export function restoreSliceState(basePath: string): PersistedSliceState | null 
     const survivors: PersistedSliceWorker[] = [];
     const dead: PersistedSliceWorker[] = [];
     for (const w of persisted.workers) {
-      if (w.state === "stopped" || w.state === "error") {
-        dead.push(w);
-      } else if (isSlicePidAlive(w.pid)) {
+      if (isSlicePidAlive(w.pid)) {
         survivors.push(w);
-      } else {
+      } else if (w.state === "running") {
         dead.push(w);
+      } else {
+        survivors.push(w);
       }
     }
 
@@ -367,11 +368,13 @@ export function stopSliceParallel(): void {
   const basePath = sliceState.basePath;
 
   for (const worker of sliceState.workers.values()) {
-    if (worker.process) {
-      try {
+    try {
+      if (worker.process) {
         worker.process.kill("SIGTERM");
-      } catch { /* already dead */ }
-    }
+      } else if (isSlicePidAlive(worker.pid)) {
+        process.kill(worker.pid, "SIGTERM");
+      }
+    } catch { /* already dead */ }
     worker.cleanup?.();
     worker.cleanup = undefined;
     worker.process = null;

@@ -178,4 +178,20 @@ describe("Windows pre-merge DB release (#4704)", () => {
       "openDatabase() called after the pre-merge stash",
     );
   });
+
+  it("pre-merge stash targets entries by marker instead of refs/stash or stash@{0}", () => {
+    const src = readFileSync(
+      join(import.meta.dirname, "..", "auto-worktree.ts"),
+      "utf-8",
+    );
+
+    assert.ok(src.includes("stashMarker"), "stash marker is tracked");
+    assert.ok(
+      src.includes('"stash", "list", "--format=%gd%x00%s"'),
+      "stash lookup reads ref and message together",
+    );
+    assert.ok(!src.includes('"rev-parse", "refs/stash"'), "refs/stash is not used for identity");
+    assert.ok(!src.includes('["stash", "pop"]'), "stash pop is never unqualified");
+    assert.ok(!src.includes('["stash", "drop"]'), "stash drop is never unqualified");
+  });
 });

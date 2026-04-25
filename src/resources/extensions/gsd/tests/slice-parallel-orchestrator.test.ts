@@ -46,6 +46,23 @@ describe("slice-parallel-orchestrator structural tests", () => {
       "Orchestrator must also pass GSD_MILESTONE_LOCK for milestone context",
     );
   });
+
+  it("recovery preserves terminal workers for coordinator-side collection", () => {
+    const source = readFileSync(join(gsdDir, "slice-parallel-orchestrator.ts"), "utf-8");
+    assert.ok(
+      source.includes('} else if (w.state === "running")') &&
+        source.includes("survivors.push(w);"),
+      "Recovery must only prune dead running workers, not stopped/error workers",
+    );
+  });
+
+  it("stopSliceParallel signals rehydrated PID-only workers", () => {
+    const source = readFileSync(join(gsdDir, "slice-parallel-orchestrator.ts"), "utf-8");
+    assert.ok(
+      source.includes('process.kill(worker.pid, "SIGTERM")'),
+      "stopSliceParallel must signal live recovered PIDs when no ChildProcess exists",
+    );
+  });
 });
 
 describe("slice_parallel preference gating", () => {
