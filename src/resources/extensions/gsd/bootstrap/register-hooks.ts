@@ -37,6 +37,26 @@ import { initHealthWidget } from "../health-widget.js";
 // printed it before the TUI launched. Only re-print on /clear (subsequent sessions).
 let isFirstSession = true;
 
+function extractSubagentIdentities(input: unknown): string[] | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const record = input as Record<string, unknown>;
+  const identities: string[] = [];
+  const addIdentity = (value: unknown): void => {
+    if (typeof value === "string" && value.trim().length > 0) identities.push(value.trim());
+  };
+  const addFromItems = (value: unknown): void => {
+    if (!Array.isArray(value)) return;
+    for (const item of value) {
+      if (item && typeof item === "object") addIdentity((item as Record<string, unknown>).agent);
+    }
+  };
+
+  addIdentity(record.agent);
+  addFromItems(record.tasks);
+  addFromItems(record.chain);
+  return identities.length > 0 ? identities : undefined;
+}
+
 async function syncServiceTierStatus(ctx: ExtensionContext): Promise<void> {
   const { getEffectiveServiceTier, formatServiceTierFooterStatus } = await import("../service-tier.js");
   ctx.ui.setStatus("gsd-fast", formatServiceTierFooterStatus(getEffectiveServiceTier(), ctx.model?.id));
@@ -350,12 +370,15 @@ export function registerHooks(
       const manifest = resolveManifest(activeUnitType);
       if (manifest) {
         let planningInput = "";
+        let subagentIdentities: string[] | undefined;
         if (isToolCallEventType("write", event)) {
           planningInput = event.input.path;
         } else if (isToolCallEventType("edit", event)) {
           planningInput = event.input.path;
         } else if (isToolCallEventType("bash", event)) {
           planningInput = event.input.command;
+        } else if (event.toolName === "subagent" || event.toolName === "task") {
+          subagentIdentities = extractSubagentIdentities((event as { input?: unknown }).input);
         }
         const planningGuard = shouldBlockPlanningUnit(
           event.toolName,
@@ -363,6 +386,7 @@ export function registerHooks(
           dash.basePath || discussionBasePath,
           activeUnitType,
           manifest.tools,
+          subagentIdentities,
         );
         if (planningGuard.block) return planningGuard;
       }

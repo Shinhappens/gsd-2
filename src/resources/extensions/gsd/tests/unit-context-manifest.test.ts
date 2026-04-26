@@ -244,6 +244,22 @@ test('planning-dispatch mode is reserved for slice-level decomposition and compl
   }
 });
 
+test('planning-dispatch manifests declare non-empty allowedSubagents lists', () => {
+  for (const [unitType, manifest] of Object.entries(UNIT_MANIFESTS)) {
+    if (manifest.tools.mode !== "planning-dispatch") continue;
+    assert.ok(
+      Array.isArray(manifest.tools.allowedSubagents) && manifest.tools.allowedSubagents.length > 0,
+      `manifest "${unitType}" has planning-dispatch policy but no allowedSubagents — explicit allowlist is required for runtime dispatch gating`,
+    );
+    for (const agent of manifest.tools.allowedSubagents) {
+      assert.ok(
+        typeof agent === "string" && agent.length > 0,
+        `manifest "${unitType}" has empty/invalid allowedSubagents entry: ${JSON.stringify(agent)}`,
+      );
+    }
+  }
+});
+
 test('#4934: tools.mode "docs" requires a non-empty allowedPathGlobs array', () => {
   for (const [unitType, manifest] of Object.entries(UNIT_MANIFESTS)) {
     const tools = (manifest as { tools: { mode: string; allowedPathGlobs?: readonly string[] } }).tools;

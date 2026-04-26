@@ -669,7 +669,7 @@ export default function (pi: ExtensionAPI) {
 			"You MUST use parallel mode when ≥2 ready tasks are independent of each other's output. Do not serialize independent tasks manually — that wastes wall time and context.",
 			"Use chain mode for sequential pipelines where each step's output feeds the next: scout → planner → worker, or worker → reviewer → worker.",
 			"Before opening a PR or marking a slice complete, dispatch the reviewer agent (and security agent if the change touches auth, network, parsing, file IO, or shell exec).",
-			"Always check available agents with /subagent before choosing one — there are 13 bundled specialists plus any project-scoped agents.",
+			"Always check available agents with /subagent before choosing one — there are bundled specialists plus any project-scoped agents.",
 		],
 		parameters: SubagentParams,
 
@@ -723,8 +723,16 @@ export default function (pi: ExtensionAPI) {
 					: params.agent
 						? [params.agent]
 						: [];
+			const dispatchTasks = hasChain
+				? params.chain!.map((s) => s.task)
+				: hasTasks
+					? params.tasks!.map((t) => t.task)
+					: params.task
+						? [params.task]
+						: [];
 			const dispatchId = crypto.randomUUID();
 			const dispatchStartMs = Date.now();
+			let finalResults: SingleResult[] = [];
 			let dispatchCompletedEmitted = false;
 
 			emitJournalEvent(ctx.cwd, {
@@ -742,8 +750,77 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 
+			const zeroUsage = (): UsageStats => ({
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: 0,
+				contextTokens: 0,
+				turns: 0,
+			});
+			const errorMessageFor = (err: unknown): string =>
+				err instanceof Error ? err.message : String(err || "subagent dispatch failed");
+			const makeFailureResult = (err: unknown, agent: string, task: string, step?: number): SingleResult => {
+				const message = errorMessageFor(err);
+				return {
+					agent,
+					agentSource: "unknown",
+					task,
+					exitCode: 1,
+					messages: [],
+					stderr: message,
+					usage: zeroUsage(),
+					stopReason: signal?.aborted ? "aborted" : "error",
+					errorMessage: message,
+					...(step !== undefined ? { step } : {}),
+				};
+			};
+			const synthesizeFailureResults = (err: unknown): SingleResult[] => {
+				if (finalResults.length > 0) {
+					let patchedRunning = false;
+					const patched = finalResults.map((result) => {
+						if (result.exitCode !== -1) return result;
+						patchedRunning = true;
+						const message = errorMessageFor(err);
+						return {
+							...result,
+							exitCode: 1,
+							stderr: result.stderr || message,
+							stopReason: signal?.aborted ? "aborted" : "error",
+							errorMessage: result.errorMessage || message,
+							usage: result.usage ?? zeroUsage(),
+						};
+					});
+					if (patchedRunning || patched.some((result) => result.exitCode !== 0)) return patched;
+
+					const nextIndex = finalResults.length < dispatchAgents.length ? finalResults.length : 0;
+					if (nextIndex > 0) {
+						return [
+							...finalResults,
+							makeFailureResult(
+								err,
+								dispatchAgents[nextIndex] ?? "unknown",
+								dispatchTasks[nextIndex] ?? "",
+								dispatchMode === "chain" ? nextIndex + 1 : undefined,
+							),
+						];
+					}
+				}
+
+				const agentsForFailure = dispatchAgents.length > 0 ? dispatchAgents : ["unknown"];
+				return agentsForFailure.map((agent, index) =>
+					makeFailureResult(
+						err,
+						agent,
+						dispatchTasks[index] ?? "",
+						dispatchMode === "chain" ? index + 1 : undefined,
+					),
+				);
+			};
 			const finishDispatch = (results: SingleResult[]): void => {
 				if (dispatchCompletedEmitted) return;
+				finalResults = results;
 				dispatchCompletedEmitted = true;
 				const successCount = results.filter((r) => r.exitCode === 0).length;
 				const failureCount = results.filter((r) => r.exitCode !== 0).length;
@@ -769,6 +846,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			};
 
+			try {
 			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
 				const requestedAgentNames = new Set<string>();
 				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
@@ -798,6 +876,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.chain && params.chain.length > 0) {
 				const results: SingleResult[] = [];
+				finalResults = results;
 				let previousOutput = "";
 
 				for (let i = 0; i < params.chain.length; i++) {
@@ -882,6 +961,7 @@ export default function (pi: ExtensionAPI) {
 						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 					};
 				}
+				finalResults = allResults;
 
 				const emitParallelUpdate = () => {
 					if (onUpdate) {
@@ -953,6 +1033,7 @@ export default function (pi: ExtensionAPI) {
 					emitParallelUpdate();
 					return result;
 				});
+				finalResults = results;
 
 				const successCount = results.filter((r) => r.exitCode === 0).length;
 				const summaries = results.map((r) => {
@@ -1010,6 +1091,7 @@ export default function (pi: ExtensionAPI) {
 							onUpdate,
 							makeDetails("single"),
 						);
+					finalResults = [result];
 
 					// Capture and merge delta if isolated
 					if (isolation) {
@@ -1053,6 +1135,12 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
 				details: makeDetails("single")([]),
 			};
+			} catch (err) {
+				if (!dispatchCompletedEmitted) finalResults = synthesizeFailureResults(err);
+				throw err;
+			} finally {
+				finishDispatch(finalResults);
+			}
 		},
 
 		renderCall(args, theme) {

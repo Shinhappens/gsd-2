@@ -15,7 +15,14 @@ import type { ToolsPolicy } from '../unit-context-manifest.ts';
 
 const BASE = join('/tmp', 'fake-project');
 const PLANNING: ToolsPolicy = { mode: 'planning' };
-const PLANNING_DISPATCH: ToolsPolicy = { mode: 'planning-dispatch' };
+const PLANNING_DISPATCH: ToolsPolicy = {
+  mode: 'planning-dispatch',
+  allowedSubagents: ['scout', 'planner', 'researcher'],
+};
+const PLANNING_DISPATCH_REVIEW: ToolsPolicy = {
+  mode: 'planning-dispatch',
+  allowedSubagents: ['reviewer', 'security', 'tester'],
+};
 const READ_ONLY: ToolsPolicy = { mode: 'read-only' };
 const ALL: ToolsPolicy = { mode: 'all' };
 const DOCS: ToolsPolicy = {
@@ -145,8 +152,43 @@ test('planning-unit: blocks task tool (alt subagent name)', () => {
 });
 
 test('planning-dispatch: allows subagent dispatch (delegated recon/planner during slice planning)', () => {
-  const r = shouldBlockPlanningUnit('subagent', '', BASE, 'plan-slice', PLANNING_DISPATCH);
+  const r = shouldBlockPlanningUnit('subagent', '', BASE, 'plan-slice', PLANNING_DISPATCH, ['scout']);
   assert.strictEqual(r.block, false);
+});
+
+test('planning-dispatch: allows task dispatch (delegated recon/planner during slice planning)', () => {
+  const r = shouldBlockPlanningUnit('task', '', BASE, 'plan-slice', PLANNING_DISPATCH, ['planner']);
+  assert.strictEqual(r.block, false);
+});
+
+test('planning-dispatch: blocks subagent dispatch without a validated agent identity', () => {
+  const r = shouldBlockPlanningUnit('subagent', '', BASE, 'plan-slice', PLANNING_DISPATCH);
+  assert.strictEqual(r.block, true);
+  assert.match(r.reason!, /missing an agent identity/);
+});
+
+test('planning-dispatch: blocks implementation-tier agent', () => {
+  const r = shouldBlockPlanningUnit('subagent', '', BASE, 'plan-slice', PLANNING_DISPATCH, ['worker']);
+  assert.strictEqual(r.block, true);
+  assert.match(r.reason!, /"worker"/);
+  assert.match(r.reason!, /not permitted/);
+});
+
+test('planning-dispatch: blocks mixed batch containing a disallowed agent', () => {
+  const r = shouldBlockPlanningUnit('subagent', '', BASE, 'plan-slice', PLANNING_DISPATCH, ['scout', 'worker']);
+  assert.strictEqual(r.block, true);
+  assert.match(r.reason!, /"worker"/);
+});
+
+test('planning-dispatch: allows review-tier agent under closeout policy', () => {
+  const r = shouldBlockPlanningUnit('subagent', '', BASE, 'complete-slice', PLANNING_DISPATCH_REVIEW, ['reviewer']);
+  assert.strictEqual(r.block, false);
+});
+
+test('planning-dispatch: blocks recon agent under closeout policy', () => {
+  const r = shouldBlockPlanningUnit('subagent', '', BASE, 'complete-slice', PLANNING_DISPATCH_REVIEW, ['scout']);
+  assert.strictEqual(r.block, true);
+  assert.match(r.reason!, /"scout"/);
 });
 
 test('planning-dispatch: still blocks writes to user source (write isolation preserved)', () => {

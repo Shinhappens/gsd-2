@@ -125,7 +125,7 @@ export type ToolsPolicy =
   | { readonly mode: "all" }
   | { readonly mode: "read-only" }
   | { readonly mode: "planning" }
-  | { readonly mode: "planning-dispatch" }
+  | { readonly mode: "planning-dispatch"; readonly allowedSubagents: readonly string[] }
   | { readonly mode: "docs"; readonly allowedPathGlobs: readonly string[] };
 
 // ─── Computed-artifact registry (#4924 v2 contract) ───────────────────────
@@ -269,14 +269,18 @@ const COMMON_BUDGET_SMALL = 250_000;    // ~65K tokens
 
 const TOOLS_ALL: ToolsPolicy = { mode: "all" };
 const TOOLS_PLANNING: ToolsPolicy = { mode: "planning" };
-// Like TOOLS_PLANNING but permits subagent dispatch. Use for planning units
-// where delegation to scout/planner-style subagents materially improves the
-// plan (slice-level decomposition, design exploration). Per-agent allowlisting
-// is enforced at the prompt layer for now — plan-slice/refine-slice prompts
-// must steer the model toward read-only specialists (scout, planner, researcher)
-// and away from implementation-tier agents (worker, refactorer) that would
-// bypass the planning unit's write-isolation guarantees.
-const TOOLS_PLANNING_DISPATCH: ToolsPolicy = { mode: "planning-dispatch" };
+// Like TOOLS_PLANNING but permits dispatch to read-only recon/planning
+// specialists. Runtime-enforced by write-gate.ts before the subagent tool runs.
+const TOOLS_PLANNING_DISPATCH_RECON: ToolsPolicy = {
+  mode: "planning-dispatch",
+  allowedSubagents: ["scout", "planner", "researcher"],
+};
+// Like TOOLS_PLANNING_DISPATCH_RECON, but for closeout units that fan out
+// verification work to review-tier specialists.
+const TOOLS_PLANNING_DISPATCH_REVIEW: ToolsPolicy = {
+  mode: "planning-dispatch",
+  allowedSubagents: ["reviewer", "security", "tester"],
+};
 const TOOLS_DOCS: ToolsPolicy = {
   mode: "docs",
   // Globs are resolved relative to project basePath. The set is intentionally
@@ -389,7 +393,7 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     // reviewer / security / tester subagents. They read the diff and report
     // findings; they do not write user source. Write isolation to .gsd/ is
     // preserved.
-    tools: TOOLS_PLANNING_DISPATCH,
+    tools: TOOLS_PLANNING_DISPATCH_REVIEW,
     artifacts: {
       // #4780 landed slice-summary as excerpt for this unit; phase 2 of
       // the architecture will read this manifest as the source of truth
@@ -425,7 +429,7 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     // planning-dispatch: allows subagent dispatch so the planner can fan out
     // to scout for codebase recon and to planner/decompose-style specialists
     // for sub-decomposition. Write-isolation to .gsd/ is preserved.
-    tools: TOOLS_PLANNING_DISPATCH,
+    tools: TOOLS_PLANNING_DISPATCH_RECON,
     artifacts: {
       inline: ["roadmap", "slice-research", "dependency-summaries", "requirements", "decisions", "templates"],
       excerpt: [],
@@ -442,7 +446,7 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     // See plan-slice — same rationale: dispatch to scout/planner-style
     // specialists during refinement is materially better than re-doing recon
     // inline.
-    tools: TOOLS_PLANNING_DISPATCH,
+    tools: TOOLS_PLANNING_DISPATCH_RECON,
     artifacts: {
       inline: ["slice-plan", "slice-research", "dependency-summaries", "templates"],
       excerpt: [],
@@ -473,7 +477,7 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     // See complete-milestone — same rationale: dispatch to reviewer / security /
     // tester subagents to fan out review work without bloating this unit's
     // context.
-    tools: TOOLS_PLANNING_DISPATCH,
+    tools: TOOLS_PLANNING_DISPATCH_REVIEW,
     artifacts: {
       // Phase 3 migration (#4782): matches today's actual
       // buildCompleteSlicePrompt inlining order. Overrides prepend +

@@ -608,6 +608,7 @@ export function shouldBlockPlanningUnit(
   basePath: string,
   unitType: string,
   policy: ToolsPolicy | null | undefined,
+  subagentIdentities?: readonly string[],
 ): { block: boolean; reason?: string } {
   if (!policy) return { block: false };
   if (policy.mode === "all") return { block: false };
@@ -630,11 +631,33 @@ export function shouldBlockPlanningUnit(
   if (tool.startsWith("gsd_")) return { block: false };
 
   if (PLANNING_SUBAGENT_TOOLS.has(tool)) {
-    // planning-dispatch is the explicit opt-in for units that benefit from
-    // delegation (scout for recon, planner for sub-decomposition). Per-agent
-    // allowlisting is a future enhancement; today we allow the dispatch and
-    // rely on the prompt to steer toward read-only specialists.
-    if (policy.mode === "planning-dispatch") return { block: false };
+    if (policy.mode === "planning-dispatch") {
+      const requested = (subagentIdentities ?? []).map(a => a.trim()).filter(Boolean);
+      const allowedSubagents = Array.isArray(policy.allowedSubagents) ? policy.allowedSubagents : [];
+      const allowed = new Set(allowedSubagents);
+      if (requested.length === 0) {
+        return {
+          block: true,
+          reason: blockReason(
+            unitType,
+            policy.mode,
+            `subagent dispatch is missing an agent identity; permitted planning agents: ${allowedSubagents.join(", ")}`,
+          ),
+        };
+      }
+      const disallowed = requested.filter(a => !allowed.has(a));
+      if (disallowed.length > 0) {
+        return {
+          block: true,
+          reason: blockReason(
+            unitType,
+            policy.mode,
+            `subagent dispatch of ${disallowed.map(a => `"${a}"`).join(", ")} not permitted in planning units; permitted agents: ${allowedSubagents.join(", ")}`,
+          ),
+        };
+      }
+      return { block: false };
+    }
     return { block: true, reason: blockReason(unitType, policy.mode, `subagent dispatch is not permitted in planning units`) };
   }
 
