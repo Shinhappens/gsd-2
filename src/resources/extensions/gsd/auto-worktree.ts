@@ -1646,6 +1646,10 @@ export function mergeMilestoneToMain(
   }
 
   // 3. chdir to original base
+  // Note: previousCwd captures the cwd at this point — i.e. the worktree cwd
+  // entering the function. Subsequent throws restore to previousCwd, leaving
+  // the caller in worktree-cwd; callers (worktree-resolver) are responsible
+  // for any further cwd movement on the error path.
   const previousCwd = process.cwd();
   process.chdir(originalBasePath_);
 
@@ -1665,6 +1669,24 @@ export function mergeMilestoneToMain(
     : undefined;
   const mainBranch =
     integrationBranch ?? validatedPrefBranch ?? nativeDetectMainBranch(originalBasePath_);
+
+  // Fail closed when the resolved integration branch is the milestone branch
+  // itself (#5024). Stale or corrupt metadata (e.g. integrationBranch recorded
+  // as "milestone/<MID>") would otherwise let the squash merge resolve to a
+  // self-merge: nothing-to-commit + empty self-diff in the post-merge safety
+  // check (#1792) collapse to a false success, and the worktree-resolver
+  // emits worktree-merged for work that never landed on a distinct
+  // integration branch.
+  if (mainBranch === milestoneBranch) {
+    process.chdir(previousCwd);
+    throw new GSDError(
+      GSD_GIT_ERROR,
+      `Resolved integration branch "${mainBranch}" is the same ref as milestone branch ` +
+      `"${milestoneBranch}" — refusing to self-merge. Integration branch metadata is invalid; ` +
+      `set a distinct main_branch in GSD preferences or repair the milestone integration record ` +
+      `before retrying milestone completion.`,
+    );
+  }
 
   // Remove transient project-root state files before any branch or merge
   // operation. Untracked milestone metadata can otherwise block squash merges.
