@@ -8,6 +8,7 @@ export {
 	mapThinkingLevelToEffort,
 	supportsAdaptiveThinking,
 } from "./providers/anthropic-shared.js";
+export * from "./providers/api-family.js";
 export * from "./providers/provider-capabilities.js";
 export * from "./providers/register-builtins.js";
 export type { ProviderSwitchReport } from "./providers/transform-messages.js";

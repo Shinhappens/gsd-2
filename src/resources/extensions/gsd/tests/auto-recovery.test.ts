@@ -657,6 +657,80 @@ test("hasImplementationArtifacts returns true when implementation files committe
   }
 });
 
+test("hasImplementationArtifacts finds milestone implementation commits after retry resumes on main (#4699)", () => {
+  const base = makeGitBase();
+  try {
+    mkdirSync(join(base, ".gsd", "milestones", "M001"), { recursive: true });
+    writeFileSync(join(base, ".gsd", "milestones", "M001", "M001-ROADMAP.md"), "# Roadmap");
+    execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "chore: auto-commit after plan-milestone\n\nGSD-Unit: M001"], { cwd: base, stdio: "ignore" });
+
+    mkdirSync(join(base, "src"), { recursive: true });
+    mkdirSync(join(base, ".gsd", "milestones", "M001", "slices", "S01", "tasks"), { recursive: true });
+    writeFileSync(join(base, "src", "feature.ts"), "export function feature() {}");
+    writeFileSync(join(base, ".gsd", "milestones", "M001", "slices", "S01", "tasks", "T01-SUMMARY.md"), "# Summary");
+    execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "feat: add milestone feature\n\nGSD-Task: S01/T01"], { cwd: base, stdio: "ignore" });
+
+    const result = hasImplementationArtifacts(base, "M001");
+    assert.equal(result, "present", "main self-diff retry should find production execute-task commits");
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("hasImplementationArtifacts rejects milestone-scoped main history with only .gsd commits (#4699)", () => {
+  const base = makeGitBase();
+  try {
+    mkdirSync(join(base, ".gsd", "milestones", "M001"), { recursive: true });
+    writeFileSync(join(base, ".gsd", "milestones", "M001", "M001-ROADMAP.md"), "# Roadmap");
+    writeFileSync(join(base, ".gsd", "milestones", "M001", "M001-SUMMARY.md"), "# Summary");
+    execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "chore: auto-commit after complete-milestone\n\nGSD-Unit: M001"], { cwd: base, stdio: "ignore" });
+
+    const result = hasImplementationArtifacts(base, "M001");
+    assert.equal(result, "absent", "milestone-scoped fallback must not treat .gsd-only commits as implementation");
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("hasImplementationArtifacts treats empty non-integration branch diff as absent (#4699)", () => {
+  const base = makeGitBase();
+  try {
+    execFileSync("git", ["checkout", "-b", "feat/empty-milestone"], { cwd: base, stdio: "ignore" });
+
+    const result = hasImplementationArtifacts(base, "M001");
+    assert.equal(result, "absent", "empty milestone branch diffs should not use main retry fallback");
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("hasImplementationArtifacts uses milestone path history instead of rolling depth (#4699)", () => {
+  const base = makeGitBase();
+  try {
+    mkdirSync(join(base, ".gsd", "milestones", "M001", "slices", "S01", "tasks"), { recursive: true });
+    mkdirSync(join(base, "src"), { recursive: true });
+    writeFileSync(join(base, "src", "feature.ts"), "export function feature() {}");
+    writeFileSync(join(base, ".gsd", "milestones", "M001", "slices", "S01", "tasks", "T01-SUMMARY.md"), "# Summary");
+    execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "feat: old milestone implementation\n\nGSD-Task: S01/T01"], { cwd: base, stdio: "ignore" });
+
+    mkdirSync(join(base, "docs"), { recursive: true });
+    for (let i = 0; i < 205; i++) {
+      writeFileSync(join(base, "docs", `note-${i}.md`), `# Note ${i}\n`);
+      execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+      execFileSync("git", ["commit", "-m", `docs: filler ${i}`], { cwd: base, stdio: "ignore" });
+    }
+
+    const result = hasImplementationArtifacts(base, "M001");
+    assert.equal(result, "present", "milestone evidence should not age out after 200 unrelated commits");
+  } finally {
+    cleanup(base);
+  }
+});
+
 test("hasImplementationArtifacts returns true on non-git directory (fail-open)", () => {
   const base = join(tmpdir(), `gsd-test-nogit-${randomUUID()}`);
   mkdirSync(base, { recursive: true });
@@ -701,6 +775,98 @@ test("verifyExpectedArtifact complete-milestone passes with impl files (#1703)",
 
     const result = verifyExpectedArtifact("complete-milestone", "M001", base);
     assert.equal(result, true, "complete-milestone should pass verification with implementation files");
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("verifyExpectedArtifact complete-milestone passes on main retry with milestone implementation commits (#4699)", () => {
+  const base = makeGitBase();
+  try {
+    mkdirSync(join(base, ".gsd", "milestones", "M001"), { recursive: true });
+    writeFileSync(join(base, ".gsd", "milestones", "M001", "M001-SUMMARY.md"), "# Milestone Summary\nDone.");
+    mkdirSync(join(base, "src"), { recursive: true });
+    mkdirSync(join(base, ".gsd", "milestones", "M001", "slices", "S01", "tasks"), { recursive: true });
+    writeFileSync(join(base, "src", "app.ts"), "console.log('hello');");
+    writeFileSync(join(base, ".gsd", "milestones", "M001", "slices", "S01", "tasks", "T01-SUMMARY.md"), "# Summary");
+    execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "feat: implementation already on main\n\nGSD-Task: S01/T01"], { cwd: base, stdio: "ignore" });
+
+    const result = verifyExpectedArtifact("complete-milestone", "M001", base);
+    assert.equal(result, true, "complete-milestone should not fail solely because HEAD vs main is a self-diff");
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("verifyExpectedArtifact complete-milestone fails when DB milestone is not complete (#4658)", () => {
+  const base = makeGitBase();
+  try {
+    execFileSync("git", ["checkout", "-b", "feat/ms-db-active"], { cwd: base, stdio: "ignore" });
+    mkdirSync(join(base, ".gsd", "milestones", "M001"), { recursive: true });
+    writeFileSync(join(base, ".gsd", "milestones", "M001", "M001-SUMMARY.md"), "# Milestone Summary\nverification FAILED — not complete.");
+    mkdirSync(join(base, "src"), { recursive: true });
+    writeFileSync(join(base, "src", "app.ts"), "console.log('hello');");
+    execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "feat: implementation with failed summary"], { cwd: base, stdio: "ignore" });
+
+    openDatabase(join(base, ".gsd", "gsd.db"));
+    insertMilestone({ id: "M001", title: "Milestone One", status: "active" });
+
+    const result = verifyExpectedArtifact("complete-milestone", "M001", base);
+    assert.equal(result, false, "complete-milestone must fail when DB status is not complete");
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("verifyExpectedArtifact complete-milestone passes when DB milestone is complete (#4658)", () => {
+  const base = makeGitBase();
+  try {
+    execFileSync("git", ["checkout", "-b", "feat/ms-db-complete"], { cwd: base, stdio: "ignore" });
+    mkdirSync(join(base, ".gsd", "milestones", "M001"), { recursive: true });
+    writeFileSync(join(base, ".gsd", "milestones", "M001", "M001-SUMMARY.md"), "# Milestone Summary\nDone.");
+    mkdirSync(join(base, "src"), { recursive: true });
+    writeFileSync(join(base, "src", "app.ts"), "console.log('hello');");
+    execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "feat: implementation complete"], { cwd: base, stdio: "ignore" });
+
+    openDatabase(join(base, ".gsd", "gsd.db"));
+    insertMilestone({ id: "M001", title: "Milestone One", status: "complete" });
+
+    const result = verifyExpectedArtifact("complete-milestone", "M001", base);
+    assert.equal(result, true, "complete-milestone should pass when DB status is complete");
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("verifyExpectedArtifact complete-milestone tolerates transient DB lag when SUMMARY is canonical success (#4658)", () => {
+  const base = makeGitBase();
+  try {
+    execFileSync("git", ["checkout", "-b", "feat/ms-db-lag-success"], { cwd: base, stdio: "ignore" });
+    mkdirSync(join(base, ".gsd", "milestones", "M001"), { recursive: true });
+    writeFileSync(
+      join(base, ".gsd", "milestones", "M001", "M001-SUMMARY.md"),
+      [
+        "---",
+        "id: M001",
+        "status: complete",
+        "---",
+        "",
+        "# M001: Success",
+      ].join("\n"),
+    );
+    mkdirSync(join(base, "src"), { recursive: true });
+    writeFileSync(join(base, "src", "app.ts"), "console.log('hello');");
+    execFileSync("git", ["add", "."], { cwd: base, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "feat: implementation with stale db"], { cwd: base, stdio: "ignore" });
+
+    openDatabase(join(base, ".gsd", "gsd.db"));
+    insertMilestone({ id: "M001", title: "Milestone One", status: "active" });
+
+    const result = verifyExpectedArtifact("complete-milestone", "M001", base);
+    assert.equal(result, true, "canonical success SUMMARY should pass verification during transient DB lag");
   } finally {
     cleanup(base);
   }
@@ -769,6 +935,55 @@ test("#4414: parallel-research sentinel path does not collide with RESEARCH suff
       milestoneResearch,
       null,
       "sentinel must not be mistaken for M001-RESEARCH.md via legacy pattern match",
+    );
+  } finally {
+    cleanup(base);
+  }
+});
+
+test("#4068: verifyExpectedArtifact parallel-research treats PARALLEL-BLOCKER as terminal completion", () => {
+  // Regression: when a parallel-research unit times out and the timeout-recovery
+  // machinery writes a PARALLEL-BLOCKER placeholder, verifyExpectedArtifact must
+  // return true so the dispatch loop can advance.  Previously it only returned
+  // true when every slice had a RESEARCH file — meaning a timeout always left
+  // verifyExpectedArtifact returning false, the unit was never cleared from
+  // unitDispatchCount, and the dispatch rule re-fired on the next iteration
+  // (infinite loop, issue #4068 / #4355).
+  const base = makeTmpBase();
+  try {
+    // Write a minimal roadmap
+    writeFileSync(
+      join(base, ".gsd", "milestones", "M001", "M001-ROADMAP.md"),
+      [
+        "# M001: Timeout Test",
+        "",
+        "## Slices",
+        "",
+        "- [ ] **S01: Alpha** `risk:low` `depends:[]`",
+        "- [ ] **S02: Beta** `risk:low` `depends:[]`",
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    // No RESEARCH files written — subagents timed out
+    clearParseCache();
+    invalidateAllCaches();
+
+    // Simulate timeout-recovery writing the PARALLEL-BLOCKER placeholder
+    const blockerPath = resolveExpectedArtifactPath("research-slice", "M001/parallel-research", base);
+    assert.ok(blockerPath, "PARALLEL-BLOCKER path must resolve for parallel-research unit");
+    writeFileSync(blockerPath!, "# BLOCKER — timeout recovery\n\n**Reason**: hard timeout.\n", "utf-8");
+
+    clearParseCache();
+    invalidateAllCaches();
+
+    // After blocker is written, verifyExpectedArtifact must return true
+    // so the dispatch loop treats this unit as complete and moves on.
+    assert.equal(
+      verifyExpectedArtifact("research-slice", "M001/parallel-research", base),
+      true,
+      "#4068: PARALLEL-BLOCKER on disk must satisfy verifyExpectedArtifact so the loop does not re-dispatch",
     );
   } finally {
     cleanup(base);

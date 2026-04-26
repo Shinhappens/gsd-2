@@ -292,4 +292,46 @@ export const CUSTOM_MODELS = {
 			compat: { thinkingFormat: "zai", supportsDeveloperRole: false },
 		} satisfies Model<"openai-completions">,
 	},
+
+	// ─── MiniMax additive hotfixes ───────────────────────────────────────
+	// models.dev currently omits MiniMax-M2.1-highspeed in some snapshots.
+	// Keep this additive (no overrides) so generated models still win when present.
+	"minimax": {
+		"MiniMax-M2.1-highspeed": {
+			id: "MiniMax-M2.1-highspeed",
+			name: "MiniMax-M2.1-highspeed",
+			api: "anthropic-messages",
+			provider: "minimax",
+			baseUrl: "https://api.minimax.io/anthropic",
+			reasoning: true,
+			input: ["text"],
+			cost: {
+				input: 0.6,
+				output: 2.4,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 204800,
+			maxTokens: 131072,
+		} satisfies Model<"anthropic-messages">,
+	},
+	"minimax-cn": {
+		"MiniMax-M2.1-highspeed": {
+			id: "MiniMax-M2.1-highspeed",
+			name: "MiniMax-M2.1-highspeed",
+			api: "anthropic-messages",
+			provider: "minimax-cn",
+			baseUrl: "https://api.minimaxi.com/anthropic",
+			reasoning: true,
+			input: ["text"],
+			cost: {
+				input: 0.6,
+				output: 2.4,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 204800,
+			maxTokens: 131072,
+		} satisfies Model<"anthropic-messages">,
+	},
 } as const;

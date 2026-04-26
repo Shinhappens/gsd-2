@@ -21,6 +21,13 @@ import type { IterationContext, LoopState, PreDispatchData, IterationData } from
 import type { SessionLockStatus } from "../session-lock.js";
 import { runDispatch, runUnitPhase, runPreDispatch, runFinalize } from "../auto/phases.js";
 import { readUnitRuntimeRecord } from "../unit-runtime.js";
+import {
+  closeDatabase,
+  insertMilestone,
+  insertSlice,
+  insertTask,
+  openDatabase,
+} from "../gsd-db.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -77,6 +84,8 @@ function makeMockDeps(
     autoWorktreeBranch: () => "auto/M001",
     resolveMilestoneFile: () => null,
     reconcileMergeState: () => "clean",
+    preflightCleanRoot: () => ({ stashPushed: false, summary: "" }),
+    postflightPopStash: () => {},
     getLedger: () => ({ units: [] }),
     getProjectTotals: () => ({ cost: 0 }),
     formatCost: (c: number) => `$${c.toFixed(2)}`,
@@ -642,6 +651,63 @@ test("terminal event is emitted on blocked state", async () => {
   assert.deepEqual((terminalEvents[0].data as any).blockers, ["Missing API key"]);
 });
 
+test("#4671: plan-v2 missing CONTEXT.md reaches dispatch recovery instead of pausing", async () => {
+  const basePath = mkdtempSync(join(tmpdir(), "gsd-4671-predispatch-"));
+  mkdirSync(join(basePath, ".gsd", "milestones", "M001", "slices", "S01", "tasks"), { recursive: true });
+  openDatabase(join(basePath, ".gsd", "gsd.db"));
+  try {
+    insertMilestone({ id: "M001", title: "Test", status: "active" });
+    insertSlice({
+      id: "S01",
+      milestoneId: "M001",
+      title: "Slice 1",
+      status: "in_progress",
+      sequence: 1,
+    });
+    insertTask({
+      id: "T01",
+      milestoneId: "M001",
+      sliceId: "S01",
+      title: "Task 1",
+      status: "pending",
+      keyFiles: ["src/task.ts"],
+      sequence: 1,
+    });
+
+    let pauseCalls = 0;
+    const capture = createEventCapture();
+    const deps = makeMockDeps(capture, {
+      pauseAuto: async () => { pauseCalls++; },
+      deriveState: async () => ({
+        phase: "executing",
+        activeMilestone: { id: "M001", title: "Test", status: "active" },
+        activeSlice: { id: "S01", title: "Slice 1" },
+        activeTask: { id: "T01", title: "Task 1" },
+        registry: [{ id: "M001", status: "active" }],
+        blockers: [],
+        recentDecisions: [],
+        nextAction: "dispatch",
+      }) as any,
+    });
+    const ic = makeIC(deps, {
+      prefs: { uok: { plan_v2: { enabled: true } } } as any,
+    });
+    ic.s.basePath = basePath;
+
+    const result = await runPreDispatch(ic, {
+      recentUnits: [],
+      stuckRecoveryAttempts: 0,
+      consecutiveFinalizeTimeouts: 0,
+    });
+
+    assert.equal(result.action, "next");
+    assert.equal(pauseCalls, 0, "missing CONTEXT.md should be handled by dispatch recovery, not plan gate pause");
+  } finally {
+    closeDatabase();
+    rmSync(basePath, { recursive: true, force: true });
+  }
+});
+
 test("milestone-transition event is emitted when milestone changes", async () => {
   const capture = createEventCapture();
   const deps = makeMockDeps(capture, {
@@ -836,4 +902,39 @@ test("runFinalize pauses and emits unit-end when pre-verification times out", as
   assert.equal((endEvents[0].data as any).status, "timed-out-finalize");
   assert.equal((endEvents[0].data as any).artifactVerified, false);
   assert.equal((endEvents[0].data as any).finalizeStage, "pre");
+});
+
+test("transient session-failed cancellations pause instead of hard-stopping", async () => {
+  const capture = createEventCapture();
+  const { resolveAgentEndCancelled, _resetPendingResolve } = await import("../auto-loop.js");
+  _resetPendingResolve();
+
+  const deps = makeMockDeps(capture);
+  const ic = makeIC(deps);
+  const iterData: IterationData = {
+    unitType: "execute-task",
+    unitId: "M001/S01/T02",
+    prompt: "do more stuff",
+    finalPrompt: "do more stuff",
+    pauseAfterUatDispatch: false,
+    state: { phase: "executing", activeMilestone: { id: "M001" }, activeSlice: { id: "S01" }, registry: [], blockers: [] } as any,
+    mid: "M001",
+    midTitle: "Test",
+    isRetry: false,
+    previousTier: undefined,
+  };
+  const loopState: LoopState = { recentUnits: [{ key: "execute-task/M001/S01/T02" }], stuckRecoveryAttempts: 0, consecutiveFinalizeTimeouts: 0 };
+
+  const unitPromise = runUnitPhase(ic, iterData, loopState);
+  await new Promise(r => setTimeout(r, 50));
+
+  resolveAgentEndCancelled({ message: "Session creation failed: temporary bootstrap overload", category: "session-failed", isTransient: true });
+
+  const result = await unitPromise;
+  assert.equal(result.action, "break");
+  assert.equal((result as any).reason, "session-timeout");
+
+  const entry = loopState.recentUnits[loopState.recentUnits.length - 1];
+  assert.ok(entry.error, "window entry must have error set");
+  assert.ok(entry.error!.startsWith("session-failed:"), "error must preserve the session-failed category");
 });

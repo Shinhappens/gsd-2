@@ -327,7 +327,7 @@ test("ADR-011 P2: listEscalationArtifacts filters to actionable by default", (t)
   assert.equal(all.length, 2, "both surface with --all");
 });
 
-test("ADR-011 P2: schema v17 fresh DB has all escalation columns on tasks + source on decisions", (t) => {
+test("ADR-011 P2: schema v20 fresh DB has all escalation columns on tasks + source on decisions", (t) => {
   const base = makeBase();
   t.after(() => cleanup(base));
   openDatabase(join(base, ".gsd", "gsd.db"));
@@ -348,7 +348,7 @@ test("ADR-011 P2: schema v17 fresh DB has all escalation columns on tasks + sour
   assert.ok(decCols.includes("source"), "decisions table must have source column");
 
   const version = adapter.prepare("SELECT MAX(version) as v FROM schema_version").get();
-  assert.equal(version?.["v"], 17);
+  assert.equal(version?.["v"], 22);
 });
 
 test("ADR-011 P2: findUnappliedEscalationOverride returns null when escalation_pending=1 (still pending)", (t) => {

@@ -118,7 +118,11 @@ export function printWelcomeScreen(opts: WelcomeScreenOptions): void {
   let line2 = ''
   if (state?.milestone) {
     const statusParts = [state.milestone, state.phase, state.slice].filter(Boolean)
-    line1 = `  Active     ${chalk.dim(statusParts.join(' · '))}`
+    const activePrefix = '  Active     '
+    const maxActiveLen = RIGHT_INNER - activePrefix.length - 1
+    let activeText = statusParts.join(' · ')
+    if (activeText.length > maxActiveLen) activeText = activeText.slice(0, maxActiveLen - 1) + '…'
+    line1 = `${activePrefix}${chalk.dim(activeText)}`
     line2 = state.nextAction
       ? `  Next       ${chalk.dim(state.nextAction)}`
       : ''

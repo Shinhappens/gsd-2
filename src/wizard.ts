@@ -23,6 +23,8 @@ export function loadStoredEnvKeys(authStorage: AuthStorage): void {
     ['discord_bot',   'DISCORD_BOT_TOKEN'],
     ['telegram_bot',  'TELEGRAM_BOT_TOKEN'],
     ['groq',          'GROQ_API_KEY'],
+    ['minimax',       'MINIMAX_API_KEY'],
+    ['minimax-cn',    'MINIMAX_CN_API_KEY'],
     ['ollama-cloud',  'OLLAMA_API_KEY'],
     ['custom-openai', 'CUSTOM_OPENAI_API_KEY'],
   ]

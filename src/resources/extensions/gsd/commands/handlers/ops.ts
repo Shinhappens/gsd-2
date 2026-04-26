@@ -251,6 +251,11 @@ Examples:
     await handleExtractLearnings(trimmed.replace(/^extract-learnings\s*/, "").trim(), ctx, pi);
     return true;
   }
+  if (trimmed === "memory" || trimmed.startsWith("memory ") || trimmed === "memory help") {
+    const { handleMemory } = await import("../../commands-memory.js");
+    await handleMemory(trimmed.replace(/^memory\s*/, "").trim(), ctx, pi);
+    return true;
+  }
   if (trimmed === "scan" || trimmed.startsWith("scan ")) {
     const { handleScan } = await import("../../commands-scan.js");
     // \s* (not \s+) is intentional: handles both /gsd scan (no args) and /gsd scan --focus X

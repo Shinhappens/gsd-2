@@ -68,13 +68,13 @@ export { resolveAllSkillReferences } from "./preferences-skills.js";
 // These lived in preferences-skills.ts but imported loadEffectiveGSDPreferences
 // back from this file, creating a circular dependency. Moved here since they
 // are trivial wrappers over loadEffectiveGSDPreferences.
-export function resolveSkillDiscoveryMode(): SkillDiscoveryMode {
-  const prefs = loadEffectiveGSDPreferences();
+export function resolveSkillDiscoveryMode(basePath?: string): SkillDiscoveryMode {
+  const prefs = loadEffectiveGSDPreferences(basePath);
   return prefs?.preferences.skill_discovery ?? "suggest";
 }
 
-export function resolveSkillStalenessDays(): number {
-  const prefs = loadEffectiveGSDPreferences();
+export function resolveSkillStalenessDays(basePath?: string): number {
+  const prefs = loadEffectiveGSDPreferences(basePath);
   return prefs?.preferences.skill_staleness_days ?? 60;
 }
 
@@ -89,10 +89,12 @@ export {
   resolveDynamicRoutingConfig,
   resolveAutoSupervisorConfig,
   resolveProfileDefaults,
+  getProfileTierMap,
   resolveEffectiveProfile,
   resolveInlineLevel,
   resolveContextSelection,
   resolveSearchProviderFromPreferences,
+  resolveDisabledModelProvidersFromPreferences,
 } from "./preferences-models.js";
 
 // ─── Path Constants & Getters ───────────────────────────────────────────────
@@ -109,16 +111,16 @@ function legacyGlobalPreferencesPath(): string {
   return join(homedir(), ".pi", "agent", "gsd-preferences.md");
 }
 
-function projectPreferencesPath(): string {
-  return join(gsdRoot(process.cwd()), "PREFERENCES.md");
+function projectPreferencesPath(basePath: string = process.cwd()): string {
+  return join(gsdRoot(basePath), "PREFERENCES.md");
 }
 // Legacy lowercase files can still exist in older projects. Keep them as a
 // compatibility-only fallback, but route new reads/writes through PREFERENCES.md.
 function legacyGlobalPreferencesPathLowercase(): string {
   return join(gsdHome(), "preferences.md");
 }
-function legacyProjectPreferencesPathLowercase(): string {
-  return join(gsdRoot(process.cwd()), "preferences.md");
+function legacyProjectPreferencesPathLowercase(basePath: string = process.cwd()): string {
+  return join(gsdRoot(basePath), "preferences.md");
 }
 
 export function getGlobalGSDPreferencesPath(): string {
@@ -129,8 +131,8 @@ export function getLegacyGlobalGSDPreferencesPath(): string {
   return legacyGlobalPreferencesPath();
 }
 
-export function getProjectGSDPreferencesPath(): string {
-  return projectPreferencesPath();
+export function getProjectGSDPreferencesPath(basePath?: string): string {
+  return projectPreferencesPath(basePath);
 }
 
 // ─── Loading ────────────────────────────────────────────────────────────────
@@ -141,14 +143,17 @@ export function loadGlobalGSDPreferences(): LoadedGSDPreferences | null {
     ?? loadPreferencesFile(legacyGlobalPreferencesPath(), "global");
 }
 
-export function loadProjectGSDPreferences(): LoadedGSDPreferences | null {
-  return loadPreferencesFile(projectPreferencesPath(), "project")
-    ?? loadPreferencesFile(legacyProjectPreferencesPathLowercase(), "project");
+export function loadProjectGSDPreferences(basePath?: string): LoadedGSDPreferences | null {
+  return loadPreferencesFile(projectPreferencesPath(basePath), "project")
+    ?? loadPreferencesFile(legacyProjectPreferencesPathLowercase(basePath), "project");
 }
 
-export function loadEffectiveGSDPreferences(): LoadedGSDPreferences | null {
+export function loadEffectiveGSDPreferences(
+  basePath?: string,
+  opts?: { availableModelIds?: string[] },
+): LoadedGSDPreferences | null {
   const globalPreferences = loadGlobalGSDPreferences();
-  const projectPreferences = loadProjectGSDPreferences();
+  const projectPreferences = loadProjectGSDPreferences(basePath);
 
   if (!globalPreferences && !projectPreferences) return null;
 
@@ -175,7 +180,11 @@ export function loadEffectiveGSDPreferences(): LoadedGSDPreferences | null {
   // Explicit user preferences always override profile defaults.
   const profile = result.preferences.token_profile as TokenProfile | undefined;
   if (profile) {
-    const profileDefaults = _resolveProfileDefaults(profile);
+    const profileDefaults = _resolveProfileDefaults(
+      profile,
+      opts?.availableModelIds,
+      result.preferences.dynamic_routing,
+    );
     result = {
       ...result,
       preferences: mergePreferences(profileDefaults as GSDPreferences, result.preferences),
@@ -380,6 +389,10 @@ function mergePreferences(base: GSDPreferences, override: GSDPreferences): GSDPr
     dynamic_routing: (base.dynamic_routing || override.dynamic_routing)
       ? { ...(base.dynamic_routing ?? {}), ...(override.dynamic_routing ?? {}) } as DynamicRoutingConfig
       : undefined,
+    disabled_model_providers: mergeStringLists(
+      base.disabled_model_providers,
+      override.disabled_model_providers,
+    ),
     uok: (base.uok || override.uok)
       ? {
           enabled: override.uok?.enabled ?? base.uok?.enabled,
@@ -603,8 +616,8 @@ export function resolvePreDispatchHooks(): PreDispatchHookConfig[] {
  * Worktree isolation requires explicit opt-in because it depends on git
  * branch infrastructure that must be set up before use.
  */
-export function getIsolationMode(): "none" | "worktree" | "branch" {
-  const prefs = loadEffectiveGSDPreferences()?.preferences?.git;
+export function getIsolationMode(basePath?: string): "none" | "worktree" | "branch" {
+  const prefs = loadEffectiveGSDPreferences(basePath)?.preferences?.git;
   if (prefs?.isolation === "worktree") return "worktree";
   if (prefs?.isolation === "branch") return "branch";
   return "none"; // default — no isolation, work on current branch

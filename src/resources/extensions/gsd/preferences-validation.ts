@@ -610,6 +610,27 @@ export function validatePreferences(preferences: GSDPreferences): {
     }
   }
 
+  // ─── Disabled Model Providers ───────────────────────────────────────
+  if (preferences.disabled_model_providers !== undefined) {
+    if (Array.isArray(preferences.disabled_model_providers)) {
+      const allStrings = preferences.disabled_model_providers.every(
+        (provider: unknown) => typeof provider === "string",
+      );
+      if (!allStrings) {
+        errors.push("disabled_model_providers must be an array of strings");
+      } else {
+        const normalized = preferences.disabled_model_providers
+          .map((provider) => provider.trim())
+          .filter((provider) => provider.length > 0);
+        if (normalized.length > 0) {
+          validated.disabled_model_providers = Array.from(new Set(normalized));
+        }
+      }
+    } else {
+      errors.push("disabled_model_providers must be an array of strings");
+    }
+  }
+
   // ─── Context Management ──────────────────────────────────────────────
   if (preferences.context_management !== undefined) {
     if (typeof preferences.context_management === "object" && preferences.context_management !== null) {
@@ -641,6 +662,50 @@ export function validatePreferences(preferences: GSDPreferences): {
       }
     } else {
       errors.push("context_management must be an object");
+    }
+  }
+
+  // ─── Context Mode (gsd_exec sandbox) ────────────────────────────────────
+  if (preferences.context_mode !== undefined) {
+    if (typeof preferences.context_mode === "object" && preferences.context_mode !== null) {
+      const cmode = preferences.context_mode as unknown as Record<string, unknown>;
+      const validCmode: Record<string, unknown> = {};
+
+      if (cmode.enabled !== undefined) {
+        if (typeof cmode.enabled === "boolean") validCmode.enabled = cmode.enabled;
+        else errors.push("context_mode.enabled must be a boolean");
+      }
+      if (cmode.exec_timeout_ms !== undefined) {
+        const t = cmode.exec_timeout_ms;
+        if (typeof t === "number" && t >= 1000 && t <= 600_000) validCmode.exec_timeout_ms = Math.floor(t);
+        else errors.push("context_mode.exec_timeout_ms must be a number between 1000 and 600000");
+      }
+      if (cmode.exec_stdout_cap_bytes !== undefined) {
+        const b = cmode.exec_stdout_cap_bytes;
+        if (typeof b === "number" && b >= 4096 && b <= 16_777_216) validCmode.exec_stdout_cap_bytes = Math.floor(b);
+        else errors.push("context_mode.exec_stdout_cap_bytes must be a number between 4096 and 16777216");
+      }
+      if (cmode.exec_digest_chars !== undefined) {
+        const c = cmode.exec_digest_chars;
+        if (typeof c === "number" && c >= 0 && c <= 4000) validCmode.exec_digest_chars = Math.floor(c);
+        else errors.push("context_mode.exec_digest_chars must be a number between 0 and 4000");
+      }
+      if (cmode.exec_env_allowlist !== undefined) {
+        if (
+          Array.isArray(cmode.exec_env_allowlist) &&
+          cmode.exec_env_allowlist.every((v) => typeof v === "string" && /^[A-Z_][A-Z0-9_]*$/i.test(v))
+        ) {
+          validCmode.exec_env_allowlist = cmode.exec_env_allowlist;
+        } else {
+          errors.push("context_mode.exec_env_allowlist must be an array of valid env var names");
+        }
+      }
+
+      if (Object.keys(validCmode).length > 0) {
+        validated.context_mode = validCmode as any;
+      }
+    } else {
+      errors.push("context_mode must be an object");
     }
   }
 
@@ -694,6 +759,41 @@ export function validatePreferences(preferences: GSDPreferences): {
 
     if (Object.keys(parallel).length > 0) {
       validated.parallel = parallel as unknown as import("./types.js").ParallelConfig;
+    }
+  }
+
+  // ─── Slice Parallel Config ───────────────────────────────────────────────
+  if (preferences.slice_parallel !== undefined) {
+    if (typeof preferences.slice_parallel === "object" && preferences.slice_parallel !== null) {
+      const sp = preferences.slice_parallel as Record<string, unknown>;
+      const validSp: NonNullable<GSDPreferences["slice_parallel"]> = {};
+
+      if (sp.enabled !== undefined) {
+        if (typeof sp.enabled === "boolean") validSp.enabled = sp.enabled;
+        else errors.push("slice_parallel.enabled must be a boolean");
+      }
+
+      if (sp.max_workers !== undefined) {
+        const maxWorkers = typeof sp.max_workers === "number" ? sp.max_workers : Number(sp.max_workers);
+        if (Number.isFinite(maxWorkers) && maxWorkers >= 1 && maxWorkers <= 8) {
+          validSp.max_workers = Math.floor(maxWorkers);
+        } else {
+          errors.push("slice_parallel.max_workers must be a number between 1 and 8");
+        }
+      }
+
+      const knownSliceParallelKeys = new Set(["enabled", "max_workers"]);
+      for (const key of Object.keys(sp)) {
+        if (!knownSliceParallelKeys.has(key)) {
+          warnings.push(`unknown slice_parallel key "${key}" — ignored`);
+        }
+      }
+
+      if (Object.keys(validSp).length > 0) {
+        validated.slice_parallel = validSp;
+      }
+    } else {
+      errors.push("slice_parallel must be an object");
     }
   }
 
@@ -907,6 +1007,27 @@ export function validatePreferences(preferences: GSDPreferences): {
     // Deprecated: merge_to_main is ignored (branchless architecture).
     if (g.merge_to_main !== undefined) {
       warnings.push("git.merge_to_main is deprecated — milestone-level merge is now always used. Remove this setting.");
+    }
+    // #4765 — collapse cadence + milestone resquash
+    if (g.collapse_cadence !== undefined) {
+      const validCadence = new Set(["milestone", "slice"]);
+      if (typeof g.collapse_cadence === "string" && validCadence.has(g.collapse_cadence)) {
+        git.collapse_cadence = g.collapse_cadence as "milestone" | "slice";
+      } else {
+        errors.push("git.collapse_cadence must be one of: milestone, slice");
+      }
+    }
+    if (g.milestone_resquash !== undefined) {
+      if (typeof g.milestone_resquash === "boolean") {
+        git.milestone_resquash = g.milestone_resquash;
+        const cadence = (git.collapse_cadence as string | undefined)
+          ?? (typeof g.collapse_cadence === "string" ? g.collapse_cadence : undefined);
+        if (cadence !== "slice") {
+          warnings.push('git.milestone_resquash is ignored unless git.collapse_cadence is "slice"');
+        }
+      } else {
+        errors.push("git.milestone_resquash must be a boolean");
+      }
     }
 
     if (Object.keys(git).length > 0) {

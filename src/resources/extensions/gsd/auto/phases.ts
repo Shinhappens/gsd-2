@@ -26,12 +26,12 @@ import {
 import { detectStuck } from "./detect-stuck.js";
 import { runUnit } from "./run-unit.js";
 import { debugLog } from "../debug-logger.js";
-import { PROJECT_FILES } from "../detection.js";
+import { PROJECT_FILES, hasProjectFileInAncestor } from "../detection.js";
 import { MergeConflictError } from "../git-service.js";
 import { setCurrentPhase, clearCurrentPhase } from "../../shared/gsd-phase-state.js";
 import { pauseAutoForProviderError } from "../provider-error-pause.js";
 import { resumeAutoAfterProviderDelay } from "../bootstrap/provider-error-resume.js";
-import { join, basename, dirname, parse as parsePath } from "node:path";
+import { join, basename } from "node:path";
 import { existsSync, cpSync, readdirSync } from "node:fs";
 import {
   logWarning,
@@ -50,10 +50,12 @@ import { withTimeout, FINALIZE_PRE_TIMEOUT_MS, FINALIZE_POST_TIMEOUT_MS } from "
 import { getEligibleSlices } from "../slice-parallel-eligibility.js";
 import { startSliceParallel } from "../slice-parallel-orchestrator.js";
 import { isDbAvailable, getMilestoneSlices } from "../gsd-db.js";
-import { ensurePlanV2Graph } from "../uok/plan-v2.js";
+import type { MinimalModelRegistry } from "../context-budget.js";
+import { ensurePlanV2Graph, isMissingFinalizedContextResult } from "../uok/plan-v2.js";
 import { resolveUokFlags } from "../uok/flags.js";
 import { UokGateRunner } from "../uok/gate-runner.js";
-import { resetEvidence } from "../safety/evidence-collector.js";
+import { resetEvidence, loadEvidenceFromDisk } from "../safety/evidence-collector.js";
+import { parseUnitId } from "../unit-id.js";
 import { createCheckpoint, cleanupCheckpoint, rollbackToCheckpoint } from "../safety/git-checkpoint.js";
 import { resolveSafetyHarnessConfig } from "../safety/safety-harness.js";
 import {
@@ -79,7 +81,11 @@ export function resetSessionTimeoutState(): void {
  * Exported for testing as _resolveReportBasePath.
  */
 export function _resolveReportBasePath(s: Pick<AutoSession, "originalBasePath" | "basePath">): string {
-  return s.originalBasePath || s.basePath;
+  // Strip /.gsd/worktrees/ suffix when basePath is itself a worktree path and
+  // originalBasePath is falsy — prevents reports landing in the worktree (#3729).
+  const resolved = s.originalBasePath || s.basePath;
+  const markerIdx = resolved.indexOf("/.gsd/worktrees/");
+  return markerIdx !== -1 ? resolved.slice(0, markerIdx) : resolved;
 }
 
 /**
@@ -90,7 +96,12 @@ export function _resolveReportBasePath(s: Pick<AutoSession, "originalBasePath" |
 export function _resolveDispatchGuardBasePath(
   s: Pick<AutoSession, "originalBasePath" | "basePath">,
 ): string {
-  return s.originalBasePath || s.basePath;
+  // Strip /.gsd/worktrees/ suffix when basePath is itself a worktree path and
+  // originalBasePath is falsy — prevents guard checks running against the
+  // worktree instead of the project root (#3729).
+  const resolved = s.originalBasePath || s.basePath;
+  const markerIdx = resolved.indexOf("/.gsd/worktrees/");
+  return markerIdx !== -1 ? resolved.slice(0, markerIdx) : resolved;
 }
 
 const PLAN_V2_GATE_PHASES: ReadonlySet<Phase> = new Set([
@@ -190,6 +201,7 @@ async function closeoutAndStop(
       s.currentUnit.startedAt,
       deps.buildSnapshotOpts(s.currentUnit.type, s.currentUnit.id),
     );
+    s.currentUnit = null;
   }
   await deps.stopAuto(ctx, pi, reason);
 }
@@ -409,27 +421,41 @@ export async function runPreDispatch(
     const compiled = ensurePlanV2Graph(s.basePath, state);
     if (!compiled.ok) {
       const reason = compiled.reason ?? "Plan v2 compilation failed";
+      if (isMissingFinalizedContextResult(compiled)) {
+        await runPreDispatchGate({
+          gateId: "plan-v2-gate",
+          gateType: "policy",
+          outcome: "pass",
+          failureClass: "none",
+          rationale: "plan v2 missing context recovery deferred to dispatch",
+          findings: reason,
+          milestoneId: state.activeMilestone?.id ?? undefined,
+        });
+      } else {
+        await runPreDispatchGate({
+          gateId: "plan-v2-gate",
+          gateType: "policy",
+          outcome: "manual-attention",
+          failureClass: "manual-attention",
+          rationale: "plan v2 compile gate failed",
+          findings: reason,
+          milestoneId: state.activeMilestone?.id ?? undefined,
+        });
+        ctx.ui.notify(`Plan gate failed-closed: ${reason}\n\nIf this keeps happening, try: /gsd doctor heal`, "error");
+        await deps.pauseAuto(ctx, pi);
+        return { action: "break", reason: "plan-v2-gate-failed" };
+      }
+    }
+    if (compiled.ok) {
       await runPreDispatchGate({
         gateId: "plan-v2-gate",
         gateType: "policy",
-        outcome: "manual-attention",
-        failureClass: "manual-attention",
-        rationale: "plan v2 compile gate failed",
-        findings: reason,
+        outcome: "pass",
+        failureClass: "none",
+        rationale: "plan v2 compile gate passed",
         milestoneId: state.activeMilestone?.id ?? undefined,
       });
-      ctx.ui.notify(`Plan gate failed-closed: ${reason}`, "error");
-      await deps.pauseAuto(ctx, pi);
-      return { action: "break", reason: "plan-v2-gate-failed" };
     }
-    await runPreDispatchGate({
-      gateId: "plan-v2-gate",
-      gateType: "policy",
-      outcome: "pass",
-      failureClass: "none",
-      rationale: "plan v2 compile gate passed",
-      milestoneId: state.activeMilestone?.id ?? undefined,
-    });
   }
   deps.syncCmuxSidebar(prefs, state);
   let mid = state.activeMilestone?.id;
@@ -544,6 +570,12 @@ export async function runPreDispatch(
     loopState.stuckRecoveryAttempts = 0;
 
     // Worktree lifecycle on milestone transition — merge current, enter next
+    // #2909: preflight — warn + stash dirty working tree before merge
+    const preflightTransition = deps.preflightCleanRoot(
+      s.originalBasePath || s.basePath,
+      s.currentMilestoneId!,
+      ctx.ui.notify.bind(ctx.ui),
+    );
     try {
       deps.resolver.mergeAndExit(s.currentMilestoneId!, ctx.ui);
     } catch (mergeErr) {
@@ -564,6 +596,14 @@ export async function runPreDispatch(
       );
       await deps.stopAuto(ctx, pi, `Merge error on milestone ${s.currentMilestoneId}: ${String(mergeErr)}`);
       return { action: "break", reason: "merge-failed" };
+    }
+    // #2909: postflight — restore stashed changes after successful merge
+    if (preflightTransition.stashPushed) {
+      deps.postflightPopStash(
+        s.originalBasePath || s.basePath,
+        s.currentMilestoneId!,
+        ctx.ui.notify.bind(ctx.ui),
+      );
     }
 
     // PR creation (auto_pr) is handled inside mergeMilestoneToMain (#2302)
@@ -643,6 +683,12 @@ export async function runPreDispatch(
     if (incomplete.length === 0 && state.registry.length > 0) {
       // All milestones complete — merge milestone branch before stopping
       if (s.currentMilestoneId) {
+        // #2909: preflight — warn + stash dirty working tree before merge
+        const preflightAllComplete = deps.preflightCleanRoot(
+          s.originalBasePath || s.basePath,
+          s.currentMilestoneId,
+          ctx.ui.notify.bind(ctx.ui),
+        );
         try {
           deps.resolver.mergeAndExit(s.currentMilestoneId, ctx.ui);
           // Prevent stopAuto from attempting the same merge (#2645)
@@ -663,6 +709,14 @@ export async function runPreDispatch(
           );
           await deps.stopAuto(ctx, pi, `Merge error on milestone ${s.currentMilestoneId}: ${String(mergeErr)}`);
           return { action: "break", reason: "merge-failed" };
+        }
+        // #2909: postflight — restore stashed changes after successful merge
+        if (preflightAllComplete.stashPushed) {
+          deps.postflightPopStash(
+            s.originalBasePath || s.basePath,
+            s.currentMilestoneId,
+            ctx.ui.notify.bind(ctx.ui),
+          );
         }
 
         // PR creation (auto_pr) is handled inside mergeMilestoneToMain (#2302)
@@ -757,6 +811,12 @@ export async function runPreDispatch(
   if (state.phase === "complete") {
     // Milestone merge on complete (before closeout so branch state is clean)
     if (s.currentMilestoneId) {
+      // #2909: preflight — warn + stash dirty working tree before merge
+      const preflightComplete = deps.preflightCleanRoot(
+        s.originalBasePath || s.basePath,
+        s.currentMilestoneId,
+        ctx.ui.notify.bind(ctx.ui),
+      );
       try {
         deps.resolver.mergeAndExit(s.currentMilestoneId, ctx.ui);
         // Prevent stopAuto from attempting the same merge (#2645)
@@ -777,6 +837,14 @@ export async function runPreDispatch(
         );
         await deps.stopAuto(ctx, pi, `Merge error on milestone ${s.currentMilestoneId}: ${String(mergeErr)}`);
         return { action: "break", reason: "merge-failed" };
+      }
+      // #2909: postflight — restore stashed changes after successful merge
+      if (preflightComplete.stashPushed) {
+        deps.postflightPopStash(
+          s.originalBasePath || s.basePath,
+          s.currentMilestoneId,
+          ctx.ui.notify.bind(ctx.ui),
+        );
       }
 
       // PR creation (auto_pr) is handled inside mergeMilestoneToMain (#2302)
@@ -857,6 +925,8 @@ export async function runDispatch(
     prefs,
     session: s,
     structuredQuestionsAvailable,
+    sessionContextWindow: ctx.model?.contextWindow,
+    modelRegistry: ctx.modelRegistry as MinimalModelRegistry | undefined,
   });
 
   if (dispatchResult.action === "stop") {
@@ -892,10 +962,14 @@ export async function runDispatch(
   // ── Sliding-window stuck detection with graduated recovery ──
   const derivedKey = `${unitType}/${unitId}`;
 
-  if (!s.pendingVerificationRetry) {
-    loopState.recentUnits.push({ key: derivedKey });
-    if (loopState.recentUnits.length > STUCK_WINDOW_SIZE) loopState.recentUnits.shift();
+  // Always record this dispatch in the sliding window so detectStuck() has
+  // accurate history. Skipping the push when pendingVerificationRetry is set
+  // caused infinite artifact-retry loops to be invisible to stuck detection
+  // (#2007). Only the *response* to a stuck signal is suppressed during retries.
+  loopState.recentUnits.push({ key: derivedKey });
+  if (loopState.recentUnits.length > STUCK_WINDOW_SIZE) loopState.recentUnits.shift();
 
+  if (!s.pendingVerificationRetry) {
     const stuckSignal = detectStuck(loopState.recentUnits);
     if (stuckSignal) {
       debugLog("autoLoop", {
@@ -1128,16 +1202,42 @@ export async function runGuards(
       s.lastBudgetAlertLevel =
         newBudgetAlertLevel as AutoSession["lastBudgetAlertLevel"];
 
-      if (threshold.pct === 100 && budgetEnforcementAction !== "none") {
+      // Emit Layer 2 budget_threshold event (post-plan hook recommendation).
+      // Extensions / Layer 0 shell hooks may return an action override.
+      let hookAction: "pause" | "downgrade" | "continue" | undefined;
+      try {
+        const { emitBudgetThreshold } = await import("../hook-emitter.js");
+        const hookResult = await emitBudgetThreshold({
+          fraction: budgetPct,
+          spent: totalCost,
+          limit: budgetCeiling,
+        });
+        if (hookResult?.action) hookAction = hookResult.action;
+      } catch (hookErr) {
+        logWarning("engine", `budget_threshold hook emission failed: ${(hookErr as Error).message}`);
+      }
+
+      // Apply hook override to enforcement action. "continue" → "none" (no enforcement),
+      // "pause" and "downgrade" map to the matching enforcement path below.
+      let effectiveAction = budgetEnforcementAction;
+      if (hookAction === "continue") {
+        effectiveAction = "none";
+      } else if (hookAction === "pause") {
+        effectiveAction = "pause";
+      } else if (hookAction === "downgrade") {
+        effectiveAction = "warn";
+      }
+
+      if (threshold.pct === 100 && effectiveAction !== "none") {
         // 100% — special enforcement logic (halt/pause/warn)
         const msg = `Budget ceiling ${deps.formatCost(budgetCeiling)} reached (spent ${deps.formatCost(totalCost)}).`;
-        if (budgetEnforcementAction === "halt") {
+        if (effectiveAction === "halt") {
           deps.sendDesktopNotification("GSD", msg, "error", "budget", basename(s.originalBasePath || s.basePath));
           await deps.stopAuto(ctx, pi, "Budget ceiling reached");
           debugLog("autoLoop", { phase: "exit", reason: "budget-halt" });
           return { action: "break", reason: "budget-halt" };
         }
-        if (budgetEnforcementAction === "pause") {
+        if (effectiveAction === "pause") {
           ctx.ui.notify(
             `${msg} Pausing auto-mode — /gsd auto to override and continue.`,
             "warning",
@@ -1283,21 +1383,10 @@ export async function runUnitPhase(
     // Monorepo support (#2347): if no project files in the worktree directory,
     // walk parent directories up to the filesystem root. In monorepos,
     // package.json / Cargo.toml etc. live in a parent directory.
-    let hasProjectFileInParent = false;
-    if (!hasProjectFile && !hasSrcDir && !hasXcodeBundle) {
-      let checkDir = dirname(s.basePath);
-      const { root } = parsePath(checkDir);
-      while (checkDir !== root) {
-        // Stop at git repository boundary — ancestors above the repo root
-        // (e.g. ~ or /usr/local) may contain unrelated project files.
-        if (deps.existsSync(join(checkDir, ".git"))) break;
-        if (PROJECT_FILES.some((f) => deps.existsSync(join(checkDir, f)))) {
-          hasProjectFileInParent = true;
-          break;
-        }
-        checkDir = dirname(checkDir);
-      }
-    }
+    const hasProjectFileInParent =
+      !hasProjectFile && !hasSrcDir && !hasXcodeBundle
+        ? hasProjectFileInAncestor(s.basePath, deps.existsSync)
+        : false;
     if (!hasProjectFile && !hasSrcDir && !hasXcodeBundle && !hasProjectFileInParent) {
       // Greenfield projects won't have project files yet — the first task creates them.
       // Log a warning but allow execution to proceed. The .git check above is sufficient
@@ -1356,6 +1445,14 @@ export async function runUnitPhase(
   );
   if (safetyConfig.enabled && safetyConfig.evidence_collection) {
     resetEvidence();
+    // Restore persisted evidence so session-restart resumes don't produce
+    // false-positive "no bash calls" warnings (Bug #4385).
+    if (s.basePath && unitType === "execute-task") {
+      const { milestone: eMid, slice: eSid, task: eTid } = parseUnitId(unitId);
+      if (eMid && eSid && eTid) {
+        loadEvidenceFromDisk(s.basePath, eMid, eSid, eTid);
+      }
+    }
   }
   // Only checkpoint code-executing units (not lifecycle/planning units)
   if (safetyConfig.enabled && safetyConfig.checkpoints && unitType === "execute-task") {
@@ -1442,6 +1539,7 @@ export async function runUnitPhase(
     sidecarItem ? undefined : { isRetry, previousTier },
     undefined,
     s.manualSessionModelOverride,
+    s.autoModeStartThinkingLevel,
   );
   s.currentUnitRouting =
     modelResult.routing as AutoSession["currentUnitRouting"];
@@ -1456,6 +1554,9 @@ export async function runUnitPhase(
     if (match) {
       const ok = await pi.setModel(match, { persist: false });
       if (ok) {
+        if (s.autoModeStartThinkingLevel) {
+          pi.setThinkingLevel(s.autoModeStartThinkingLevel);
+        }
         s.currentUnitModel = match as AutoSession["currentUnitModel"];
         ctx.ui.notify(`Hook model override: ${match.provider}/${match.id}`, "info");
       } else {
@@ -1586,21 +1687,38 @@ export async function runUnitPhase(
   }
 
   if (unitResult.status === "cancelled") {
-    // Provider-error pause: pauseAuto already handled cleanup and scheduled
-    // recovery. Don't hard-stop — just break out of the loop (#2762).
-    if (unitResult.errorContext?.category === "provider") {
+    const errorCategory = unitResult.errorContext?.category;
+    // Provider-error pause: agent_end recovery normally pauses before this
+    // branch. Provider readiness failures happen before dispatch, so pause here
+    // if nothing upstream already did.
+    if (errorCategory === "provider") {
+      if (!s.paused) {
+        const detail = unitResult.errorContext?.message ?? `Provider unavailable for ${unitType} ${unitId}`;
+        await pauseAutoForProviderError(
+          ctx.ui,
+          detail,
+          () => deps.pauseAuto(ctx, pi),
+          {
+            isRateLimit: false,
+            isTransient: Boolean(unitResult.errorContext?.isTransient),
+            retryAfterMs: unitResult.errorContext?.retryAfterMs,
+          },
+        );
+      }
       await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, unitResult.errorContext);
-      debugLog("autoLoop", { phase: "exit", reason: "provider-pause", isTransient: unitResult.errorContext.isTransient });
+      debugLog("autoLoop", { phase: "exit", reason: "provider-pause", isTransient: unitResult.errorContext?.isTransient });
       return { action: "break", reason: "provider-pause" };
     }
     // Timeout category covers two distinct scenarios:
     //   1. Session creation timeout (120s) — transient, auto-resume with backoff
     //   2. Unit hard timeout (30min+) — stuck agent, pause for manual review
+    // Transient session-failed covers recoverable newSession failures and should
+    // pause instead of hard-stopping.
     // Structural errors (TypeError, is not a function) are NOT transient
     // and must hard-stop to avoid infinite retry loops.
     if (
       unitResult.errorContext?.isTransient &&
-      unitResult.errorContext?.category === "timeout"
+      errorCategory === "timeout"
     ) {
       const isSessionCreationTimeout = unitResult.errorContext.message?.includes("Session creation timed out");
 
@@ -1662,6 +1780,20 @@ export async function runUnitPhase(
       await deps.autoCommitUnit?.(s.basePath, unitType, unitId, ctx);
       await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, unitResult.errorContext);
       return { action: "break", reason: "unit-hard-timeout" };
+    }
+    if (
+      unitResult.errorContext?.isTransient &&
+      errorCategory === "session-failed"
+    ) {
+      ctx.ui.notify(
+        `Session creation failed transiently for ${unitType} ${unitId}: ${unitResult.errorContext?.message ?? "unknown"}. Pausing auto-mode (recoverable).`,
+        "warning",
+      );
+      debugLog("autoLoop", { phase: "session-start-transient-pause", unitType, unitId, category: errorCategory });
+      await deps.pauseAuto(ctx, pi);
+      await deps.autoCommitUnit?.(s.basePath, unitType, unitId, ctx);
+      await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, unitResult.errorContext);
+      return { action: "break", reason: "session-timeout" };
     }
     // All other cancelled states (structural errors, non-transient failures): hard stop
     if (s.currentUnit) {
@@ -1878,6 +2010,20 @@ export async function runFinalize(
       debugLog("autoLoop", { phase: "sidecar-artifact-retry-skipped", iteration: ic.iteration });
     } else {
       // s.pendingVerificationRetry was set by postUnitPreVerification.
+      // Emit a dedicated journal event so forensics can distinguish bounded
+      // verification retries from genuine stuck-loop dispatch repetitions (#4540).
+      const retryInfo = s.pendingVerificationRetry;
+      deps.emitJournalEvent({
+        ts: new Date().toISOString(),
+        flowId: ic.flowId,
+        seq: ic.nextSeq(),
+        eventType: "artifact-verification-retry",
+        data: {
+          unitType: preUnitSnapshot?.type,
+          unitId: retryInfo?.unitId,
+          attempt: retryInfo?.attempt,
+        },
+      });
       // Continue the loop — next iteration will inject the retry context into the prompt.
       debugLog("autoLoop", { phase: "artifact-verification-retry", iteration: ic.iteration });
       return { action: "continue" };
@@ -1960,6 +2106,8 @@ export async function runFinalize(
 
   // Both pre and post verification completed without timeout — reset counter
   loopState.consecutiveFinalizeTimeouts = 0;
+  s.currentUnit = null;
+  clearCurrentPhase();
 
   // Surface accumulated workflow-logger issues for this unit to the user.
   // Warnings/errors logged during the unit are buffered in the logger and

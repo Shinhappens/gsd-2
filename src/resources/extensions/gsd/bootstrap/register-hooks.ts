@@ -10,7 +10,8 @@ import { getEcosystemReadyPromise } from "../ecosystem/loader.js";
 import { buildMilestoneFileName, resolveMilestonePath, resolveSliceFile, resolveSlicePath } from "../paths.js";
 import { buildBeforeAgentStartResult } from "./system-context.js";
 import { handleAgentEnd } from "./agent-end-recovery.js";
-import { clearDiscussionFlowState, isDepthConfirmationAnswer, isQueuePhaseActive, markDepthVerified, resetWriteGateState, shouldBlockContextWrite, shouldBlockQueueExecution, isGateQuestionId, setPendingGate, clearPendingGate, getPendingGate, shouldBlockPendingGate, shouldBlockPendingGateBash, extractDepthVerificationMilestoneId } from "./write-gate.js";
+import { clearDiscussionFlowState, isDepthConfirmationAnswer, isQueuePhaseActive, markDepthVerified, resetWriteGateState, shouldBlockContextWrite, shouldBlockPlanningUnit, shouldBlockQueueExecution, isGateQuestionId, setPendingGate, clearPendingGate, getPendingGate, shouldBlockPendingGate, shouldBlockPendingGateBash, extractDepthVerificationMilestoneId } from "./write-gate.js";
+import { resolveManifest } from "../unit-context-manifest.js";
 import { isBlockedStateFile, isBashWriteToStateFile, BLOCKED_WRITE_ERROR } from "../write-intercept.js";
 import { cleanupQuickBranch } from "../quick.js";
 import { getDiscussionMilestoneId } from "../guided-flow.js";
@@ -18,12 +19,13 @@ import { loadToolApiKeys } from "../commands-config.js";
 import { loadFile, saveFile, formatContinue } from "../files.js";
 import { deriveState } from "../state.js";
 import { getAutoDashboardData, isAutoActive, isAutoPaused, markToolEnd, markToolStart, recordToolInvocationError } from "../auto.js";
-import { hideFooter } from "../auto-dashboard.js";
+
 import { isParallelActive, shutdownParallel } from "../parallel-orchestrator.js";
 import { checkToolCallLoop, resetToolCallLoopGuard } from "./tool-call-loop-guard.js";
 import { saveActivityLog } from "../activity-log.js";
 import { resetAskUserQuestionsCache } from "../../ask-user-questions.js";
-import { recordToolCall as safetyRecordToolCall, recordToolResult as safetyRecordToolResult } from "../safety/evidence-collector.js";
+import { recordToolCall as safetyRecordToolCall, recordToolResult as safetyRecordToolResult, saveEvidenceToDisk } from "../safety/evidence-collector.js";
+import { parseUnitId } from "../unit-id.js";
 import { classifyCommand } from "../safety/destructive-guard.js";
 import { logWarning as safetyLogWarning } from "../workflow-logger.js";
 import { installNotifyInterceptor } from "./notify-interceptor.js";
@@ -40,6 +42,15 @@ async function syncServiceTierStatus(ctx: ExtensionContext): Promise<void> {
   ctx.ui.setStatus("gsd-fast", formatServiceTierFooterStatus(getEffectiveServiceTier(), ctx.model?.id));
 }
 
+async function applyDisabledModelProviderPolicy(ctx: ExtensionContext): Promise<void> {
+  try {
+    const { resolveDisabledModelProvidersFromPreferences } = await import("../preferences.js");
+    ctx.modelRegistry.setDisabledModelProviders(resolveDisabledModelProvidersFromPreferences());
+  } catch {
+    // Non-fatal: keep default provider visibility if preferences cannot be loaded.
+  }
+}
+
 export function registerHooks(
   pi: ExtensionAPI,
   ecosystemHandlers: GSDEcosystemBeforeAgentStartHandler[],
@@ -48,11 +59,14 @@ export function registerHooks(
     initNotificationStore(process.cwd());
     installNotifyInterceptor(ctx);
     initNotificationWidget(ctx);
-    initHealthWidget(ctx);
+    if (!isAutoActive()) {
+      initHealthWidget(ctx);
+    }
     resetWriteGateState();
     resetToolCallLoopGuard();
     resetAskUserQuestionsCache();
     await syncServiceTierStatus(ctx);
+    await applyDisabledModelProviderPolicy(ctx);
     // Skip MCP auto-prep when running inside an auto-worktree (see session_switch below).
     const { isInAutoWorktree } = await import("../auto-worktree.js");
     if (!isInAutoWorktree(process.cwd())) {
@@ -90,7 +104,7 @@ export function registerHooks(
     }
     loadToolApiKeys();
     if (isAutoActive()) {
-      ctx.ui.setFooter(hideFooter);
+      ctx.ui.setWidget("gsd-health", undefined);
     }
   });
 
@@ -102,6 +116,7 @@ export function registerHooks(
     resetAskUserQuestionsCache();
     clearDiscussionFlowState();
     await syncServiceTierStatus(ctx);
+    await applyDisabledModelProviderPolicy(ctx);
     // Skip MCP auto-prep when running inside an auto-worktree. The worktree
     // already has .mcp.json from createAutoWorktree, and re-running the writer
     // post-chdir rewrites the file mid-run (non-idempotent due to cwd-relative
@@ -113,7 +128,7 @@ export function registerHooks(
     }
     loadToolApiKeys();
     if (isAutoActive()) {
-      ctx.ui.setFooter(hideFooter);
+      ctx.ui.setWidget("gsd-health", undefined);
     }
   });
 
@@ -225,6 +240,42 @@ export function registerHooks(
     }));
   });
 
+  // Context-mode snapshot: write .gsd/last-snapshot.md before compaction so
+  // agents can call gsd_resume (or Read the file) to re-orient. Opt-in via
+  // preferences.context_mode.enabled. Runs after the auto-cancel handler
+  // above — if that one returned cancel:true, pi still fires us but the
+  // compaction won't actually happen; the snapshot is still useful then,
+  // since auto may pause and resume later.
+  pi.on("session_before_compact", async () => {
+    try {
+      const { loadEffectiveGSDPreferences } = await import("../preferences.js");
+      const { isContextModeEnabled } = await import("../preferences-types.js");
+      const prefs = loadEffectiveGSDPreferences();
+      if (!isContextModeEnabled(prefs?.preferences)) return;
+      const { writeCompactionSnapshot } = await import("../compaction-snapshot.js");
+      const { ensureDbOpen } = await import("./dynamic-tools.js");
+      await ensureDbOpen();
+      const basePath = process.cwd();
+      let activeContext: string | null = null;
+      try {
+        const state = await deriveState(basePath);
+        if (state.activeMilestone && state.activeSlice && state.activeTask) {
+          activeContext =
+            `Active: ${state.activeMilestone.id} / ${state.activeSlice.id} / ${state.activeTask.id}` +
+            (state.activeTask.title ? ` — ${state.activeTask.title}` : "");
+        }
+      } catch {
+        /* non-fatal */
+      }
+      writeCompactionSnapshot(basePath, { activeContext });
+    } catch (err) {
+      safetyLogWarning(
+        "context-mode",
+        `failed to write compaction snapshot: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  });
+
   pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
     if (isParallelActive()) {
       try {
@@ -298,6 +349,36 @@ export function registerHooks(
       if (queueGuard.block) return queueGuard;
     }
 
+    // ── Planning-unit tools-policy enforcement (#4934): runtime half ─────
+    // The active auto-mode unit's manifest declares a ToolsPolicy. For
+    // planning/docs/read-only modes, deny writes outside .gsd/ (or the
+    // manifest's allowedPathGlobs), bash that isn't read-only, and
+    // subagent dispatch. Closes the b23 bug class where a discuss-milestone
+    // turn used the host Edit tool to modify user source files.
+    const dash = getAutoDashboardData();
+    const activeUnitType = dash.currentUnit?.type;
+    if (activeUnitType) {
+      const manifest = resolveManifest(activeUnitType);
+      if (manifest) {
+        let planningInput = "";
+        if (isToolCallEventType("write", event)) {
+          planningInput = event.input.path;
+        } else if (isToolCallEventType("edit", event)) {
+          planningInput = event.input.path;
+        } else if (isToolCallEventType("bash", event)) {
+          planningInput = event.input.command;
+        }
+        const planningGuard = shouldBlockPlanningUnit(
+          event.toolName,
+          planningInput,
+          dash.basePath || discussionBasePath,
+          activeUnitType,
+          manifest.tools,
+        );
+        if (planningGuard.block) return planningGuard;
+      }
+    }
+
     // ── Single-writer engine: block direct writes to STATE.md ──────────
     // Covers write, edit, and bash tools to prevent bypass vectors.
     if (isToolCallEventType("write", event)) {
@@ -354,7 +435,7 @@ export function registerHooks(
     if (isAutoActive() && typeof event.toolCallId === "string") {
       markToolEnd(event.toolCallId);
     }
-    if (isAutoActive() && event.isError && event.toolName.startsWith("gsd_")) {
+    if (isAutoActive() && event.isError) {
       const resultPayload = ("result" in event ? event.result : undefined) as any;
       const errorText = typeof resultPayload === "string"
         ? resultPayload
@@ -363,6 +444,8 @@ export function registerHooks(
             : (typeof (event as any).content === "string"
                 ? (event as any).content
                 : String(resultPayload ?? "")));
+      // Let recordToolInvocationError classify the failure so non-gsd_ harness
+      // errors and deterministic policy rejections are handled consistently.
       recordToolInvocationError(event.toolName, errorText);
     }
     if (event.toolName !== "ask_user_questions") return;
@@ -445,22 +528,33 @@ export function registerHooks(
 
   pi.on("tool_execution_start", async (event) => {
     if (!isAutoActive()) return;
-    markToolStart(event.toolCallId);
+    markToolStart(event.toolCallId, event.toolName);
   });
 
   pi.on("tool_execution_end", async (event) => {
     markToolEnd(event.toolCallId);
-    // #2883: Capture tool invocation errors (malformed/truncated JSON arguments)
+    // #2883/#4974: Capture deterministic invocation/policy errors
     // so postUnitPreVerification can break the retry loop instead of re-dispatching.
-    if (event.isError && event.toolName.startsWith("gsd_")) {
+    if (event.isError) {
       const errorText = typeof event.result === "string"
         ? event.result
         : (typeof event.result?.content?.[0]?.text === "string" ? event.result.content[0].text : String(event.result));
+      // Let recordToolInvocationError classify the failure so non-gsd_ harness
+      // errors and deterministic policy rejections are handled consistently.
       recordToolInvocationError(event.toolName, errorText);
     }
     // Safety harness: record tool execution results for evidence cross-referencing
     if (isAutoActive()) {
       safetyRecordToolResult(event.toolCallId, event.toolName, event.result, event.isError);
+      // Persist evidence to disk after each tool result so it survives a session
+      // restart mid-unit (Bug #4385 — non-persisted evidence false positives).
+      const dash = getAutoDashboardData();
+      if (dash.basePath && dash.currentUnit?.type === "execute-task") {
+        const { milestone: pMid, slice: pSid, task: pTid } = parseUnitId(dash.currentUnit.id);
+        if (pMid && pSid && pTid) {
+          saveEvidenceToDisk(dash.basePath, pMid, pSid, pTid);
+        }
+      }
     }
   });
 

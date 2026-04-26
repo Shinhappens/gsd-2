@@ -11,8 +11,8 @@
  *   - Optional search/tool integrations (Brave, Tavily, Jina, Context7)
  */
 
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import { AuthStorage } from "@gsd/pi-coding-agent";
 import { getEnvApiKey } from "@gsd/pi-ai";
 import { loadEffectiveGSDPreferences } from "./preferences.js";
@@ -72,7 +72,8 @@ function modelToProviderId(model: string): string | null {
 
   // Explicit provider prefix (e.g. "openrouter/deepseek-r1")
   if (model.includes("/")) {
-    const prefix = model.split("/")[0].toLowerCase();
+    const rawPrefix = model.split("/")[0];
+    const prefix = rawPrefix.toLowerCase();
     // Map known prefixes to registry IDs
     const prefixMap: Record<string, string> = {
       "anthropic-vertex": "anthropic-vertex",
@@ -86,6 +87,7 @@ function modelToProviderId(model: string): string | null {
       "github-copilot": "github-copilot",
     };
     if (prefixMap[prefix]) return prefixMap[prefix];
+    return rawPrefix;
   }
 
   const lower = model.toLowerCase();
@@ -145,7 +147,7 @@ function collectConfiguredModelProviders(): Set<string> {
 
 interface KeyLookup {
   found: boolean;
-  source: "auth.json" | "env" | "none";
+  source: "auth.json" | "env" | "models.json" | "none";
   backedOff: boolean;
 }
 
@@ -167,8 +169,55 @@ const CLI_BINARY_MAP: Record<string, string> = {
 function isCliBinaryInPath(providerId: string): boolean {
   const binary = CLI_BINARY_MAP[providerId];
   if (!binary) return false;
-  const pathDirs = (process.env.PATH ?? "").split(":");
-  return pathDirs.some(dir => dir && existsSync(join(dir, binary)));
+
+  const pathDirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
+
+  // On Windows, command shims are commonly installed as .cmd/.exe/.bat/.com.
+  // Scan PATHEXT candidates in addition to the bare binary name.
+  const executableNames: string[] = [binary];
+  if (process.platform === "win32") {
+    const rawPathExt = process.env.PATHEXT
+      ?.split(";")
+      .map(ext => ext.trim())
+      .filter(Boolean) ?? [];
+    const normalizedPathExt = rawPathExt.map(ext =>
+      ext.startsWith(".") ? ext.toLowerCase() : `.${ext.toLowerCase()}`,
+    );
+    const defaultExt = [".exe", ".cmd", ".bat", ".com"];
+    for (const ext of [...normalizedPathExt, ...defaultExt]) {
+      const candidate = `${binary}${ext}`;
+      if (!executableNames.includes(candidate)) executableNames.push(candidate);
+    }
+  }
+
+  return pathDirs.some(dir => executableNames.some(name => existsSync(join(dir, name))));
+}
+
+function modelsJsonPaths(): string[] {
+  const home = process.env.HOME ?? "~";
+  return [
+    join(home, ".gsd", "agent", "models.json"),
+    // Keep parity with custom-provider discovery during auto bootstrap.
+    join(home, ".pi", "agent", "models.json"),
+  ];
+}
+
+function hasModelsJsonApiKey(providerId: string): boolean {
+  for (const path of modelsJsonPaths()) {
+    if (!existsSync(path)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf-8")) as {
+        providers?: Record<string, { apiKey?: unknown }>;
+      };
+      const apiKey = parsed.providers?.[providerId]?.apiKey;
+      if (typeof apiKey === "string" && apiKey.trim().length > 0) {
+        return true;
+      }
+    } catch {
+      // Malformed models.json should not break the dashboard health check.
+    }
+  }
+  return false;
 }
 
 function resolveKey(providerId: string): KeyLookup {
@@ -219,6 +268,10 @@ function resolveKey(providerId: string): KeyLookup {
   // (e.g., search providers like Brave, Tavily; tool providers like Jina, Context7)
   if (info?.envVar && process.env[info.envVar]) {
     return { found: true, source: "env", backedOff: false };
+  }
+
+  if (hasModelsJsonApiKey(providerId)) {
+    return { found: true, source: "models.json", backedOff: false };
   }
 
   return { found: false, source: "none", backedOff: false };

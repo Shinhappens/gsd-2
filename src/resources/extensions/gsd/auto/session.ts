@@ -17,7 +17,7 @@
  */
 
 import type { Api, Model } from "@gsd/pi-ai";
-import type { ExtensionCommandContext } from "@gsd/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent";
 import type { GitServiceImpl } from "../git-service.js";
 import type { CaptureEntry } from "../captures.js";
 import type { BudgetAlertLevel } from "../auto-budget.js";
@@ -39,6 +39,8 @@ export interface StartModel {
   provider: string;
   id: string;
 }
+
+export type ThinkingLevelSnapshot = ReturnType<ExtensionAPI["getThinkingLevel"]>;
 
 export interface PendingVerificationRetry {
   unitId: string;
@@ -62,11 +64,18 @@ export interface SidecarItem {
   captureId?: string;
 }
 
+export interface PreExecFailure {
+  /** Milestone/slice that failed (e.g. "M001/S02"). */
+  unitId: string;
+  /** Verbatim blocking check strings from the failed gate run. */
+  blockingFindings: string[];
+  /** Condensed gate verdict excerpt for context (status + rationale). */
+  verdictExcerpt: string;
+}
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-export const MAX_UNIT_DISPATCHES = 3;
 export const STUB_RECOVERY_THRESHOLD = 2;
-export const MAX_LIFETIME_DISPATCHES = 6;
 export const NEW_SESSION_TIMEOUT_MS = 120_000;
 
 // ─── AutoSession ─────────────────────────────────────────────────────────────
@@ -120,6 +129,8 @@ export class AutoSession {
   currentDispatchedModelId: string | null = null;
   originalModelId: string | null = null;
   originalModelProvider: string | null = null;
+  autoModeStartThinkingLevel: ThinkingLevelSnapshot | null = null;
+  originalThinkingLevel: ThinkingLevelSnapshot | null = null;
   lastBudgetAlertLevel: BudgetAlertLevel = 0;
 
   // ── Recovery ─────────────────────────────────────────────────────────────
@@ -134,6 +145,18 @@ export class AutoSession {
 
   // ── Sidecar queue ─────────────────────────────────────────────────────
   sidecarQueue: SidecarItem[] = [];
+
+  // ── Pre-exec gate failure context (#4551) ───────────────────────────
+  /**
+   * Persisted when a pre-execution gate fails on a plan-slice or refine-slice
+   * unit. The planning → plan-slice dispatch rule reads this field and injects
+   * the failure details into the next re-dispatch prompt so the LLM can fix the
+   * specific issues instead of producing an identical plan.
+   *
+   * Cleared after it has been consumed (injected into the prompt) to avoid
+   * stale context bleeding into unrelated slices.
+   */
+  lastPreExecFailure: PreExecFailure | null = null;
 
   // ── Tool invocation errors (#2883) ──────────────────────────────────
   /** Set when a GSD tool execution ends with isError due to malformed/truncated
@@ -152,6 +175,12 @@ export class AutoSession {
   /** Set to true after phases.ts successfully calls mergeAndExit, so that
    *  stopAuto does not attempt the same merge a second time (#2645). */
   milestoneMergedInPhases = false;
+
+  // #4765 — slice-cadence collapse: main-branch SHAs at the moment each
+  // milestone's first slice merge began. Used by resquashMilestoneOnMain at
+  // milestone completion to collapse N slice commits into one. Cleared when
+  // the milestone finishes (or resquash runs).
+  milestoneStartShas: Map<string, string> = new Map();
 
   // ── Dispatch circuit breakers ──────────────────────────────────────
   rewriteAttemptCount = 0;
@@ -195,7 +224,12 @@ export class AutoSession {
   }
 
   get lockBasePath(): string {
-    return this.originalBasePath || this.basePath;
+    // Prefer originalBasePath (project root); fall back to basePath.
+    // Strip /.gsd/worktrees/ suffix if basePath is itself a worktree path
+    // to avoid reading/writing the lock inside the worktree (#3729).
+    const resolved = this.originalBasePath || this.basePath;
+    const markerIdx = resolved.indexOf("/.gsd/worktrees/");
+    return markerIdx !== -1 ? resolved.slice(0, markerIdx) : resolved;
   }
 
   reset(): void {
@@ -241,6 +275,8 @@ export class AutoSession {
     this.currentDispatchedModelId = null;
     this.originalModelId = null;
     this.originalModelProvider = null;
+    this.autoModeStartThinkingLevel = null;
+    this.originalThinkingLevel = null;
     this.lastBudgetAlertLevel = 0;
 
     // Recovery
@@ -261,11 +297,13 @@ export class AutoSession {
     this.sidecarQueue = [];
     this.rewriteAttemptCount = 0;
     this.consecutiveCompleteBootstraps = 0;
+    this.lastPreExecFailure = null;
     this.lastToolInvocationError = null;
     this.lastGitActionFailure = null;
     this.lastGitActionStatus = null;
     this.isolationDegraded = false;
     this.milestoneMergedInPhases = false;
+    this.milestoneStartShas = new Map();
     this.checkpointSha = null;
 
     // Signal handler

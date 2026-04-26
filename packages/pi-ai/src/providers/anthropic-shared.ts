@@ -339,10 +339,16 @@ export function convertMessages(
 						});
 					}
 				} else if (block.type === "toolCall") {
+					// Guard: never forward a tool_use block with an empty name.
+					// fine-grained-tool-streaming-2025-05-14 can cause the name to arrive
+					// as a delta on incompatible providers (e.g. MiniMax), leaving block.name
+					// as "". Re-sending that to MiniMax triggers error 2013 (#4538).
+					const toolName = isOAuthToken ? toClaudeCodeName(block.name) : block.name;
+					if (!toolName) continue;
 					blocks.push({
 						type: "tool_use",
 						id: block.id,
-						name: isOAuthToken ? toClaudeCodeName(block.name) : block.name,
+						name: toolName,
 						input: block.arguments ?? {},
 					});
 				} else if (block.type === "serverToolUse") {
@@ -505,7 +511,9 @@ export function buildParams(
 		if (supportsAdaptiveThinking(model.id)) {
 			params.thinking = { type: "adaptive" };
 			if (options.effort) {
-				params.output_config = { effort: options.effort };
+				// The SDK's OutputConfig.effort type doesn't include "xhigh" yet.
+				// Cast so our superset AnthropicEffort type compiles cleanly.
+				params.output_config = { effort: options.effort as "low" | "medium" | "high" | "max" };
 			}
 		} else {
 			params.thinking = {
@@ -641,12 +649,25 @@ export function processAnthropicStream(
 						output.content.push(block);
 						stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
 					} else if (event.content_block.type === "tool_use") {
+						// Guard: some Anthropic-compatible providers (e.g. MiniMax with
+						// fine-grained-tool-streaming beta) stream the tool name as a delta,
+						// leaving content_block.name as "" here. Fall back to the tool list
+						// if available to avoid storing an empty name in history (#4538).
+						const rawName = event.content_block.name;
+						let resolvedName: string;
+						if (rawName) {
+							resolvedName = isOAuthToken ? fromClaudeCodeName(rawName, context.tools) : rawName;
+						} else {
+							const fallbackName = context.tools?.[0]?.name ?? rawName;
+							if (fallbackName && fallbackName !== rawName) {
+								console.warn(`[anthropic-shared] Empty tool name in content_block_start (id=${event.content_block.id}); falling back to first tool: ${fallbackName}`);
+							}
+							resolvedName = fallbackName;
+						}
 						const block: Block = {
 							type: "toolCall",
 							id: event.content_block.id,
-							name: isOAuthToken
-								? fromClaudeCodeName(event.content_block.name, context.tools)
-								: event.content_block.name,
+							name: resolvedName,
 							arguments: (event.content_block.input as Record<string, any>) ?? {},
 							partialJson: "",
 							index: event.index,

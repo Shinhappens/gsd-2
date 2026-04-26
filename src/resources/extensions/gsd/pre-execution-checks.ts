@@ -91,8 +91,13 @@ export function extractPackageReferences(description: string): string[] {
     }
   }
 
-  // require('pkg') or import from 'pkg' in code blocks
-  const importPattern = /(?:require\s*\(\s*['"]|from\s+['"])([a-zA-Z0-9@/_-]+)['"\)]/g;
+  // require('pkg') or `import ... from 'pkg'` in code blocks.
+  // The `from\s+['"]` branch MUST be preceded by an `import` keyword so that
+  // natural-language prose like `from "What's Next"` or `from 'master'` does
+  // not produce false package-existence failures.  Requiring the leading import
+  // keyword anchors the match to JavaScript/TypeScript syntax.
+  // See: https://github.com/gsd-build/gsd-2/issues/4388
+  const importPattern = /(?:require\s*\(\s*['"]|import\b[\s\S]*?\bfrom\s+['"])([a-zA-Z0-9@/_-]+)['"\)]/g;
   let importMatch: RegExpExecArray | null;
   while ((importMatch = importPattern.exec(description)) !== null) {
     // Skip relative imports and node builtins
@@ -323,9 +328,24 @@ function extractPathFromAnnotation(raw: string): string {
     return backtickMatch[2].trim();
   }
 
+  // Strip leading/trailing double or single quotes wrapping the whole value.
+  // Plan documents sometimes emit `"src/foo.ts"` or `'src/bar.ts'` as input
+  // annotations. Stripping the wrapper allows the inner path to be checked
+  // correctly instead of producing a false-positive "file not found" error
+  // for a literal string with quote characters in it (#3747).
+  const quoteMatch = trimmed.match(/^(["'])([^"']+)\1$/);
+  if (quoteMatch) {
+    return quoteMatch[2].trim();
+  }
+
   const annotatedMatch = trimmed.match(/^(.+?)\s+[—–-]\s+.+$/);
   if (annotatedMatch) {
-    return annotatedMatch[1].trim();
+    const prefix = annotatedMatch[1].trim();
+    const prefixBacktickMatch = prefix.match(/`([^`]+)`/);
+    if (prefixBacktickMatch && looksLikePathOrUrl(prefixBacktickMatch[1].trim())) {
+      return prefixBacktickMatch[1].trim();
+    }
+    return prefix.replace(/`/g, "").trim();
   }
 
   // Fallback: scan all backticked tokens and return the first one that looks
@@ -388,13 +408,19 @@ function containsGlobPattern(candidate: string): boolean {
 
 /**
  * Build a set of files that will be created by tasks up to (but not including) taskIndex.
+ * Also includes outputs of completed tasks at any position — a completed task has already
+ * run and its outputs are available regardless of sequence position or disk state (#4071).
  * All paths are normalized for consistent comparison.
  */
 function getExpectedOutputsUpTo(tasks: TaskRow[], taskIndex: number): Set<string> {
   const outputs = new Set<string>();
-  for (let i = 0; i < taskIndex; i++) {
-    for (const file of tasks[i].expected_output) {
-      outputs.add(normalizeFilePath(file));
+  for (let i = 0; i < tasks.length; i++) {
+    const task = tasks[i];
+    // Include prior tasks (i < taskIndex) OR completed tasks at any position
+    if (i < taskIndex || task.status === "completed") {
+      for (const file of task.expected_output) {
+        outputs.add(normalizeFilePath(file));
+      }
     }
   }
   return outputs;
@@ -403,10 +429,13 @@ function getExpectedOutputsUpTo(tasks: TaskRow[], taskIndex: number): Set<string
 /**
  * Check that all files referenced in task.inputs either:
  *   1. Exist on disk, OR
- *   2. Are in a prior task's expected_output
+ *   2. Are in a prior task's expected_output, OR
+ *   3. Are in the current task's own expected_output — the task produces them,
+ *      so they don't need to pre-exist (#4459, mirroring the exemption #3626
+ *      introduced for task.files).
  *
- * task.files ("files likely touched") is excluded — it intentionally includes
- * files the task will create, so they don't need to pre-exist (#3626).
+ * task.files ("files likely touched") is excluded entirely from this check —
+ * it intentionally includes files the task will create (#3626).
  *
  * All paths are normalized before comparison to ensure ./src/a.ts matches src/a.ts.
  */
@@ -419,6 +448,7 @@ export function checkFilePathConsistency(
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i];
     const priorOutputs = getExpectedOutputsUpTo(tasks, i);
+    const ownOutputs = new Set<string>(task.expected_output.map(normalizeFilePath));
     const filesToCheck = [...task.inputs];
 
     for (const file of filesToCheck) {
@@ -436,23 +466,23 @@ export function checkFilePathConsistency(
 
       // Check if file is in prior expected outputs (priorOutputs already normalized)
       const inPriorOutputs = priorOutputs.has(normalizedFile);
+      const inOwnOutputs = ownOutputs.has(normalizedFile);
 
       // Directory inputs are satisfied when something produces a file beneath
       // them — either a prior task or the current task itself.
       let directorySatisfied = false;
-      if (!existsOnDisk && !inPriorOutputs && isDirectoryReference(file)) {
-        const sameTaskOutputs = task.expected_output.map(normalizeFilePath);
+      if (!existsOnDisk && !inPriorOutputs && !inOwnOutputs && isDirectoryReference(file)) {
         directorySatisfied =
           anyOutputUnderDirectory(normalizedFile, priorOutputs) ||
-          anyOutputUnderDirectory(normalizedFile, sameTaskOutputs);
+          anyOutputUnderDirectory(normalizedFile, ownOutputs);
       }
 
-      if (!existsOnDisk && !inPriorOutputs && !directorySatisfied) {
+      if (!existsOnDisk && !inPriorOutputs && !inOwnOutputs && !directorySatisfied) {
         results.push({
           category: "file",
           target: file,
           passed: false,
-          message: `Task ${task.id} references '${file}' which doesn't exist and isn't created by prior tasks`,
+          message: `Task ${task.id} references '${file}' which doesn't exist and isn't created by prior or same-task outputs`,
           blocking: true,
         });
       }
@@ -477,13 +507,19 @@ export function checkTaskOrdering(
   const results: PreExecutionCheckJSON[] = [];
 
   // Build map: normalized file → task index that creates it
-  const fileCreators = new Map<string, { taskId: string; index: number; originalPath: string }>();
+  const fileCreators = new Map<string, { taskId: string; index: number; originalPath: string; completed: boolean }>();
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i];
     for (const file of task.expected_output) {
       const normalizedFile = normalizeFilePath(file);
-      if (!fileCreators.has(normalizedFile)) {
-        fileCreators.set(normalizedFile, { taskId: task.id, index: i, originalPath: file });
+      const existing = fileCreators.get(normalizedFile);
+      if (!existing || (!existing.completed && task.status === "completed")) {
+        fileCreators.set(normalizedFile, {
+          taskId: task.id,
+          index: i,
+          originalPath: file,
+          completed: task.status === "completed",
+        });
       }
     }
   }
@@ -507,7 +543,11 @@ export function checkTaskOrdering(
       const creator = fileCreators.get(normalizedFile);
       const absolutePath = resolve(basePath, normalizedFile);
       const existsOnDisk = existsSync(absolutePath);
-      if (creator && creator.index > i && !existsOnDisk) {
+      // Skip if the creating task has already completed — its output is available
+      // regardless of disk state (e.g. file was a temp artifact cleaned up after
+      // the task ran, or a replan introduced a new earlier-sequence task that
+      // reads this pre-execution output). (#4071)
+      if (creator && creator.index > i && !existsOnDisk && !creator.completed) {
         // Task reads file that is created later — impossible ordering
         results.push({
           category: "file",

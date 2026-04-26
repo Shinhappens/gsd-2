@@ -180,7 +180,7 @@ function openRawDb(path: string): unknown {
   return new Database(path);
 }
 
-const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 22;
 
 function indexExists(db: DbAdapter, name: string): boolean {
   return !!db.prepare(
@@ -281,7 +281,10 @@ function initSchema(db: DbAdapter, fileBacked: boolean): void {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         superseded_by TEXT DEFAULT NULL,
-        hit_count INTEGER NOT NULL DEFAULT 0
+        hit_count INTEGER NOT NULL DEFAULT 0,
+        scope TEXT NOT NULL DEFAULT 'project',
+        tags TEXT NOT NULL DEFAULT '[]',
+        structured_fields TEXT DEFAULT NULL
       )
     `);
 
@@ -292,6 +295,45 @@ function initSchema(db: DbAdapter, fileBacked: boolean): void {
         processed_at TEXT NOT NULL
       )
     `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_sources (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        uri TEXT,
+        title TEXT,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL UNIQUE,
+        imported_at TEXT NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'project',
+        tags TEXT NOT NULL DEFAULT '[]'
+      )
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_embeddings (
+        memory_id TEXT PRIMARY KEY,
+        model TEXT NOT NULL,
+        dim INTEGER NOT NULL,
+        vector BLOB NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_relations (
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        rel TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0.8,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (from_id, to_id, rel)
+      )
+    `);
+
+    // FTS5 virtual table mirroring memories.content for fast keyword search.
+    // Optional — if the SQLite build lacks FTS5, we fall back to LIKE scans.
+    tryCreateMemoriesFts(db);
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS milestones (
@@ -516,6 +558,7 @@ function initSchema(db: DbAdapter, fileBacked: boolean): void {
     `);
 
     db.exec("CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(superseded_by)");
+
     db.exec("CREATE INDEX IF NOT EXISTS idx_replan_history_milestone ON replan_history(milestone_id, created_at)");
 
     // v13 indexes — hot-path dispatch queries
@@ -533,9 +576,6 @@ function initSchema(db: DbAdapter, fileBacked: boolean): void {
     db.exec("CREATE INDEX IF NOT EXISTS idx_turn_git_tx_turn ON turn_git_transactions(trace_id, turn_id)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_audit_events_trace ON audit_events(trace_id, ts)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_audit_events_turn ON audit_events(trace_id, turn_id, ts)");
-    // ADR-011 Phase 2 — also created by the v17 migration; fresh installs
-    // skip migrations so the index must be created here too.
-    db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_escalation_pending ON tasks(milestone_id, slice_id, escalation_pending)");
 
     db.exec(`CREATE VIEW IF NOT EXISTS active_decisions AS SELECT * FROM decisions WHERE superseded_by IS NULL`);
     db.exec(`CREATE VIEW IF NOT EXISTS active_requirements AS SELECT * FROM requirements WHERE superseded_by IS NULL`);
@@ -543,6 +583,17 @@ function initSchema(db: DbAdapter, fileBacked: boolean): void {
 
     const existing = db.prepare("SELECT count(*) as cnt FROM schema_version").get();
     if (existing && (existing["cnt"] as number) === 0) {
+      // Fresh install — all tables are created above with the full current schema,
+      // so it is safe to create all migration-specific indexes here.  For existing
+      // databases these indexes are created inside the individual migration guards
+      // in migrateSchema() after the corresponding columns have been added.
+      db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_escalation_pending ON tasks(milestone_id, slice_id, escalation_pending)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_sources_kind ON memory_sources(kind)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_sources_scope ON memory_sources(scope)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_from ON memory_relations(from_id)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_to ON memory_relations(to_id)");
+
       db.prepare(
         "INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)",
       ).run({
@@ -563,6 +614,56 @@ function initSchema(db: DbAdapter, fileBacked: boolean): void {
 function columnExists(db: DbAdapter, table: string, column: string): boolean {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all();
   return rows.some((row) => row["name"] === column);
+}
+
+/**
+ * Create the FTS5 virtual table for memories plus the triggers that keep it
+ * in sync with the base table. FTS5 may be unavailable on stripped-down
+ * SQLite builds — callers should treat failure as non-fatal and fall back
+ * to LIKE-based scans in `memory-store.queryMemoriesRanked`.
+ */
+export function tryCreateMemoriesFts(db: DbAdapter): boolean {
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+      USING fts5(content, content='memories', content_rowid='seq', tokenize='porter unicode61')
+    `);
+    // Triggers mirror inserts / updates / deletes on the base memories table.
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS memories_ai
+      AFTER INSERT ON memories BEGIN
+        INSERT INTO memories_fts(rowid, content) VALUES (new.seq, new.content);
+      END
+    `);
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS memories_ad
+      AFTER DELETE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.seq, old.content);
+      END
+    `);
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS memories_au
+      AFTER UPDATE OF content ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.seq, old.content);
+        INSERT INTO memories_fts(rowid, content) VALUES (new.seq, new.content);
+      END
+    `);
+    return true;
+  } catch (err) {
+    logWarning("db", `FTS5 unavailable — memory queries will use LIKE fallback: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+export function isMemoriesFtsAvailable(db: DbAdapter): boolean {
+  try {
+    const row = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'")
+      .get();
+    return !!row;
+  } catch {
+    return false;
+  }
 }
 
 function ensureColumn(db: DbAdapter, table: string, column: string, ddl: string): void {
@@ -836,19 +937,24 @@ function migrateSchema(db: DbAdapter): void {
     }
 
     if (currentVersion < 12) {
+      // NOTE: The original DDL used COALESCE(task_id, '') in the PRIMARY KEY
+      // expression, which is invalid SQLite syntax and causes startup errors on
+      // DBs that migrate through v12. The corrected DDL uses
+      // task_id TEXT NOT NULL DEFAULT '' with a plain column list PK. DBs that
+      // were created with the broken DDL are repaired by the v22 migration below.
       db.exec(`
         CREATE TABLE IF NOT EXISTS quality_gates (
           milestone_id TEXT NOT NULL,
           slice_id TEXT NOT NULL,
           gate_id TEXT NOT NULL,
           scope TEXT NOT NULL DEFAULT 'slice',
-          task_id TEXT DEFAULT NULL,
+          task_id TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL DEFAULT 'pending',
           verdict TEXT NOT NULL DEFAULT '',
           rationale TEXT NOT NULL DEFAULT '',
           findings TEXT NOT NULL DEFAULT '',
           evaluated_at TEXT DEFAULT NULL,
-          PRIMARY KEY (milestone_id, slice_id, gate_id, COALESCE(task_id, '')),
+          PRIMARY KEY (milestone_id, slice_id, gate_id, task_id),
           FOREIGN KEY (milestone_id, slice_id) REFERENCES slices(milestone_id, id)
         )
       `);
@@ -988,6 +1094,144 @@ function migrateSchema(db: DbAdapter): void {
       });
     }
 
+    if (currentVersion < 18) {
+      // Memory system Phase 2: scope + tags on memories, plus memory_sources
+      // table for raw ingested content (notes, files, URLs, artifacts).
+      ensureColumn(db, "memories", "scope", `ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'project'`);
+      ensureColumn(db, "memories", "tags", `ALTER TABLE memories ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_sources (
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          uri TEXT,
+          title TEXT,
+          content TEXT NOT NULL,
+          content_hash TEXT NOT NULL UNIQUE,
+          imported_at TEXT NOT NULL,
+          scope TEXT NOT NULL DEFAULT 'project',
+          tags TEXT NOT NULL DEFAULT '[]'
+        )
+      `);
+      // If memory_sources already existed before v18 (created by an earlier
+      // version of initSchema that lacked scope/tags), add the missing columns.
+      ensureColumn(db, "memory_sources", "scope", `ALTER TABLE memory_sources ADD COLUMN scope TEXT NOT NULL DEFAULT 'project'`);
+      ensureColumn(db, "memory_sources", "tags", `ALTER TABLE memory_sources ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_sources_kind ON memory_sources(kind)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_sources_scope ON memory_sources(scope)");
+      db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)").run({
+        ":version": 18,
+        ":applied_at": new Date().toISOString(),
+      });
+    }
+
+    if (currentVersion < 19) {
+      // Memory system Phase 3: embeddings + FTS5 for hybrid retrieval.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_embeddings (
+          memory_id TEXT PRIMARY KEY,
+          model TEXT NOT NULL,
+          dim INTEGER NOT NULL,
+          vector BLOB NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+      `);
+      tryCreateMemoriesFts(db);
+      // Backfill FTS5 with any existing memories (triggers only cover future writes).
+      if (isMemoriesFtsAvailable(db)) {
+        try {
+          db.exec(`INSERT INTO memories_fts(rowid, content) SELECT seq, content FROM memories`);
+        } catch (err) {
+          logWarning("db", `FTS5 backfill failed: ${(err as Error).message}`);
+        }
+      }
+      db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)").run({
+        ":version": 19,
+        ":applied_at": new Date().toISOString(),
+      });
+    }
+
+    if (currentVersion < 20) {
+      // Memory system Phase 4: knowledge-graph relations between memories.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_relations (
+          from_id TEXT NOT NULL,
+          to_id TEXT NOT NULL,
+          rel TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 0.8,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (from_id, to_id, rel)
+        )
+      `);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_from ON memory_relations(from_id)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_to ON memory_relations(to_id)");
+      db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)").run({
+        ":version": 20,
+        ":applied_at": new Date().toISOString(),
+      });
+    }
+
+    if (currentVersion < 21) {
+      // ADR-013 Step 2: preserve structured fields (gsd_save_decision's
+      // scope/decision/choice/rationale/made_by/revisable) on memories rows so
+      // the eventual decisions->memories cutover does not lose schema fidelity.
+      // Nullable JSON column — existing rows stay NULL until backfilled in Step 5.
+      // Use ensureColumn for race-safety (matches v15-v18 pattern; bare ALTER
+      // throws "duplicate column" on the loser of a concurrent open race even
+      // though the transaction wrapper protects the schema_version row).
+      ensureColumn(db, "memories", "structured_fields", "ALTER TABLE memories ADD COLUMN structured_fields TEXT DEFAULT NULL");
+      db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)").run({
+        ":version": 21,
+        ":applied_at": new Date().toISOString(),
+      });
+    }
+
+    if (currentVersion < 22) {
+      // v22: Repair quality_gates tables that were created by the broken v12
+      // migration (which used COALESCE(task_id, '') as a PK expression — invalid
+      // SQLite DDL). Those DBs have task_id nullable (dflt_value NULL, notnull 0).
+      // Rebuild the table with the correct schema, migrating existing rows via
+      // COALESCE so no data is lost.
+      const qgInfo = db.prepare("PRAGMA table_info(quality_gates)").all() as Array<Record<string, unknown>>;
+      const taskIdCol = qgInfo.find((r) => r["name"] === "task_id");
+      const needsRepair = taskIdCol && (taskIdCol["notnull"] === 0 || taskIdCol["notnull"] === "0");
+      if (needsRepair) {
+        db.exec(`
+          CREATE TABLE quality_gates_new (
+            milestone_id TEXT NOT NULL,
+            slice_id TEXT NOT NULL,
+            gate_id TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT 'slice',
+            task_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            verdict TEXT NOT NULL DEFAULT '',
+            rationale TEXT NOT NULL DEFAULT '',
+            findings TEXT NOT NULL DEFAULT '',
+            evaluated_at TEXT DEFAULT NULL,
+            PRIMARY KEY (milestone_id, slice_id, gate_id, task_id),
+            FOREIGN KEY (milestone_id, slice_id) REFERENCES slices(milestone_id, id)
+          )
+        `);
+        db.exec(`
+          INSERT OR IGNORE INTO quality_gates_new
+            (milestone_id, slice_id, gate_id, scope, task_id, status, verdict, rationale, findings, evaluated_at)
+          SELECT milestone_id, slice_id, gate_id, scope, COALESCE(task_id, ''), status, verdict, rationale, findings, evaluated_at
+          FROM quality_gates
+        `);
+        db.exec("DROP TABLE quality_gates");
+        db.exec("ALTER TABLE quality_gates_new RENAME TO quality_gates");
+        db.exec("CREATE INDEX IF NOT EXISTS idx_quality_gates_pending ON quality_gates(milestone_id, slice_id, status)");
+      }
+      // Ensure scope column exists on quality_gates and assessments (guard
+      // against DBs that somehow lack it after a partial migration).
+      ensureColumn(db, "quality_gates", "scope", "ALTER TABLE quality_gates ADD COLUMN scope TEXT NOT NULL DEFAULT 'slice'");
+      ensureColumn(db, "assessments", "scope", "ALTER TABLE assessments ADD COLUMN scope TEXT NOT NULL DEFAULT ''");
+      db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)").run({
+        ":version": 22,
+        ":applied_at": new Date().toISOString(),
+      });
+    }
+
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
@@ -1000,6 +1244,8 @@ let currentPath: string | null = null;
 let currentPid: number = 0;
 let _exitHandlerRegistered = false;
 let _dbOpenAttempted = false;
+let _lastDbError: Error | null = null;
+let _lastDbPhase: "open" | "initSchema" | "vacuum-recovery" | null = null;
 
 export function getDbProvider(): ProviderName | null {
   loadProvider();
@@ -1020,12 +1266,58 @@ export function wasDbOpenAttempted(): boolean {
   return _dbOpenAttempted;
 }
 
+export function getDbStatus(): {
+  available: boolean;
+  provider: ProviderName | null;
+  attempted: boolean;
+  lastError: Error | null;
+  lastPhase: "open" | "initSchema" | "vacuum-recovery" | null;
+} {
+  loadProvider();
+  return {
+    available: currentDb !== null,
+    provider: providerName,
+    attempted: _dbOpenAttempted,
+    lastError: _lastDbError,
+    lastPhase: _lastDbPhase,
+  };
+}
+
 export function openDatabase(path: string): boolean {
   _dbOpenAttempted = true;
   if (currentDb && currentPath !== path) closeDatabase();
   if (currentDb && currentPath === path) return true;
 
-  const rawDb = openRawDb(path);
+  // Reset error state only when a new open attempt is actually going to run.
+  _lastDbError = null;
+  _lastDbPhase = null;
+
+  let rawDb: unknown;
+  let fallbackProvider: ProviderName | null = null;
+  let fallbackModule: unknown = null;
+  try {
+    rawDb = openRawDb(path);
+  } catch (primaryErr) {
+    _lastDbPhase = "open";
+    _lastDbError = primaryErr instanceof Error ? primaryErr : new Error(String(primaryErr));
+    // node:sqlite loaded but failed to open this file — try better-sqlite3 as fallback.
+    if (providerName === "node:sqlite") {
+      try {
+        const mod = _require("better-sqlite3");
+        const Db = (mod && mod.default) ? mod.default : mod;
+        if (typeof Db === "function") {
+          rawDb = new Db(path);
+          fallbackProvider = "better-sqlite3";
+          fallbackModule = Db;
+          _lastDbError = null;
+          _lastDbPhase = null;
+        }
+      } catch {
+        // fallback unavailable; surface original error
+      }
+    }
+    if (!rawDb) throw primaryErr;
+  }
   if (!rawDb) return false;
 
   const adapter = createAdapter(rawDb);
@@ -1041,13 +1333,23 @@ export function openDatabase(path: string): boolean {
         initSchema(adapter, fileBacked);
         process.stderr.write("gsd-db: recovered corrupt database via VACUUM\n");
       } catch (retryErr) {
+        _lastDbPhase = "vacuum-recovery";
+        _lastDbError = retryErr instanceof Error ? retryErr : new Error(String(retryErr));
         try { adapter.close(); } catch (e) { logWarning("db", `close after VACUUM failed: ${(e as Error).message}`); }
         throw retryErr;
       }
     } else {
-      try { adapter.close(); } catch (e) { logWarning("db", `close after VACUUM failed: ${(e as Error).message}`); }
+      _lastDbPhase = "initSchema";
+      _lastDbError = err instanceof Error ? err : new Error(String(err));
+      try { adapter.close(); } catch (e) { logWarning("db", `close after initSchema failed: ${(e as Error).message}`); }
       throw err;
     }
+  }
+
+  // Commit fallback provider switch only after open + schema both succeeded.
+  if (fallbackProvider) {
+    providerName = fallbackProvider;
+    providerModule = fallbackModule;
   }
 
   currentDb = adapter;
@@ -1077,8 +1379,12 @@ export function closeDatabase(): void {
     currentDb = null;
     currentPath = null;
     currentPid = 0;
-    _dbOpenAttempted = false;
   }
+  // Reset session-scoped state unconditionally so stale error info from a
+  // failed open doesn't persist into the next open attempt or status check.
+  _dbOpenAttempted = false;
+  _lastDbError = null;
+  _lastDbPhase = null;
 }
 
 /** Run a full VACUUM — call sparingly (e.g. after milestone completion). */
@@ -1099,6 +1405,16 @@ export function checkpointDatabase(): void {
 
 let _txDepth = 0;
 
+/**
+ * Whether the current call is running inside an active SQLite transaction.
+ * Statement-time recovery paths (e.g. VACUUM retry on a malformed memory
+ * store) MUST gate on this — SQLite refuses VACUUM inside a transaction
+ * and would mask the original error with a secondary "cannot VACUUM" throw.
+ */
+export function isInTransaction(): boolean {
+  return _txDepth > 0;
+}
+
 export function transaction<T>(fn: () => T): T {
   if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
 
@@ -1113,8 +1429,8 @@ export function transaction<T>(fn: () => T): T {
     }
   }
 
-  _txDepth++;
   currentDb.exec("BEGIN");
+  _txDepth++;
   try {
     const result = fn();
     currentDb.exec("COMMIT");
@@ -1146,8 +1462,8 @@ export function readTransaction<T>(fn: () => T): T {
     }
   }
 
-  _txDepth++;
   currentDb.exec("BEGIN DEFERRED");
+  _txDepth++;
   try {
     const result = fn();
     currentDb.exec("COMMIT");
@@ -2470,7 +2786,10 @@ export function reconcileWorktreeDb(
           FROM wt.artifacts
         `).run());
 
-        // Merge milestones — worktree may have updated status/planning fields
+        // Merge milestones — worktree may have updated status/planning fields.
+        // Never downgrade status: complete > active > pre-planning (#4372).
+        // A stale worktree may carry an older 'active' status for a milestone
+        // that the main DB has already marked 'complete'; preserve the higher status.
         merged.milestones = countChanges(adapter.prepare(`
           INSERT OR REPLACE INTO milestones (
             id, title, status, depends_on, created_at, completed_at,
@@ -2478,11 +2797,25 @@ export function reconcileWorktreeDb(
             verification_contract, verification_integration, verification_operational, verification_uat,
             definition_of_done, requirement_coverage, boundary_map_markdown
           )
-          SELECT id, title, status, depends_on, created_at, completed_at,
-                 vision, success_criteria, key_risks, proof_strategy,
-                 verification_contract, verification_integration, verification_operational, verification_uat,
-                 definition_of_done, requirement_coverage, boundary_map_markdown
-          FROM wt.milestones
+          SELECT w.id, w.title,
+                 CASE
+                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   THEN m.status ELSE w.status
+                 END,
+                 w.depends_on,
+                 CASE
+                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   THEN m.created_at ELSE w.created_at
+                 END,
+                 CASE
+                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   THEN m.completed_at ELSE w.completed_at
+                 END,
+                 w.vision, w.success_criteria, w.key_risks, w.proof_strategy,
+                 w.verification_contract, w.verification_integration, w.verification_operational, w.verification_uat,
+                 w.definition_of_done, w.requirement_coverage, w.boundary_map_markdown
+          FROM wt.milestones w
+          LEFT JOIN milestones m ON m.id = w.id
         `).run());
 
         // Merge slices — preserve worktree progress but never downgrade completed status (#2558).
@@ -2623,6 +2956,9 @@ export function insertAssessment(entry: {
   fullContent: string;
 }): void {
   if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
+  // Idempotent: PRIMARY KEY is `path`, which is deterministic given (milestone_id, scope) per
+  // the artifact-path resolver. Retrying the same reassess-roadmap silently overwrites the row
+  // instead of accumulating duplicates.
   currentDb.prepare(
     `INSERT OR REPLACE INTO assessments (path, milestone_id, slice_id, task_id, status, scope, full_content, created_at)
      VALUES (:path, :milestone_id, :slice_id, :task_id, :status, :scope, :full_content, :created_at)`,
@@ -2777,7 +3113,7 @@ function rowToGate(row: Record<string, unknown>): GateRow {
     scope: row["scope"] as GateScope,
     task_id: (row["task_id"] as string) ?? "",
     status: row["status"] as GateStatus,
-    verdict: (row["verdict"] as GateVerdict) || "",
+    verdict: row["status"] === "pending" ? null : (row["verdict"] as GateVerdict),
     rationale: (row["rationale"] as string) || "",
     findings: (row["findings"] as string) || "",
     evaluated_at: (row["evaluated_at"] as string) ?? null,
@@ -2881,7 +3217,7 @@ export function getGateResults(milestoneId: string, sliceId: string, scope?: Gat
 export function markAllGatesOmitted(milestoneId: string, sliceId: string): void {
   if (!currentDb) return;
   currentDb.prepare(
-    `UPDATE quality_gates SET status = 'omitted', verdict = 'omitted', evaluated_at = :now
+    `UPDATE quality_gates SET status = 'complete', verdict = 'omitted', evaluated_at = :now
      WHERE milestone_id = :mid AND slice_id = :sid AND status = 'pending'`,
   ).run({
     ":mid": milestoneId,
@@ -3423,11 +3759,21 @@ export function insertMemoryRow(args: {
   sourceUnitId: string | null;
   createdAt: string;
   updatedAt: string;
+  scope?: string;
+  tags?: string[];
+  /**
+   * ADR-013 Step 2: optional structured payload preserved alongside the flat
+   * `content` field. Used to retain gsd_save_decision-style fields (scope,
+   * decision, choice, rationale, made_by, revisable) on architecture-category
+   * memories so the cutover in Step 6 is lossless. Schema is intentionally
+   * open inside the JSON; documented per category in ADR-013.
+   */
+  structuredFields?: Record<string, unknown> | null;
 }): void {
   if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
   currentDb.prepare(
-    `INSERT INTO memories (id, category, content, confidence, source_unit_type, source_unit_id, created_at, updated_at)
-     VALUES (:id, :category, :content, :confidence, :source_unit_type, :source_unit_id, :created_at, :updated_at)`,
+    `INSERT INTO memories (id, category, content, confidence, source_unit_type, source_unit_id, created_at, updated_at, scope, tags, structured_fields)
+     VALUES (:id, :category, :content, :confidence, :source_unit_type, :source_unit_id, :created_at, :updated_at, :scope, :tags, :structured_fields)`,
   ).run({
     ":id": args.id,
     ":category": args.category,
@@ -3437,7 +3783,106 @@ export function insertMemoryRow(args: {
     ":source_unit_id": args.sourceUnitId,
     ":created_at": args.createdAt,
     ":updated_at": args.updatedAt,
+    ":scope": args.scope ?? "project",
+    ":tags": JSON.stringify(args.tags ?? []),
+    ":structured_fields": args.structuredFields == null ? null : JSON.stringify(args.structuredFields),
   });
+}
+
+export function insertMemorySourceRow(args: {
+  id: string;
+  kind: string;
+  uri: string | null;
+  title: string | null;
+  content: string;
+  contentHash: string;
+  importedAt: string;
+  scope?: string;
+  tags?: string[];
+}): void {
+  if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
+  currentDb.prepare(
+    `INSERT OR IGNORE INTO memory_sources (id, kind, uri, title, content, content_hash, imported_at, scope, tags)
+     VALUES (:id, :kind, :uri, :title, :content, :content_hash, :imported_at, :scope, :tags)`,
+  ).run({
+    ":id": args.id,
+    ":kind": args.kind,
+    ":uri": args.uri,
+    ":title": args.title,
+    ":content": args.content,
+    ":content_hash": args.contentHash,
+    ":imported_at": args.importedAt,
+    ":scope": args.scope ?? "project",
+    ":tags": JSON.stringify(args.tags ?? []),
+  });
+}
+
+export function deleteMemorySourceRow(id: string): boolean {
+  if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
+  const res = currentDb
+    .prepare("DELETE FROM memory_sources WHERE id = :id")
+    .run({ ":id": id }) as { changes?: number };
+  return (res?.changes ?? 0) > 0;
+}
+
+export function upsertMemoryEmbedding(args: {
+  memoryId: string;
+  model: string;
+  dim: number;
+  vector: Uint8Array;
+  updatedAt: string;
+}): void {
+  if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
+  currentDb.prepare(
+    `INSERT INTO memory_embeddings (memory_id, model, dim, vector, updated_at)
+     VALUES (:memory_id, :model, :dim, :vector, :updated_at)
+     ON CONFLICT(memory_id) DO UPDATE SET
+       model = excluded.model,
+       dim = excluded.dim,
+       vector = excluded.vector,
+       updated_at = excluded.updated_at`,
+  ).run({
+    ":memory_id": args.memoryId,
+    ":model": args.model,
+    ":dim": args.dim,
+    ":vector": args.vector,
+    ":updated_at": args.updatedAt,
+  });
+}
+
+export function deleteMemoryEmbedding(memoryId: string): boolean {
+  if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
+  const res = currentDb
+    .prepare("DELETE FROM memory_embeddings WHERE memory_id = :id")
+    .run({ ":id": memoryId }) as { changes?: number };
+  return (res?.changes ?? 0) > 0;
+}
+
+export function insertMemoryRelationRow(args: {
+  fromId: string;
+  toId: string;
+  rel: string;
+  confidence: number;
+  createdAt: string;
+}): void {
+  if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
+  currentDb.prepare(
+    `INSERT OR REPLACE INTO memory_relations (from_id, to_id, rel, confidence, created_at)
+     VALUES (:from_id, :to_id, :rel, :confidence, :created_at)`,
+  ).run({
+    ":from_id": args.fromId,
+    ":to_id": args.toId,
+    ":rel": args.rel,
+    ":confidence": args.confidence,
+    ":created_at": args.createdAt,
+  });
+}
+
+export function deleteMemoryRelationsFor(memoryId: string): void {
+  if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
+  currentDb
+    .prepare("DELETE FROM memory_relations WHERE from_id = :id OR to_id = :id")
+    .run({ ":id": memoryId });
 }
 
 export function rewriteMemoryId(placeholderId: string, realId: string): void {

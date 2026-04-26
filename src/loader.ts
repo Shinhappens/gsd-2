@@ -3,7 +3,7 @@
 // Copyright (c) 2026 Jeremy McSpadden <jeremy@fluxlabs.net>
 import { fileURLToPath } from 'url'
 import { dirname, resolve, join, relative, delimiter } from 'path'
-import { existsSync, readFileSync, mkdirSync, symlinkSync, cpSync } from 'fs'
+import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, symlinkSync, cpSync } from 'fs'
 
 // Fast-path: handle --version/-v and --help/-h before importing any heavy
 // dependencies. This avoids loading the entire pi-coding-agent barrel import
@@ -36,15 +36,15 @@ if (firstArg === '--help' || firstArg === '-h') {
 // package.json (already parsed above) and verifies git is available.
 // ---------------------------------------------------------------------------
 {
-  const MIN_NODE_MAJOR = 22
+  const { MIN_NODE_MAJOR, checkNodeVersion, requireGit } = await import('./runtime-checks.js')
   const red = '\x1b[31m'
   const bold = '\x1b[1m'
   const dim = '\x1b[2m'
   const reset = '\x1b[0m'
 
   // -- Node version --
-  const nodeMajor = parseInt(process.versions.node.split('.')[0], 10)
-  if (nodeMajor < MIN_NODE_MAJOR) {
+  const nodeCheck = checkNodeVersion(process.versions.node, MIN_NODE_MAJOR)
+  if (!nodeCheck.ok) {
     process.stderr.write(
       `\n${red}${bold}Error:${reset} GSD requires Node.js >= ${MIN_NODE_MAJOR}.0.0\n` +
       `       You are running Node.js ${process.versions.node}\n\n` +
@@ -57,10 +57,9 @@ if (firstArg === '--help' || firstArg === '-h') {
   }
 
   // -- git --
-  try {
-    const { execFileSync } = await import('child_process')
-    execFileSync('git', ['--version'], { stdio: 'ignore' })
-  } catch {
+  const { execFileSync } = await import('child_process')
+  const gitOk = requireGit((cmd, args) => execFileSync(cmd, args as string[], { stdio: 'ignore' }))
+  if (!gitOk) {
     process.stderr.write(
       `\n${red}${bold}Error:${reset} GSD requires git but it was not found on PATH.\n\n` +
       `${dim}Install git:${reset}\n` +
@@ -180,14 +179,37 @@ if (process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.http_proxy 
 // On Windows without Developer Mode or admin rights, symlinkSync will throw even for
 // 'junction' type — so we fall back to cpSync (a full directory copy) which works
 // everywhere without elevated permissions.
-const gsdScopeDir = join(gsdNodeModules, '@gsd')
+// Discover linkable workspace packages by scanning packages/*/package.json for
+// `gsd.linkable === true`. This is the single source of truth — the same list
+// read by scripts/link-workspace-packages.cjs and scripts/validate-pack.js.
+// Adding a new linkable package requires only setting `gsd.linkable` in its
+// package.json; there is no enumeration to keep in sync here.
 const packagesDir = join(gsdRoot, 'packages')
-const wsPackages = ['native', 'pi-agent-core', 'pi-ai', 'pi-coding-agent', 'pi-tui']
+type WsPkg = { dir: string; scope: string; name: string }
+const wsPackages: WsPkg[] = []
 try {
-  if (!existsSync(gsdScopeDir)) mkdirSync(gsdScopeDir, { recursive: true })
+  if (existsSync(packagesDir)) {
+    for (const dir of readdirSync(packagesDir)) {
+      const pkgPath = join(packagesDir, dir)
+      if (!statSync(pkgPath).isDirectory()) continue
+      const pkgJsonPath = join(pkgPath, 'package.json')
+      if (!existsSync(pkgJsonPath)) continue
+      try {
+        const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'))
+        const gsd = pkg.gsd
+        if (!gsd || gsd.linkable !== true) continue
+        if (gsd.scope && gsd.name) wsPackages.push({ dir, scope: gsd.scope, name: gsd.name })
+      } catch { /* ignore malformed package.json */ }
+    }
+  }
+} catch { /* non-fatal — validation below catches missing critical packages */ }
+
+try {
   for (const pkg of wsPackages) {
-    const target = join(gsdScopeDir, pkg)
-    const source = join(packagesDir, pkg)
+    const scopeDir = join(gsdNodeModules, pkg.scope)
+    if (!existsSync(scopeDir)) mkdirSync(scopeDir, { recursive: true })
+    const target = join(scopeDir, pkg.name)
+    const source = join(packagesDir, pkg.dir)
     if (!existsSync(source) || existsSync(target)) continue
     try {
       symlinkSync(source, target, 'junction')
@@ -198,6 +220,8 @@ try {
     }
   }
 } catch { /* non-fatal */ }
+
+const gsdScopeDir = join(gsdNodeModules, '@gsd')
 
 // Validate critical workspace packages are resolvable. If still missing after the
 // symlink+copy attempts, emit a clear diagnostic instead of a cryptic

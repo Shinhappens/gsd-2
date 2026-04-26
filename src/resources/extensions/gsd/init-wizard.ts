@@ -10,7 +10,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { showNextAction } from "../shared/tui.js";
-import { nativeIsRepo, nativeInit } from "./native-git-bridge.js";
+import { nativeIsRepo, nativeInit, nativeAddAll, nativeCommit } from "./native-git-bridge.js";
 import { ensureGitignore, untrackRuntimeFiles } from "./gitignore.js";
 import { gsdRoot } from "./paths.js";
 import { assertSafeDirectory } from "./validate-directory.js";
@@ -74,6 +74,7 @@ export async function showProjectInit(
   }
 
   // ── Step 2: Git setup ──────────────────────────────────────────────────────
+  let didInitGit = false;
   if (!signals.isGitRepo) {
     const gitChoice = await showNextAction(ctx, {
       title: "GSD — Project Setup",
@@ -89,6 +90,7 @@ export async function showProjectInit(
 
     if (gitChoice === "init_git") {
       nativeInit(basePath, prefs.mainBranch);
+      didInitGit = true;
     }
   } else {
     // Auto-detect main branch from existing repo
@@ -294,6 +296,18 @@ export async function showProjectInit(
   // Ensure .gitignore
   ensureGitignore(basePath);
   untrackRuntimeFiles(basePath);
+
+  // Create initial commit so git log and git worktree work immediately (#4530).
+  // Without this, the branch is "unborn" (zero commits) and downstream operations
+  // like `git log` and `git worktree add` fail.
+  if (didInitGit) {
+    try {
+      nativeAddAll(basePath);
+      nativeCommit(basePath, "chore: init project");
+    } catch {
+      // Non-fatal — user can commit manually; don't block project init
+    }
+  }
 
   // Auto-generate codebase map for instant agent orientation
   try {

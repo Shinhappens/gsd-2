@@ -117,6 +117,22 @@ export interface OnboardingBridgeAuthRefreshState {
   error: string | null;
 }
 
+/**
+ * CLI-side onboarding completion record exposed to the web client.
+ *
+ * Mirrors the JSON written by `src/resources/extensions/gsd/onboarding-state.ts`.
+ * Read-only metadata: lets the web UI render "setup complete (date)" indicators
+ * and offer a "re-run setup" affordance. Does NOT influence the `locked` flag —
+ * lock semantics still depend on whether a required provider is configured.
+ */
+export interface OnboardingCompletionRecord {
+  completedAt: string | null;
+  completedSteps: string[];
+  skippedSteps: string[];
+  lastResumePoint: string | null;
+  flowVersion: number;
+}
+
 export interface OnboardingState {
   status: "blocked" | "ready";
   locked: boolean;
@@ -136,6 +152,8 @@ export interface OnboardingState {
   lastValidation: OnboardingValidationResult | null;
   activeFlow: OnboardingProviderFlowState | null;
   bridgeAuthRefresh: OnboardingBridgeAuthRefreshState;
+  /** CLI-side onboarding wizard completion record. Null if never completed. Optional for back-compat with existing fixtures. */
+  completionRecord?: OnboardingCompletionRecord | null;
 }
 
 type ProviderFlowRuntime = {
@@ -167,6 +185,15 @@ const REQUIRED_PROVIDER_CATALOG: RequiredProviderCatalogEntry[] = [
   { id: "xai", label: "xAI (Grok)", supportsApiKey: true, supportsOAuth: false },
   { id: "openrouter", label: "OpenRouter", supportsApiKey: true, supportsOAuth: false },
   { id: "mistral", label: "Mistral", supportsApiKey: true, supportsOAuth: false },
+  { id: "minimax", label: "MiniMax", supportsApiKey: true, supportsOAuth: false },
+  { id: "minimax-cn", label: "MiniMax CN", supportsApiKey: true, supportsOAuth: false },
+  // Supported by the core provider registry; configured via env/auth today.
+  { id: "ollama-cloud", label: "Ollama Cloud", supportsApiKey: false, supportsOAuth: false },
+  { id: "custom-openai", label: "Custom (OpenAI-compatible)", supportsApiKey: false, supportsOAuth: false },
+  { id: "cerebras", label: "Cerebras", supportsApiKey: false, supportsOAuth: false },
+  { id: "azure-openai-responses", label: "Azure OpenAI", supportsApiKey: false, supportsOAuth: false },
+  { id: "alibaba-coding-plan", label: "Alibaba Coding Plan", supportsApiKey: false, supportsOAuth: false },
+  { id: "alibaba-dashscope", label: "Alibaba DashScope", supportsApiKey: false, supportsOAuth: false },
   { id: "claude-code", label: "Claude Code (Local CLI)", supportsApiKey: false, supportsOAuth: false, supportsExternalCli: true, recommended: true },
 ];
 
@@ -194,6 +221,7 @@ const OPTIONAL_SECTION_CATALOG: OptionalSectionCatalogEntry[] = [
     providers: [
       { id: "discord_bot", label: "Discord", envVar: "DISCORD_BOT_TOKEN" },
       { id: "slack_bot", label: "Slack", envVar: "SLACK_BOT_TOKEN" },
+      { id: "telegram_bot", label: "Telegram", envVar: "TELEGRAM_BOT_TOKEN" },
     ],
   },
 ];
@@ -390,6 +418,39 @@ async function validateAnthropicApiKey(fetchImpl: typeof fetch, apiKey: string):
   }
 }
 
+async function validateAnthropicCompatibleApiKey(
+  fetchImpl: typeof fetch,
+  providerId: string,
+  apiKey: string,
+  baseUrl: string,
+  model: string,
+): Promise<ValidationProbeResult> {
+  try {
+    const response = await fetchImpl(`${baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 1,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    if (!response.ok) {
+      return { ok: false, message: await parseFailureMessage(providerId, response) };
+    }
+
+    return { ok: true, message: `${providerId} credentials validated` };
+  } catch (error) {
+    return { ok: false, message: `${providerId} validation failed: ${sanitizeMessage(error)}` };
+  }
+}
+
 async function defaultValidateApiKey(
   providerId: string,
   apiKey: string,
@@ -413,6 +474,22 @@ async function defaultValidateApiKey(
       });
     case "mistral":
       return await validateBearerRequest(fetchImpl, providerId, "https://api.mistral.ai/v1/models", apiKey);
+    case "minimax":
+      return await validateAnthropicCompatibleApiKey(
+        fetchImpl,
+        providerId,
+        apiKey,
+        "https://api.minimax.io/anthropic",
+        "MiniMax-M2.7",
+      );
+    case "minimax-cn":
+      return await validateAnthropicCompatibleApiKey(
+        fetchImpl,
+        providerId,
+        apiKey,
+        "https://api.minimaxi.com/anthropic",
+        "MiniMax-M2.7",
+      );
     default:
       return { ok: false, message: `${providerId} does not support API-key validation via onboarding` };
   }
@@ -739,6 +816,24 @@ export class OnboardingService {
     const optionalSections = this.buildOptionalSectionState(authStorage);
     const lockReason = resolveOnboardingLockReason(Boolean(satisfiedByProvider), this.bridgeAuthRefresh);
 
+    // Read CLI-side completion record (best-effort — never throw)
+    let completionRecord: OnboardingCompletionRecord | null = null;
+    try {
+      const { readOnboardingRecord, isOnboardingComplete } = await import(
+        "../resources/extensions/gsd/onboarding-state.js"
+      );
+      const r = readOnboardingRecord();
+      completionRecord = {
+        completedAt: isOnboardingComplete() ? r.completedAt : null,
+        completedSteps: r.completedSteps,
+        skippedSteps: r.skippedSteps,
+        lastResumePoint: r.lastResumePoint,
+        flowVersion: r.flowVersion,
+      };
+    } catch {
+      completionRecord = null;
+    }
+
     return {
       status: lockReason ? "blocked" : "ready",
       locked: lockReason !== null,
@@ -763,6 +858,7 @@ export class OnboardingService {
       lastValidation: this.lastValidation ? { ...this.lastValidation } : null,
       activeFlow: this.activeFlow ? structuredClone(this.activeFlow.state) : null,
       bridgeAuthRefresh: { ...this.bridgeAuthRefresh },
+      completionRecord,
     };
   }
 

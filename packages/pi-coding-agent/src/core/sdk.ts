@@ -31,6 +31,13 @@ export class CredentialCooldownError extends Error {
 		this.retryAfterMs = retryAfterMs;
 	}
 }
+
+export function canRestoreSessionModel(
+	modelRegistry: Pick<ModelRegistry, "isProviderRequestReady">,
+	model: Model<any>,
+): boolean {
+	return modelRegistry.isProviderRequestReady(model.provider);
+}
 import { Agent, type AgentMessage, type ThinkingLevel } from "@gsd/pi-agent-core";
 import type { Message, Model } from "@gsd/pi-ai";
 import { getAgentDir, getDocsPath } from "../config.js";
@@ -98,6 +105,16 @@ export interface CreateAgentSessionOptions {
 	tools?: Tool[];
 	/** Custom tools to register (in addition to built-in tools). */
 	customTools?: ToolDefinition[];
+	/**
+	 * Additional tool names to activate after extensions/MCP servers register.
+	 * Names that are not registered by any extension are silently ignored
+	 * by AgentSession.setActiveToolsByName.
+	 *
+	 * Used by --tools to forward names that don't match a built-in (likely
+	 * extension- or MCP-provided), so subagents whose frontmatter declares
+	 * extension tools don't end up with an empty tool list.
+	 */
+	extraActiveToolNames?: string[];
 
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
@@ -252,9 +269,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// If session has data, try to restore model from it
 	if (!model && hasExistingSession && existingSession.model) {
 		const restoredModel = modelRegistry.find(existingSession.model.provider, existingSession.model.modelId);
-		if (restoredModel && (await modelRegistry.getApiKey(restoredModel))) {
-			model = restoredModel;
-		}
+			if (restoredModel && canRestoreSessionModel(modelRegistry, restoredModel)) {
+				model = restoredModel;
+			}
 		if (!model) {
 			modelFallbackMessage = `Could not restore model ${existingSession.model.provider}/${existingSession.model.modelId}`;
 		}
@@ -311,9 +328,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const defaultActiveToolNames: ToolName[] = editMode === "hashline"
 		? ["hashline_read", "bash", "hashline_edit", "write", "lsp"]
 		: ["read", "bash", "edit", "write", "lsp"];
-	const initialActiveToolNames: ToolName[] = options.tools
+	const builtinActiveToolNames: ToolName[] = options.tools
 		? options.tools.map((t) => t.name).filter((n): n is ToolName => n in allTools)
 		: defaultActiveToolNames;
+	// Merge in extension/MCP tool names from --tools that didn't match a built-in.
+	// AgentSession.setActiveToolsByName silently drops names that aren't in the
+	// registry, so unknown names are harmless here.
+	const initialActiveToolNames: string[] = options.extraActiveToolNames
+		? [...builtinActiveToolNames, ...options.extraActiveToolNames]
+		: builtinActiveToolNames;
 
 	let agent: Agent;
 

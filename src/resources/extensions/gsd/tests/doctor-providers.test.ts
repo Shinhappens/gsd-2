@@ -15,7 +15,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, chmodSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
@@ -327,6 +327,88 @@ test("runProviderChecks ignores empty placeholder keys in auth.json", () => {
   rmSync(tmpHome, { recursive: true, force: true });
 });
 
+test("runProviderChecks detects custom provider keys from models.json", () => {
+  const tmpHome = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-custom-home-")));
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-custom-repo-")));
+  const agentDir = join(tmpHome, ".gsd", "agent");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(join(repo, ".gsd"), { recursive: true });
+
+  writeFileSync(
+    join(repo, ".gsd", "PREFERENCES.md"),
+    [
+      "---",
+      "models:",
+      "  execution:",
+      "    model: custom-model",
+      "    provider: custom-provider",
+      "---",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({
+    providers: {
+      "custom-provider": {
+        api: "openai-completions",
+        apiKey: "x",
+        baseUrl: "https://example.invalid/v1",
+        models: [{ id: "custom-model", name: "Custom Model" }],
+      },
+    },
+  }));
+
+  withEnv({
+    HOME: tmpHome,
+    CUSTOM_PROVIDER_API_KEY: undefined,
+    PATH: tmpHome,
+  }, () => {
+    withCwd(repo, () => {
+      const results = runProviderChecks();
+      const custom = results.find(r => r.name === "custom-provider");
+      assert.ok(custom, "custom provider result should exist");
+      assert.equal(custom!.status, "ok", "models.json apiKey should satisfy custom provider auth");
+      assert.ok(custom!.message.includes("models.json"), "should report models.json source");
+      assert.equal(summariseProviderIssues(results), null, "custom models.json key should not raise dashboard warning");
+    });
+  });
+
+  rmSync(repo, { recursive: true, force: true });
+  rmSync(tmpHome, { recursive: true, force: true });
+});
+
+test("runProviderChecks reports missing custom provider key without models.json apiKey", () => {
+  const tmpHome = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-custom-missing-home-")));
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-custom-missing-repo-")));
+  mkdirSync(join(repo, ".gsd"), { recursive: true });
+
+  writeFileSync(
+    join(repo, ".gsd", "PREFERENCES.md"),
+    [
+      "---",
+      "models:",
+      "  execution: custom-provider/custom-model",
+      "---",
+      "",
+    ].join("\n"),
+  );
+
+  withEnv({
+    HOME: tmpHome,
+    CUSTOM_PROVIDER_API_KEY: undefined,
+    PATH: tmpHome,
+  }, () => {
+    withCwd(repo, () => {
+      const results = runProviderChecks();
+      const custom = results.find(r => r.name === "custom-provider");
+      assert.ok(custom, "provider-qualified custom model should be checked");
+      assert.equal(custom!.status, "error", "missing custom provider key should still be reported");
+    });
+  });
+
+  rmSync(repo, { recursive: true, force: true });
+  rmSync(tmpHome, { recursive: true, force: true });
+});
+
 // ─── runProviderChecks — cross-provider routing ──────────────────────────────
 
 test("runProviderChecks reports ok for Anthropic when GitHub Copilot env var is set", () => {
@@ -517,7 +599,7 @@ test("runProviderChecks reports ok for Google via google-gemini-cli auth.json (#
 
   // google-gemini-cli OAuth in auth.json (no google API key)
   const authData = {
-    "google-gemini-cli": { type: "oauth", apiKey: "ya29.gemini-cli-token", expires: Date.now() + 3_600_000 },
+    "google-gemini-cli": { type: "oauth", expires: Date.now() + 3_600_000 },
   };
   writeFileSync(join(agentDir, "auth.json"), JSON.stringify(authData));
 
@@ -640,13 +722,76 @@ test("runProviderChecks reports ok for Anthropic via claude-code binary in PATH"
     COPILOT_GITHUB_TOKEN: undefined,
     GH_TOKEN: undefined,
     GITHUB_TOKEN: undefined,
-    PATH: `${binDir}:${process.env.PATH ?? ""}`,
+    PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
   }, () => {
     try {
       const results = runProviderChecks();
       const anthropic = results.find(r => r.name === "anthropic");
       assert.ok(anthropic, "anthropic result should exist");
       assert.equal(anthropic!.status, "ok", "should be ok when claude CLI binary is in PATH");
+      assert.ok(anthropic!.message.toLowerCase().includes("claude"), "should mention claude-code as source");
+    } finally {
+      rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
+});
+
+test("runProviderChecks detects claude.cmd in PATH on Windows (#4503)", { skip: process.platform !== "win32" }, () => {
+  const tmpHome = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-cc-win-route-home-")));
+  const binDir = join(tmpHome, "bin");
+  mkdirSync(binDir, { recursive: true });
+
+  // On Windows, users commonly install Claude via a .cmd shim.
+  const fakeClaudeCmd = join(binDir, "claude.cmd");
+  writeFileSync(fakeClaudeCmd, "@echo off\r\necho mock\r\n");
+
+  withEnv({
+    HOME: tmpHome,
+    ANTHROPIC_API_KEY: undefined,
+    ANTHROPIC_OAUTH_TOKEN: undefined,
+    COPILOT_GITHUB_TOKEN: undefined,
+    GH_TOKEN: undefined,
+    GITHUB_TOKEN: undefined,
+    // Explicitly use ';' to mirror Windows PATH entries.
+    PATH: `${binDir};${process.env.PATH ?? ""}`,
+    PATHEXT: ".COM;.EXE;.BAT;.CMD",
+  }, () => {
+    try {
+      const results = runProviderChecks();
+      const anthropic = results.find(r => r.name === "anthropic");
+      assert.ok(anthropic, "anthropic result should exist");
+      assert.equal(anthropic!.status, "ok", "should be ok when claude.cmd is in PATH");
+      assert.ok(anthropic!.message.toLowerCase().includes("claude"), "should mention claude-code as source");
+    } finally {
+      rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
+});
+
+test("runProviderChecks detects claude.exe in PATH on Windows (#4548)", { skip: process.platform !== "win32" }, () => {
+  const tmpHome = realpathSync(mkdtempSync(join(tmpdir(), "gsd-providers-cc-exe-home-")));
+  const binDir = join(tmpHome, "bin");
+  mkdirSync(binDir, { recursive: true });
+
+  // Some Windows installs ship a direct claude.exe binary (not a .cmd shim).
+  const fakeClaudeExe = join(binDir, "claude.exe");
+  writeFileSync(fakeClaudeExe, "");
+
+  withEnv({
+    HOME: tmpHome,
+    ANTHROPIC_API_KEY: undefined,
+    ANTHROPIC_OAUTH_TOKEN: undefined,
+    COPILOT_GITHUB_TOKEN: undefined,
+    GH_TOKEN: undefined,
+    GITHUB_TOKEN: undefined,
+    PATH: `${binDir};${process.env.PATH ?? ""}`,
+    PATHEXT: ".COM;.EXE;.BAT;.CMD",
+  }, () => {
+    try {
+      const results = runProviderChecks();
+      const anthropic = results.find(r => r.name === "anthropic");
+      assert.ok(anthropic, "anthropic result should exist");
+      assert.equal(anthropic!.status, "ok", "should be ok when claude.exe is in PATH (#4548)");
       assert.ok(anthropic!.message.toLowerCase().includes("claude"), "should mention claude-code as source");
     } finally {
       rmSync(tmpHome, { recursive: true, force: true });

@@ -18,6 +18,7 @@ import { getCurrentBranch } from "./worktree.js";
 import { getActiveHook } from "./post-unit-hooks.js";
 import { getLedger, getProjectTotals } from "./metrics.js";
 import { getErrorMessage } from "./error-utils.js";
+import { nativeIsRepo } from "./native-git-bridge.js";
 import {
   resolveMilestoneFile,
   resolveSliceFile,
@@ -336,6 +337,10 @@ let lastCommitFetchedAt = 0;
 
 function refreshLastCommit(basePath: string): void {
   try {
+    if (!nativeIsRepo(basePath)) {
+      cachedLastCommit = null;
+      return;
+    }
     const raw = execFileSync("git", ["log", "-1", "--format=%cr|%s"], {
       cwd: basePath,
       encoding: "utf-8",
@@ -349,10 +354,12 @@ function refreshLastCommit(basePath: string): void {
         message: raw.slice(sep + 1),
       };
     }
-    lastCommitFetchedAt = Date.now();
   } catch (err) {
     // Non-fatal — just skip last commit display
+    cachedLastCommit = null;
     logWarning("dashboard", `operation failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    lastCommitFetchedAt = Date.now();
   }
 }
 
@@ -362,6 +369,23 @@ function getLastCommit(basePath: string): { timeAgo: string; message: string } |
     refreshLastCommit(basePath);
   }
   return cachedLastCommit;
+}
+
+export function _resetLastCommitCacheForTests(): void {
+  cachedLastCommit = null;
+  lastCommitFetchedAt = 0;
+}
+
+export function _refreshLastCommitForTests(basePath: string): void {
+  refreshLastCommit(basePath);
+}
+
+export function _getLastCommitForTests(basePath: string): { timeAgo: string; message: string } | null {
+  return getLastCommit(basePath);
+}
+
+export function _getLastCommitFetchedAtForTests(): number {
+  return lastCommitFetchedAt;
 }
 
 // ─── Footer Factory ───────────────────────────────────────────────────────────

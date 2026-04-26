@@ -248,12 +248,13 @@ describe('git-service', async () => {
 
   assert.deepStrictEqual(
     RUNTIME_EXCLUSION_PATHS.length,
-    15,
-    "exactly 15 runtime exclusion paths"
+    16,
+    "exactly 16 runtime exclusion paths"
   );
 
   const expectedPaths = [
     ".gsd/activity/",
+    ".gsd/audit/",
     ".gsd/forensics/",
     ".gsd/runtime/",
     ".gsd/worktrees/",
@@ -1235,6 +1236,7 @@ describe('git-service', async () => {
     const content = readFileSync(join(repo, ".gitignore"), "utf-8");
     const lines = content.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
     assert.ok(lines.includes(".gsd"), "ensureGitignore: .gitignore contains .gsd");
+    assert.ok(lines.includes(".mcp.json"), "ensureGitignore: .gitignore contains .mcp.json");
 
     // Idempotent — calling again doesn't add duplicates
     const modified2 = ensureGitignore(repo);
