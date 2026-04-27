@@ -445,6 +445,19 @@ export function registerHooks(
     markToolStart(event.toolCallId, event.toolName);
     safetyRecordToolCall(event.toolCallId, event.toolName, event.input as Record<string, unknown>);
 
+    // Persist immediately at dispatch so a mid-unit re-dispatch — which calls
+    // resetEvidence() + loadEvidenceFromDisk() in runUnitPhase — cannot wipe
+    // the entry between tool_call and tool_execution_end. Without this, the
+    // race window equals the tool's runtime, producing the "no bash calls"
+    // false positive when the LLM clearly ran a verification command.
+    const callDash = getAutoRuntimeSnapshot();
+    if (callDash.basePath && callDash.currentUnit?.type === "execute-task") {
+      const { milestone: cMid, slice: cSid, task: cTid } = parseUnitId(callDash.currentUnit.id);
+      if (cMid && cSid && cTid) {
+        saveEvidenceToDisk(callDash.basePath, cMid, cSid, cTid);
+      }
+    }
+
     // Destructive command classification (warn only, never block)
     if (isToolCallEventType("bash", event)) {
       const classification = classifyCommand(event.input.command);
