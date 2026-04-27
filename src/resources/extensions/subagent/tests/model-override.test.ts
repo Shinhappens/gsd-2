@@ -9,9 +9,10 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
 		description: "A test agent",
 		systemPrompt: "You are a test agent",
 		source: "project" as const,
+		filePath: "test-agent.md",
 		tools: [],
 		...overrides,
-	} as AgentConfig;
+	};
 }
 
 describe("buildSubagentProcessArgs model override", () => {

@@ -267,7 +267,7 @@ export function buildSubagentProcessArgs(
 	modelOverride?: string,
 ): string[] {
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	const effectiveModel = modelOverride || agent.model;
+	const effectiveModel = modelOverride ?? agent.model;
 	if (effectiveModel) args.push("--model", effectiveModel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 	if (tmpPromptPath) args.push("--append-system-prompt", tmpPromptPath);
