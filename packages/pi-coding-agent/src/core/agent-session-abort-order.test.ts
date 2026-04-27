@@ -106,6 +106,28 @@ describe("#4243 — abort() must run before _disconnectFromAgent()", () => {
 		);
 	});
 
+	it("newSession() waits instead of aborting while agent_end handlers are still running", async () => {
+		const session = await createSession();
+		const order: string[] = [];
+
+		(session as any)._processingAgentEnd = true;
+		(session as any).agent.waitForIdle = async () => {
+			order.push("waitForIdle");
+		};
+		(session as any).abort = async () => {
+			order.push("abort");
+		};
+		const originalDisconnect = (session as any)._disconnectFromAgent.bind(session);
+		(session as any)._disconnectFromAgent = () => {
+			order.push("_disconnectFromAgent");
+			originalDisconnect();
+		};
+
+		const ok = await session.newSession();
+		assert.equal(ok, true);
+		assert.deepEqual(order, ["waitForIdle", "_disconnectFromAgent"]);
+	});
+
 	it("switchSession() invokes abort() before _disconnectFromAgent()", async () => {
 		const session = await createSession({ persistSessions: true });
 		// Seed a session file to switch to (switchSession reads from the session manager).

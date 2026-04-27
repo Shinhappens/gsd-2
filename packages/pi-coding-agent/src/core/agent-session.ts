@@ -272,6 +272,7 @@ export class AgentSession {
 	// Extension system
 	private _extensionRunner: ExtensionRunner | undefined = undefined;
 	private _turnIndex = 0;
+	private _processingAgentEnd = false;
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -627,20 +628,25 @@ export class AgentSession {
 			this._turnIndex = 0;
 			await this._extensionRunner.emit({ type: "agent_start" });
 		} else if (event.type === "agent_end") {
-			await this._extensionRunner.emit({ type: "agent_end", messages: event.messages });
-			// `stop` fires on true quiescence: the agent cleanly completed and is now
-			// waiting for the user. Use the last assistant message's stopReason to
-			// distinguish clean completion from error/cancellation.
-			const last = event.messages[event.messages.length - 1];
-			const stopReason: "completed" | "cancelled" | "error" | "blocked" =
-				last?.role === "assistant"
-					? last.stopReason === "aborted"
-						? "cancelled"
-						: last.stopReason === "error"
-							? "error"
-							: "completed"
-					: "completed";
-			await this._extensionRunner.emitStop({ reason: stopReason, lastMessage: last });
+			this._processingAgentEnd = true;
+			try {
+				await this._extensionRunner.emit({ type: "agent_end", messages: event.messages });
+				// `stop` fires on true quiescence: the agent cleanly completed and is now
+				// waiting for the user. Use the last assistant message's stopReason to
+				// distinguish clean completion from error/cancellation.
+				const last = event.messages[event.messages.length - 1];
+				const stopReason: "completed" | "cancelled" | "error" | "blocked" =
+					last?.role === "assistant"
+						? last.stopReason === "aborted"
+							? "cancelled"
+							: last.stopReason === "error"
+								? "error"
+								: "completed"
+						: "completed";
+				await this._extensionRunner.emitStop({ reason: stopReason, lastMessage: last });
+			} finally {
+				this._processingAgentEnd = false;
+			}
 		} else if (event.type === "turn_start") {
 			const extensionEvent: TurnStartEvent = {
 				type: "turn_start",
@@ -1564,6 +1570,19 @@ export class AgentSession {
 		}
 	}
 
+	private async _settleCurrentTurnForSessionTransition(): Promise<void> {
+		if (this._processingAgentEnd) {
+			await this.agent.waitForIdle();
+			return;
+		}
+
+		// #4243: Normal session transitions must abort before disconnecting so
+		// message_end/agent_end events fire while listeners are still connected.
+		// During agent_end handling the turn is already ending; aborting there can
+		// convert a successful auto-mode handoff into an aborted provider message.
+		await this.abort();
+	}
+
 	/**
 	 * Start a new session, optionally with initial messages and parent tracking.
 	 * Clears all messages and starts a new session.
@@ -1592,10 +1611,7 @@ export class AgentSession {
 			}
 		}
 
-	// #4243: Must call abort() BEFORE _disconnectFromAgent() so that
-	// message_end/agent_end events fire and the #4216 finalization code
-	// can run before we unsubscribe from the event bus.
-	await this.abort();
+		await this._settleCurrentTurnForSessionTransition();
 
 		// #3731: If the caller aborted (e.g. runUnit() timed out and restored cwd to
 		// project root), discard this session before capturing process.cwd() and
@@ -1605,8 +1621,8 @@ export class AgentSession {
 			return false;
 		}
 
-	this._disconnectFromAgent();
-	this.agent.reset();
+		this._disconnectFromAgent();
+		this.agent.reset();
 		// Update cwd to current process directory — auto-mode may have chdir'd
 		// into a worktree since the original session was created.
 		const previousCwd = this._cwd;
@@ -2457,12 +2473,9 @@ export class AgentSession {
 			}
 		}
 
-	// #4243: Must call abort() BEFORE _disconnectFromAgent() so that
-	// message_end/agent_end events fire and the #4216 finalization code
-	// can run before we unsubscribe from the event bus.
-	await this.abort();
-	this._disconnectFromAgent();
-	this._steeringMessages = [];
+		await this._settleCurrentTurnForSessionTransition();
+		this._disconnectFromAgent();
+		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this._pendingNextTurnMessages = [];
 
