@@ -36,7 +36,7 @@ export function resolveExpectedArtifactPath(
     case "research-decision":
       return join(gsdRoot(base), "runtime", "research-decision.json");
     case "research-project":
-      return join(gsdRoot(base), "research");
+      return join(gsdRoot(base), "research", "PROJECT-RESEARCH-BLOCKER.md");
     case "discuss-milestone": {
       const dir = resolveMilestonePath(base, mid);
       return dir ? join(dir, buildMilestoneFileName(mid, "CONTEXT")) : null;

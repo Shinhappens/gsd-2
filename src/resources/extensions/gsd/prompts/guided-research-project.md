@@ -1,6 +1,6 @@
 **Working directory:** `{{workingDirectory}}`. All file reads, writes, and shell commands MUST operate relative to this directory. Do NOT `cd` to any other directory.
 
-Run **project-level domain research** in 4 parallel dimensions. Read `.gsd/PROJECT.md` and `.gsd/REQUIREMENTS.md` first — they define the scope of what to research. Then spawn 4 parallel `Task` calls (one per dimension), each writing its findings to `.gsd/research/`. This stage runs ONCE per project, after `discuss-requirements` and the `research-decision` gate, before any milestone-level work.
+Run **project-level domain research** in 4 parallel dimensions. Read `.gsd/PROJECT.md` and `.gsd/REQUIREMENTS.md` first — they define the scope of what to research. Then spawn 4 parallel `Task` calls (one per dimension) using agent class `scout`, each writing its findings to `.gsd/research/`. This stage runs ONCE per project, after `discuss-requirements` and the `research-decision` gate, before any milestone-level work.
 
 **Structured questions available: {{structuredQuestionsAvailable}}**
 
@@ -28,7 +28,7 @@ If either file is missing, STOP and emit: `"PROJECT.md or REQUIREMENTS.md missin
 
 ## Fan-out
 
-Issue **4 `Task` tool calls in a single assistant response** (one tool block containing four `Task` invocations). The tool runtime executes them concurrently — that is the parallelism mechanism here. Do not split them across multiple turns; do not chain them sequentially. After issuing the four calls, wait for ALL of their tool results to come back before doing anything in the "After fan-out completes" step below.
+Issue **4 `Task` tool calls in a single assistant response** (one tool block containing four `Task` invocations). Use `agent: "scout"` for every task. Do not use `agent: "researcher"` — this unit runs under the `planning-dispatch` tools-policy and only `scout` is permitted for project research. The tool runtime executes the calls concurrently — that is the parallelism mechanism here. Do not split them across multiple turns; do not chain them sequentially. After issuing the four calls, wait for ALL of their tool results to come back before doing anything in the "After fan-out completes" step below.
 
 Each task gets its own focused prompt. Each task writes one file.
 

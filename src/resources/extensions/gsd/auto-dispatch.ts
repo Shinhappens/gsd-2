@@ -129,6 +129,7 @@ export interface DispatchRule {
 }
 
 const PROJECT_RESEARCH_DIMENSIONS = ["STACK", "FEATURES", "ARCHITECTURE", "PITFALLS"] as const;
+const PROJECT_RESEARCH_BLOCKER = "PROJECT-RESEARCH-BLOCKER.md";
 
 function isProjectResearchDimensionSatisfied(researchDir: string, name: string): boolean {
   return (
@@ -138,6 +139,7 @@ function isProjectResearchDimensionSatisfied(researchDir: string, name: string):
 }
 
 function isProjectResearchComplete(researchDir: string): boolean {
+  if (existsSync(join(researchDir, PROJECT_RESEARCH_BLOCKER))) return true;
   return PROJECT_RESEARCH_DIMENSIONS.every((name) =>
     isProjectResearchDimensionSatisfied(researchDir, name),
   );

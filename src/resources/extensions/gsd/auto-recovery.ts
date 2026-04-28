@@ -40,6 +40,7 @@ import {
   resolveMilestoneFile,
   clearPathCache,
   resolveGsdRootFile,
+  gsdRoot,
 } from "./paths.js";
 import {
   existsSync,
@@ -67,6 +68,7 @@ export {
 // ─── Artifact Resolution & Verification ───────────────────────────────────────
 
 const PROJECT_RESEARCH_DIMENSIONS = ["STACK", "FEATURES", "ARCHITECTURE", "PITFALLS"] as const;
+const PROJECT_RESEARCH_BLOCKER = "PROJECT-RESEARCH-BLOCKER.md";
 
 function hasCapturedWorkflowPrefs(base: string): boolean {
   const prefsPath = resolveExpectedArtifactPath("workflow-preferences", "WORKFLOW-PREFS", base);
@@ -88,8 +90,9 @@ function hasValidResearchDecision(base: string): boolean {
 }
 
 function hasCompleteProjectResearch(base: string): boolean {
-  const researchDir = resolveExpectedArtifactPath("research-project", "PROJECT-RESEARCH", base);
-  if (!researchDir || !existsSync(researchDir)) return false;
+  const researchDir = join(gsdRoot(base), "research");
+  if (!existsSync(researchDir)) return false;
+  if (existsSync(join(researchDir, PROJECT_RESEARCH_BLOCKER))) return true;
   return PROJECT_RESEARCH_DIMENSIONS.every((name) =>
     existsSync(join(researchDir, `${name}.md`)) ||
     existsSync(join(researchDir, `${name}-BLOCKER.md`)),

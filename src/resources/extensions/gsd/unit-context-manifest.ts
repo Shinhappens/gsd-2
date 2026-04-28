@@ -664,8 +664,8 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     },
     maxSystemPromptChars: COMMON_BUDGET_SMALL,
   },
-  // research-project: orchestrator that fans out 4 parallel research
-  // subagents (stack, features, architecture, pitfalls). Needs the
+  // research-project: orchestrator that fans out 4 parallel scout subagents
+  // for project research (stack, features, architecture, pitfalls). Needs the
   // planning-dispatch policy to dispatch them. PROJECT.md + REQUIREMENTS.md
   // give the orchestrator the framing context.
   "research-project": {
@@ -674,7 +674,7 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     memory: "prompt-relevant",
     codebaseMap: true,
     preferences: "active-only",
-    tools: { mode: "planning-dispatch", allowedSubagents: ["scout", "researcher"] },
+    tools: { mode: "planning-dispatch", allowedSubagents: ["scout"] },
     artifacts: {
       inline: ["project", "requirements", "templates"],
       excerpt: [],

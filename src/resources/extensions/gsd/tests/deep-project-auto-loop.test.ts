@@ -10,7 +10,7 @@ import { runPreDispatch } from "../auto/phases.ts";
 import { AutoSession } from "../auto/session.ts";
 import { bootstrapAutoSession } from "../auto-start.ts";
 import { postUnitPreVerification } from "../auto-post-unit.ts";
-import { verifyExpectedArtifact } from "../auto-recovery.ts";
+import { resolveExpectedArtifactPath, verifyExpectedArtifact, writeBlockerPlaceholder } from "../auto-recovery.ts";
 import {
   clearPendingAutoStart,
   checkDeepProjectSetupAfterTurn,
@@ -532,6 +532,28 @@ test("deep project setup: project-level units verify their real artifacts", () =
     writeFileSync(join(researchDir, "ARCHITECTURE.md"), "# Architecture\n");
     assert.equal(verifyExpectedArtifact("research-project", "PROJECT-RESEARCH", base), false);
     writeFileSync(join(researchDir, "PITFALLS-BLOCKER.md"), "# Blocked\n");
+    assert.equal(verifyExpectedArtifact("research-project", "PROJECT-RESEARCH", base), true);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("deep project setup: research-project blocker placeholder is a file, not the research directory", () => {
+  const base = makeBase();
+  try {
+    const expectedPath = resolveExpectedArtifactPath("research-project", "PROJECT-RESEARCH", base);
+    assert.equal(expectedPath, join(base, ".gsd", "research", "PROJECT-RESEARCH-BLOCKER.md"));
+
+    mkdirSync(join(base, ".gsd", "research"), { recursive: true });
+    const diagnosis = writeBlockerPlaceholder(
+      "research-project",
+      "PROJECT-RESEARCH",
+      base,
+      "test recovery",
+    );
+
+    assert.match(diagnosis ?? "", /research/i);
+    assert.equal(existsSync(join(base, ".gsd", "research", "PROJECT-RESEARCH-BLOCKER.md")), true);
     assert.equal(verifyExpectedArtifact("research-project", "PROJECT-RESEARCH", base), true);
   } finally {
     rmSync(base, { recursive: true, force: true });

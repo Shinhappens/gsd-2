@@ -119,6 +119,21 @@ test("workflow preferences prompt writes defaults without interactive questions"
   assert.doesNotMatch(prompt, /Ask all five questions/i);
 });
 
+test("project research prompt dispatches scout agents allowed by planning-dispatch", () => {
+  const prompt = readPrompt("guided-research-project");
+  assert.match(prompt, /agent:\s*"scout"/);
+  assert.match(prompt, /Do not use `agent: "researcher"`/);
+});
+
+test("slice planning prompts name scout for external research dispatch", () => {
+  const planSlice = readPrompt("plan-slice");
+  const refineSlice = readPrompt("refine-slice");
+  assert.match(planSlice, /dispatch the \*\*scout\*\* agent/);
+  assert.match(refineSlice, /dispatch the \*\*scout\*\* agent/);
+  assert.doesNotMatch(planSlice, /dispatch the \*\*researcher\*\* agent/);
+  assert.doesNotMatch(refineSlice, /dispatch the \*\*researcher\*\* agent/);
+});
+
 test("guided project prompt writes root PROJECT artifact, not PROJECT milestone", () => {
   const prompt = readPrompt("guided-discuss-project");
   assert.match(prompt, /artifact_type:\s*"PROJECT"/);
