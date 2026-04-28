@@ -371,8 +371,8 @@ export function findEvalReviewFile(
  * template to fill, and it embeds the scoring rubric with the explicit
  * anti-Goodhart language: string presence is not evidence; cite an executed
  * code path or a test that exercises the dimension. The rubric weights
- * (60% coverage, 40% infrastructure) are documented in
- * `docs/dev/ADR-011-eval-review-scoring.md`.
+ * (60% coverage, 40% infrastructure) and the rationale for that split are
+ * inlined in the prompt body itself and in `docs/user-docs/eval-review.md`.
  *
  * @param ctx - prompt context built by {@link buildEvalReviewContext}.
  * @returns the fully-formed prompt as a single markdown string.
@@ -457,9 +457,10 @@ dimensions require: a logging provider, a metrics sink, an eval harness,
 training/evaluation datasets. Lower weight because infrastructure tends
 toward binary: it's either wired up or not, and adding it is mechanical.
 
-The 60/40 split is justified in \`docs/dev/ADR-011-eval-review-scoring.md\`.
-Alternatives considered: 50/50 (under-rewards behavior verification),
-70/30 (over-penalizes greenfield slices that haven't yet built infra).
+Alternatives considered for the split: 50/50 under-rewards behavior
+verification; 70/30 over-penalizes greenfield slices that haven't yet
+built the infrastructure layer. 60/40 keeps coverage decisive without
+flooring early slices.
 
 ## Anti-Goodhart Rule (read carefully)
 

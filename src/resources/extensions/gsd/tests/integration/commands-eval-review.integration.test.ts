@@ -129,7 +129,7 @@ describe("integration: /gsd eval-review helper chain on a real on-disk slice", (
     assert.ok(prompt.includes("NOT_IMPLEMENTED"));
     assert.ok(prompt.includes("0.6"));
     assert.ok(prompt.includes("0.4"));
-    assert.ok(prompt.includes("ADR-011"));
+    assert.ok(prompt.includes("Alternatives considered"));
     assert.ok(prompt.includes("Anti-Goodhart"));
 
     // Slice content was inlined verbatim — pick anchors that don't span line breaks.

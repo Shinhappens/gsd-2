@@ -52,9 +52,9 @@ export const DIMENSION_VALUES = [
 export const MIN_SCORE = 0;
 /** Upper bound for any score in the schema. */
 export const MAX_SCORE = 100;
-/** Coverage's contribution to overall_score. See ADR-011 for rationale. */
+/** Coverage's contribution to overall_score. See `docs/user-docs/eval-review.md` for rationale. */
 export const COVERAGE_WEIGHT = 0.6;
-/** Infrastructure's contribution to overall_score. See ADR-011 for rationale. */
+/** Infrastructure's contribution to overall_score. See `docs/user-docs/eval-review.md` for rationale. */
 export const INFRASTRUCTURE_WEIGHT = 0.4;
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
@@ -192,7 +192,7 @@ export function parseEvalReviewFrontmatter(raw: string): ParseResult {
 
 /**
  * Compute `overall_score` from the two component scores using the rubric
- * weights documented in ADR-011.
+ * weights documented in `docs/user-docs/eval-review.md`.
  *
  * The handler always recomputes this value rather than trusting whatever the
  * LLM emitted in `overall_score`. If the LLM-emitted value disagrees with the
@@ -223,7 +223,7 @@ export function deriveCounts(gaps: readonly EvalReviewGapT[]): EvalReviewCountsT
 
 /**
  * Map a numeric overall_score to its verdict literal using the bands from
- * ADR-011: ≥80 PRODUCTION_READY, 60..79 NEEDS_WORK, 40..59 SIGNIFICANT_GAPS,
+ * Bands per `docs/user-docs/eval-review.md`: ≥80 PRODUCTION_READY, 60..79 NEEDS_WORK, 40..59 SIGNIFICANT_GAPS,
  * <40 NOT_IMPLEMENTED.
  *
  * @param overall - integer 0..100.

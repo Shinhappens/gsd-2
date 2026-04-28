@@ -413,11 +413,14 @@ describe("buildEvalReviewPrompt", () => {
     assert.ok(prompt.includes("truncated"));
   });
 
-  it("documents the 60/40 weighting alongside the rubric", () => {
+  it("documents the 60/40 weighting alongside the rubric and explains the split", () => {
     const prompt = buildEvalReviewPrompt(ctxFixture());
     assert.ok(prompt.includes("0.6"));
     assert.ok(prompt.includes("0.4"));
-    assert.ok(prompt.includes("ADR-011"));
+    // Rationale must be present in the prompt body — the rubric is not just
+    // numbers, the auditor needs to know WHY coverage gaps are weighted higher.
+    assert.ok(prompt.toLowerCase().includes("compound"));
+    assert.ok(prompt.includes("Alternatives considered"));
   });
 
   it("falls back to a best-practices note when AI-SPEC.md is absent", () => {
