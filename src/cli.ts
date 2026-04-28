@@ -15,6 +15,7 @@ import { shouldRunOnboarding, runOnboarding } from './onboarding.js'
 import chalk from 'chalk'
 import { checkForUpdates } from './update-check.js'
 import { shouldBypassManagedResourceMismatchGate } from './cli-policy.js'
+import { shouldRedirectAutoToHeadless } from './cli-auto-routing.js'
 import { printHelp, printSubcommandHelp } from './help-text.js'
 import { applySecurityOverrides } from './security-overrides.js'
 import { validateConfiguredModel } from './startup-model-validation.js'
@@ -454,10 +455,10 @@ function flushPendingProviderRegistrations(resourceLoader: DefaultResourceLoader
   runtime.pendingProviderRegistrations = []
 }
 
-// `gsd auto [args...]` — shorthand for `gsd headless auto [args...]` (#2732)
-// Without this, `gsd auto` falls through to the interactive TUI which hangs
-// when stdin/stdout are piped (non-TTY environments).
-if (cliFlags.messages[0] === 'auto') {
+// `gsd auto [args...]` with piped stdin/stdout — shorthand for
+// `gsd headless auto [args...]` (#2732). Keep terminal TTY launches in the
+// interactive path so Warp/iTerm/Terminal retain foreground ownership.
+if (shouldRedirectAutoToHeadless(cliFlags.messages[0], process.stdin.isTTY, process.stdout.isTTY)) {
   await runHeadlessFromAuto(buildHeadlessAutoArgs(cliFlags))
 }
 
@@ -738,17 +739,6 @@ if (!cliFlags.worktree && !isPrintMode) {
   } catch { /* non-fatal */ }
 }
 markStartup('worktreeStatusBanner')
-
-// ---------------------------------------------------------------------------
-// Auto-redirect: `gsd auto` with piped stdout → headless mode (#2732)
-// When stdout is not a TTY (e.g. `gsd auto | cat`, `gsd auto > file`),
-// the TUI cannot render and the process hangs. Redirect to headless mode
-// which handles non-interactive output gracefully.
-// ---------------------------------------------------------------------------
-if (cliFlags.messages[0] === 'auto' && !process.stdout.isTTY) {
-  process.stderr.write('[gsd] stdout is not a terminal — running auto-mode in headless mode.\n')
-  await runHeadlessFromAuto(cliFlags.messages.slice(1))
-}
 
 // ---------------------------------------------------------------------------
 // Interactive mode — normal TTY session
