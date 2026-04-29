@@ -203,6 +203,32 @@ function isWorkflowPrefsCaptured(basePath: string): boolean {
   return /^workflow_prefs_captured:\s*true\s*$/m.test(match[1]);
 }
 
+function maybeAutoSkipWorkflowDefaultedTrivialResearch(
+  basePath: string,
+  decisionSource: string | undefined,
+): boolean {
+  if (decisionSource !== "workflow-preferences") return false;
+  const root = gsdRoot(basePath);
+  const projectPath = join(root, "PROJECT.md");
+  const requirementsPath = join(root, "REQUIREMENTS.md");
+  if (!existsSync(projectPath) || !existsSync(requirementsPath)) return false;
+  if (!validateArtifact(projectPath, "project").ok) return false;
+  if (!validateArtifact(requirementsPath, "requirements").ok) return false;
+
+  try {
+    const classification = classifyProjectResearchScope(
+      readFileSync(projectPath, "utf-8"),
+      readFileSync(requirementsPath, "utf-8"),
+    );
+    if (classification.variant !== "trivial") return false;
+    writeProjectResearchAutoSkipDecision(basePath, classification);
+    return true;
+  } catch (err) {
+    logWarning("dispatch", `project research fast-path classification failed — running research: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
 /**
  * Deep planning mode: check whether any project-level stage gate
  * (workflow-preferences, discuss-project, discuss-requirements,
@@ -279,6 +305,7 @@ export function getDeepStageGate(prefs: GSDPreferences | undefined, basePath: st
   try {
     const cfg = JSON.parse(readFileSync(decisionPath, "utf-8")) as Record<string, unknown>;
     const decision = typeof cfg.decision === "string" ? cfg.decision : undefined;
+    const decisionSource = typeof cfg.source === "string" ? cfg.source : undefined;
     if (decision !== "research" && decision !== "skip") {
       return {
         status: "pending",
@@ -287,6 +314,13 @@ export function getDeepStageGate(prefs: GSDPreferences | undefined, basePath: st
       };
     }
     if (decision === "research") {
+      if (maybeAutoSkipWorkflowDefaultedTrivialResearch(basePath, decisionSource)) {
+        return {
+          status: "complete",
+          stage: null,
+          reason: "Trivial workflow-defaulted project research was auto-skipped.",
+        };
+      }
       const researchStatus = getProjectResearchStatus(basePath);
       if (researchStatus.globalBlocker) {
         return {
@@ -786,26 +820,7 @@ export const DISPATCH_RULES: DispatchRule[] = [
         return null;
       }
       if (decision !== "research") return null; // user picked "skip" — fall through
-      try {
-        const projectPath = join(gsdRoot(basePath), "PROJECT.md");
-        if (
-          decisionSource === "workflow-preferences" &&
-          existsSync(projectPath) &&
-          validateArtifact(projectPath, "project").ok &&
-          validateArtifact(requirementsPath, "requirements").ok
-        ) {
-          const classification = classifyProjectResearchScope(
-            readFileSync(projectPath, "utf-8"),
-            readFileSync(requirementsPath, "utf-8"),
-          );
-          if (classification.variant === "trivial") {
-            writeProjectResearchAutoSkipDecision(basePath, classification);
-            return null;
-          }
-        }
-      } catch (err) {
-        logWarning("dispatch", `project research fast-path classification failed — running research: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      if (maybeAutoSkipWorkflowDefaultedTrivialResearch(basePath, decisionSource)) return null;
       const researchStatus = getProjectResearchStatus(basePath);
       if (researchStatus.blocked) {
         const blockerReason = researchStatus.globalBlocker

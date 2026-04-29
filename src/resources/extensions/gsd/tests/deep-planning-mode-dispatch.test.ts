@@ -597,6 +597,43 @@ test("Deep mode: research-project auto-skips tiny static apps when research was 
   assert.equal(getDeepStageGate(prefs, base).status, "complete");
 });
 
+test("Deep mode gate auto-skips tiny static apps even with stale research blockers", (t) => {
+  const base = makeIsolatedBaseWithCleanup(t);
+
+  writeFileSync(
+    join(base, ".gsd", "PREFERENCES.md"),
+    "---\nplanning_depth: deep\nworkflow_prefs_captured: true\n---\n",
+  );
+  writeTinyTodoProject(base);
+  mkdirSync(join(base, ".gsd", "runtime"), { recursive: true });
+  writeFileSync(
+    join(base, ".gsd", "runtime", "research-decision.json"),
+    JSON.stringify({
+      decision: "research",
+      decided_at: "2026-04-27T00:00:00Z",
+      source: "workflow-preferences",
+    }),
+  );
+  mkdirSync(join(base, ".gsd", "research"), { recursive: true });
+  for (const name of ["STACK", "FEATURES", "ARCHITECTURE", "PITFALLS"]) {
+    writeFileSync(join(base, ".gsd", "research", `${name}-BLOCKER.md`), "# blocked\n");
+  }
+
+  const prefs = { planning_depth: "deep" } as GSDPreferences;
+  const gate = getDeepStageGate(prefs, base);
+
+  assert.deepEqual(
+    { status: gate.status, stage: gate.stage },
+    { status: "complete", stage: null },
+    "workflow-defaulted tiny apps should not get trapped by stale research blockers",
+  );
+  assert.equal(hasPendingDeepStage(prefs, base), false);
+  const decision = JSON.parse(readFileSync(join(base, ".gsd", "runtime", "research-decision.json"), "utf-8"));
+  assert.equal(decision.decision, "skip");
+  assert.equal(decision.source, "project-research-fast-path");
+  assert.equal(decision.previous_source, "workflow-preferences");
+});
+
 test("Deep mode: research-project honors explicit research decisions for tiny static apps", async (t) => {
   const base = makeIsolatedBaseWithCleanup(t);
 
