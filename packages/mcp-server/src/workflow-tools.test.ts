@@ -107,6 +107,42 @@ describe("workflow MCP tools", () => {
     }
   });
 
+  it("gsd_summary_save supports root-level PROJECT artifacts without milestone_id", async () => {
+    const base = makeTmpBase();
+    try {
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const tool = server.tools.find((t) => t.name === "gsd_summary_save");
+      assert.ok(tool, "summary tool should be registered");
+
+      const milestoneParam = tool!.params.milestone_id as { isOptional?: () => boolean };
+      assert.equal(
+        milestoneParam.isOptional?.(),
+        true,
+        "workflow MCP schema must advertise milestone_id as optional for root artifacts",
+      );
+
+      const result = await tool!.handler({
+        projectDir: base,
+        artifact_type: "PROJECT",
+        content: "# Project\n\nRoot artifact",
+      });
+
+      const text = (result as any).content[0].text as string;
+      assert.match(text, /Saved PROJECT artifact/);
+      assert.ok(
+        existsSync(join(base, ".gsd", "PROJECT.md")),
+        "root project artifact should exist on disk",
+      );
+      assert.equal(
+        readFileSync(join(base, ".gsd", "PROJECT.md"), "utf-8"),
+        "# Project\n\nRoot artifact",
+      );
+    } finally {
+      cleanup(base);
+    }
+  });
+
   it("rejects workflow tool calls outside the configured project root", async () => {
     const base = makeTmpBase();
     const otherBase = makeTmpBase();

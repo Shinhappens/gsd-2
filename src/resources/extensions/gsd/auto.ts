@@ -1186,6 +1186,19 @@ export async function pauseAuto(
     s.currentUnit = null;
   }
 
+  // Keep STATE.md aligned with the DB-backed state before releasing pause state.
+  // Without this, an interrupted deep run can leave STATE.md saying "no active
+  // milestone" even after the DB/disk reconciliation has recovered the next unit.
+  if (s.basePath) {
+    try {
+      await rebuildState(s.basePath);
+    } catch (e) {
+      debugLog("pause-rebuild-state-failed", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   if (lockBase()) {
     releaseSessionLock(lockBase());
     clearLock(lockBase());

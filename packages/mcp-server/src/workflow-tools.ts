@@ -192,7 +192,7 @@ type WorkflowToolExecutors = {
   ) => Promise<unknown>;
   executeSummarySave: (
     params: {
-      milestone_id: string;
+      milestone_id?: string;
       slice_id?: string;
       task_id?: string;
       artifact_type: string;
@@ -1188,10 +1188,10 @@ const sliceCompleteSchema = z.object(sliceCompleteParams);
 
 const summarySaveParams = {
   projectDir: projectDirParam,
-  milestone_id: z.string().describe("Milestone ID (e.g. M001)"),
+  milestone_id: z.string().optional().describe("Milestone ID (e.g. M001). Omit only for root-level PROJECT/PROJECT-DRAFT/REQUIREMENTS/REQUIREMENTS-DRAFT artifacts."),
   slice_id: z.string().optional().describe("Slice ID (e.g. S01)"),
   task_id: z.string().optional().describe("Task ID (e.g. T01)"),
-  artifact_type: z.string().describe("Artifact type to save (SUMMARY, RESEARCH, CONTEXT, ASSESSMENT, CONTEXT-DRAFT)"),
+  artifact_type: z.string().describe("Artifact type to save (SUMMARY, RESEARCH, CONTEXT, ASSESSMENT, CONTEXT-DRAFT, PROJECT, PROJECT-DRAFT, REQUIREMENTS, REQUIREMENTS-DRAFT)"),
   content: z.string().describe("The full markdown content of the artifact"),
 };
 const summarySaveSchema = z.object(summarySaveParams);
@@ -1669,12 +1669,12 @@ export function registerWorkflowTools(server: McpToolServer): void {
 
   server.tool(
     "gsd_summary_save",
-    "Save a GSD summary/research/context/assessment artifact to the database and disk.",
+    "Save a GSD summary/research/context/assessment artifact to the database and disk. Omit milestone_id only for root-level PROJECT/PROJECT-DRAFT/REQUIREMENTS/REQUIREMENTS-DRAFT artifacts.",
     summarySaveParams,
     async (args: Record<string, unknown>) => {
       const parsed = parseWorkflowArgs(summarySaveSchema, args);
       const { projectDir, milestone_id, slice_id, task_id, artifact_type, content } = parsed;
-      await enforceWorkflowWriteGate("gsd_summary_save", projectDir, milestone_id);
+      await enforceWorkflowWriteGate("gsd_summary_save", projectDir, milestone_id ?? null);
       const executors = await getWorkflowToolExecutors();
       const supportedArtifactTypes = getSupportedSummaryArtifactTypes(executors);
       if (!supportedArtifactTypes.includes(artifact_type)) {
