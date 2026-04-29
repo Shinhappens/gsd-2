@@ -23,7 +23,18 @@ import { execFileSync } from 'node:child_process';
 //     remove/rename invalidates the cache automatically.
 
 const GSD_ROOT_TTL_MS = 30_000;
+const MAX_CACHE_ENTRIES = 256;
 const gsdRootCache = new Map<string, { value: string; expiresAt: number }>();
+
+function setBoundedCache<K, V>(cache: Map<K, V>, key: K, value: V): void {
+  if (cache.has(key)) cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > MAX_CACHE_ENTRIES) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    cache.delete(oldest.value);
+  }
+}
 
 function cachedGsdRoot(projectDir: string): string | null {
   const hit = gsdRootCache.get(projectDir);
@@ -32,11 +43,12 @@ function cachedGsdRoot(projectDir: string): string | null {
     gsdRootCache.delete(projectDir);
     return null;
   }
+  setBoundedCache(gsdRootCache, projectDir, hit);
   return hit.value;
 }
 
 function rememberGsdRoot(projectDir: string, value: string): void {
-  gsdRootCache.set(projectDir, { value, expiresAt: Date.now() + GSD_ROOT_TTL_MS });
+  setBoundedCache(gsdRootCache, projectDir, { value, expiresAt: Date.now() + GSD_ROOT_TTL_MS });
 }
 
 interface MtimeEntry<V> { mtimeMs: number; value: V }
@@ -53,6 +65,8 @@ function readWithMtimeCache<V>(
   cacheKey: string,
   dir: string,
   compute: () => V,
+  cloneForStore: (value: V) => V = (value) => value,
+  cloneForReturn: (value: V) => V = (value) => value,
 ): V {
   let mtimeMs: number;
   try {
@@ -62,10 +76,13 @@ function readWithMtimeCache<V>(
     return compute();
   }
   const hit = cache.get(cacheKey);
-  if (hit && hit.mtimeMs === mtimeMs) return hit.value;
-  const value = compute();
-  cache.set(cacheKey, { mtimeMs, value });
-  return value;
+  if (hit && hit.mtimeMs === mtimeMs) {
+    setBoundedCache(cache, cacheKey, hit);
+    return cloneForReturn(hit.value);
+  }
+  const value = cloneForStore(compute());
+  setBoundedCache(cache, cacheKey, { mtimeMs, value });
+  return cloneForReturn(value);
 }
 
 const milestoneIdsCache = new Map<string, MtimeEntry<string[]>>();
@@ -73,6 +90,16 @@ const milestoneDirCache = new Map<string, MtimeEntry<string | null>>();
 const sliceIdsCache = new Map<string, MtimeEntry<string[]>>();
 const sliceDirCache = new Map<string, MtimeEntry<string | null>>();
 const taskFilesCache = new Map<string, MtimeEntry<Array<{ id: string; hasPlan: boolean; hasSummary: boolean }>>>();
+
+function cloneStringArray(value: string[]): string[] {
+  return Array.from(value);
+}
+
+function cloneTaskFiles(
+  value: Array<{ id: string; hasPlan: boolean; hasSummary: boolean }>,
+): Array<{ id: string; hasPlan: boolean; hasSummary: boolean }> {
+  return value.map((task) => ({ ...task }));
+}
 
 /** @internal — exported for testing only */
 export function _resetReaderCaches(): void {
@@ -164,7 +191,7 @@ export function findMilestoneIds(gsdRoot: string): string[] {
       if (match) ids.push(match[1]);
     }
     return ids.sort();
-  });
+  }, cloneStringArray, cloneStringArray);
 }
 
 /**
@@ -232,7 +259,7 @@ export function findSliceIds(gsdRoot: string, milestoneId: string): string[] {
       if (match) ids.push(match[1]);
     }
     return ids.sort();
-  });
+  }, cloneStringArray, cloneStringArray);
 }
 
 /** Resolve the actual directory for a slice */
@@ -304,5 +331,5 @@ export function findTaskFiles(
     return Array.from(taskMap.entries())
       .map(([id, info]) => ({ id, ...info }))
       .sort((a, b) => a.id.localeCompare(b.id));
-  });
+  }, cloneTaskFiles, cloneTaskFiles);
 }

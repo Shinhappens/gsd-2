@@ -161,7 +161,7 @@ const SECURITY_SENSITIVE_KEYS = new Set<string>([
 ]);
 
 export function isSecuritySensitiveEnvKey(key: string): boolean {
-  return SECURITY_SENSITIVE_KEYS.has(key);
+  return SECURITY_SENSITIVE_KEYS.has(key.toUpperCase());
 }
 
 export function isSupportedDeploymentEnvironment(env: string): boolean {
@@ -229,6 +229,10 @@ export async function applySecrets(
 
   if (destination === "dotenv") {
     for (const { key, value } of provided) {
+      if (!isSafeEnvVarKey(key)) {
+        errors.push(`${key}: invalid environment variable name`);
+        continue;
+      }
       if (isSecuritySensitiveEnvKey(key)) {
         errors.push(`${key}: refusing to set MCP server runtime variable via secure_env_collect`);
         continue;

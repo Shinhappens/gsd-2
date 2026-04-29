@@ -12,7 +12,9 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolve } from 'node:path';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, join, resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
 
 import { SessionManager } from './session-manager.js';
@@ -582,7 +584,22 @@ describe('SessionManager.resolveCLIPath', () => {
     assert.equal(result, resolve('/custom/path/to/gsd'));
   });
 
-  it('throws when GSD_CLI_PATH not set and which fails', () => {
+  it('finds gsd on PATH without shelling out to which', () => {
+    delete process.env['GSD_CLI_PATH'];
+    const tmp = mkdtempSync(join(tmpdir(), 'gsd-cli-path-'));
+    try {
+      const shimName = process.platform === 'win32' ? 'gsd.cmd' : 'gsd';
+      const shimPath = join(tmp, shimName);
+      writeFileSync(shimPath, '', 'utf8');
+      process.env['PATH'] = [tmp, originalPath].filter(Boolean).join(delimiter);
+
+      assert.equal(SessionManager.resolveCLIPath(), resolve(shimPath));
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('throws when GSD_CLI_PATH not set and PATH lookup fails', () => {
     delete process.env['GSD_CLI_PATH'];
     process.env['PATH'] = '/nonexistent';
     assert.throws(

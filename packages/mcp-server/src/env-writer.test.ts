@@ -12,6 +12,7 @@ import {
   detectDestination,
   writeEnvKey,
   applySecrets,
+  isSecuritySensitiveEnvKey,
   isSafeEnvVarKey,
   isSupportedDeploymentEnvironment,
   resolveProjectEnvFilePath,
@@ -295,6 +296,41 @@ describe('applySecrets', () => {
     }
   });
 
+  it('rejects invalid dotenv keys before writing or hydrating', async () => {
+    const tmp = makeTempDir('apply-invalid');
+    const envPath = join(tmp, '.env');
+    try {
+      const { applied, errors } = await applySecrets(
+        [{ key: 'BAD-KEY', value: 'val-a' }],
+        'dotenv',
+        { envFilePath: envPath },
+      );
+      assert.deepStrictEqual(applied, []);
+      assert.deepStrictEqual(errors, ['BAD-KEY: invalid environment variable name']);
+      assert.throws(() => readFileSync(envPath, 'utf8'), /ENOENT/);
+      assert.equal(process.env['BAD-KEY'], undefined);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects security-sensitive dotenv keys case-insensitively', async () => {
+    const tmp = makeTempDir('apply-sensitive');
+    const envPath = join(tmp, '.env');
+    try {
+      const { applied, errors } = await applySecrets(
+        [{ key: 'path', value: 'malicious-bin' }],
+        'dotenv',
+        { envFilePath: envPath },
+      );
+      assert.deepStrictEqual(applied, []);
+      assert.deepStrictEqual(errors, ['path: refusing to set MCP server runtime variable via secure_env_collect']);
+      assert.throws(() => readFileSync(envPath, 'utf8'), /ENOENT/);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it('returns errors for invalid vercel environment', async () => {
     const tmp = makeTempDir('apply');
     try {
@@ -331,6 +367,14 @@ describe('isSafeEnvVarKey', () => {
     assert.ok(!isSafeEnvVarKey('has-dash'));
     assert.ok(!isSafeEnvVarKey('has space'));
     assert.ok(!isSafeEnvVarKey(''));
+  });
+});
+
+describe('isSecuritySensitiveEnvKey', () => {
+  it('matches sensitive keys case-insensitively', () => {
+    assert.ok(isSecuritySensitiveEnvKey('PATH'));
+    assert.ok(isSecuritySensitiveEnvKey('path'));
+    assert.ok(isSecuritySensitiveEnvKey('Node_Options'));
   });
 });
 
