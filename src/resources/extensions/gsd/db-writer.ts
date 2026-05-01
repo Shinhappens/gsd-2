@@ -572,8 +572,8 @@ export async function saveDecisionToDb(
     // ADR-013 dual-write: keep the memory store in sync with every decision
     // persisted via the legacy gsd_save_decision path. Without this, prompts
     // that still call gsd_save_decision (discuss.md, plan-milestone.md,
-    // guided-plan-slice.md, et al. during the deprecation window) would
-    // create decisions rows invisible to memory_query and loadMemoryBlock.
+    // plan-slice.md, et al.) would create decisions rows invisible to
+    // memory_query and loadMemoryBlock.
     // Best-effort — never throw, never roll back the decision on failure.
     try {
       const { createMemory } = await import('./memory-store.js');

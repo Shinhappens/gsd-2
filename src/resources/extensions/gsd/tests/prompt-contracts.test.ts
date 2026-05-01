@@ -200,16 +200,6 @@ test("execute-task prompt still contains template variables for context", () => 
   assert.match(prompt, /\{\{planPath\}\}/);
 });
 
-test("guided-execute-task prompt references gsd_task_complete tool", () => {
-  const prompt = readPrompt("guided-execute-task");
-  assert.match(prompt, /gsd_task_complete/);
-});
-
-test("guided-execute-task prompt does not instruct manual file write", () => {
-  const prompt = readPrompt("guided-execute-task");
-  assert.doesNotMatch(prompt, /Write `?\{\{taskId\}\}-SUMMARY\.md`?.*mark it done/i);
-});
-
 // ─── Prompt migration: complete-slice → gsd_complete_slice ────────────
 
 test("complete-slice prompt references gsd_complete_slice tool", () => {
@@ -220,11 +210,6 @@ test("complete-slice prompt references gsd_complete_slice tool", () => {
 test("complete-slice prompt does not instruct LLM to toggle checkboxes manually", () => {
   const prompt = readPrompt("complete-slice");
   assert.doesNotMatch(prompt, /change \[ \] to \[x\]/);
-});
-
-test("guided-complete-slice prompt references gsd_slice_complete tool", () => {
-  const prompt = readPrompt("guided-complete-slice");
-  assert.match(prompt, /gsd_slice_complete/);
 });
 
 test("complete-slice prompt instructs writing summary and UAT files before tool call", () => {
@@ -264,12 +249,6 @@ test("plan-milestone prompt references DB-backed planning tool and explicitly fo
   const prompt = readPrompt("plan-milestone");
   assert.match(prompt, /gsd_plan_milestone/);
   assert.match(prompt, /Do \*\*not\*\* write `?\{\{outputPath\}\}`?, `?ROADMAP\.md`?, or other planning artifacts manually/i);
-});
-
-test("guided-plan-milestone prompt references DB-backed planning tool and explicitly forbids manual roadmap writes", () => {
-  const prompt = readPrompt("guided-plan-milestone");
-  assert.match(prompt, /gsd_plan_milestone/);
-  assert.match(prompt, /Do \*\*not\*\* write `?\{\{milestoneId\}\}-ROADMAP\.md`?, `?ROADMAP\.md`?, or other planning artifacts manually/i);
 });
 
 test("plan-slice prompt no longer frames direct PLAN writes as the source of truth", () => {
