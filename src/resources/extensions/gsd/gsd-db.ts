@@ -181,7 +181,7 @@ function openRawDb(path: string): unknown {
   return new Database(path);
 }
 
-export const SCHEMA_VERSION = 22;
+export const SCHEMA_VERSION = 23;
 
 function indexExists(db: DbAdapter, name: string): boolean {
   return !!db.prepare(
@@ -354,7 +354,8 @@ function initSchema(db: DbAdapter, fileBacked: boolean): void {
         verification_uat TEXT NOT NULL DEFAULT '',
         definition_of_done TEXT NOT NULL DEFAULT '[]',
         requirement_coverage TEXT NOT NULL DEFAULT '',
-        boundary_map_markdown TEXT NOT NULL DEFAULT ''
+        boundary_map_markdown TEXT NOT NULL DEFAULT '',
+        sequence INTEGER DEFAULT 0
       )
     `);
 
@@ -1229,6 +1230,17 @@ function migrateSchema(db: DbAdapter): void {
       ensureColumn(db, "assessments", "scope", "ALTER TABLE assessments ADD COLUMN scope TEXT NOT NULL DEFAULT ''");
       db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)").run({
         ":version": 22,
+        ":applied_at": new Date().toISOString(),
+      });
+    }
+
+    if (currentVersion < 23) {
+      // v23: milestone queue ordering moves into the canonical DB. The
+      // historical QUEUE-ORDER.json file remains a projection, but runtime
+      // derivation must not read it as authoritative state.
+      ensureColumn(db, "milestones", "sequence", "ALTER TABLE milestones ADD COLUMN sequence INTEGER DEFAULT 0");
+      db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)").run({
+        ":version": 23,
         ":applied_at": new Date().toISOString(),
       });
     }
@@ -2497,6 +2509,7 @@ export interface MilestoneRow {
   definition_of_done: string[];
   requirement_coverage: string;
   boundary_map_markdown: string;
+  sequence: number;
 }
 
 function rowToMilestone(row: Record<string, unknown>): MilestoneRow {
@@ -2518,6 +2531,7 @@ function rowToMilestone(row: Record<string, unknown>): MilestoneRow {
     definition_of_done: JSON.parse((row["definition_of_done"] as string) || "[]"),
     requirement_coverage: (row["requirement_coverage"] as string) ?? "",
     boundary_map_markdown: (row["boundary_map_markdown"] as string) ?? "",
+    sequence: Number(row["sequence"] ?? 0),
   };
 }
 
@@ -2545,7 +2559,9 @@ function rowToArtifact(row: Record<string, unknown>): ArtifactRow {
 
 export function getAllMilestones(): MilestoneRow[] {
   if (!currentDb) return [];
-  const rows = currentDb.prepare("SELECT * FROM milestones ORDER BY id").all();
+  const rows = currentDb.prepare(
+    "SELECT * FROM milestones ORDER BY CASE WHEN sequence > 0 THEN 0 ELSE 1 END, sequence, id",
+  ).all();
   return rows.map(rowToMilestone);
 }
 
@@ -2554,6 +2570,22 @@ export function getMilestone(id: string): MilestoneRow | null {
   const row = currentDb.prepare("SELECT * FROM milestones WHERE id = :id").get({ ":id": id });
   if (!row) return null;
   return rowToMilestone(row);
+}
+
+export function setMilestoneQueueOrder(order: string[]): void {
+  if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
+  currentDb.exec("BEGIN IMMEDIATE");
+  try {
+    currentDb.prepare("UPDATE milestones SET sequence = 0").run();
+    const stmt = currentDb.prepare("UPDATE milestones SET sequence = :sequence WHERE id = :id");
+    order.forEach((id, index) => {
+      stmt.run({ ":id": id, ":sequence": index + 1 });
+    });
+    currentDb.exec("COMMIT");
+  } catch (err) {
+    currentDb.exec("ROLLBACK");
+    throw err;
+  }
 }
 
 /**
@@ -2751,6 +2783,8 @@ export function reconcileWorktreeDb(
       // fall through to the main DB's existing value (not a literal default)
       // so reconcile never silently clears state the main tree has recorded.
       const hasDecisionSource = wtInfo.some((col) => col["name"] === "source");
+      const wtMilestoneInfo = adapter.prepare("PRAGMA wt.table_info('milestones')").all();
+      const hasMilestoneSequence = wtMilestoneInfo.some((col) => col["name"] === "sequence");
       const wtSliceInfo = adapter.prepare("PRAGMA wt.table_info('slices')").all();
       const hasIsSketch = wtSliceInfo.some((col) => col["name"] === "is_sketch");
       const hasSketchScope = wtSliceInfo.some((col) => col["name"] === "sketch_scope");
@@ -2824,7 +2858,7 @@ export function reconcileWorktreeDb(
             id, title, status, depends_on, created_at, completed_at,
             vision, success_criteria, key_risks, proof_strategy,
             verification_contract, verification_integration, verification_operational, verification_uat,
-            definition_of_done, requirement_coverage, boundary_map_markdown
+            definition_of_done, requirement_coverage, boundary_map_markdown, sequence
           )
           SELECT w.id, w.title,
                  CASE
@@ -2842,7 +2876,8 @@ export function reconcileWorktreeDb(
                  END,
                  w.vision, w.success_criteria, w.key_risks, w.proof_strategy,
                  w.verification_contract, w.verification_integration, w.verification_operational, w.verification_uat,
-                 w.definition_of_done, w.requirement_coverage, w.boundary_map_markdown
+                 w.definition_of_done, w.requirement_coverage, w.boundary_map_markdown,
+                 ${hasMilestoneSequence ? "COALESCE(w.sequence, 0)" : "COALESCE(m.sequence, 0)"}
           FROM wt.milestones w
           LEFT JOIN milestones m ON m.id = w.id
         `).run());
@@ -3129,6 +3164,20 @@ export function getAssessment(path: string): Record<string, unknown> | null {
   const row = currentDb.prepare(
     `SELECT * FROM assessments WHERE path = :path`,
   ).get({ ":path": path });
+  return row ?? null;
+}
+
+export function getLatestAssessmentByScope(
+  milestoneId: string,
+  scope: string,
+): Record<string, unknown> | null {
+  if (!currentDb) return null;
+  const row = currentDb.prepare(
+    `SELECT * FROM assessments
+      WHERE milestone_id = :mid AND scope = :scope
+      ORDER BY created_at DESC
+      LIMIT 1`,
+  ).get({ ":mid": milestoneId, ":scope": scope });
   return row ?? null;
 }
 
@@ -3619,8 +3668,8 @@ export function restoreManifest(manifest: StateManifest): void {
       `INSERT INTO milestones (id, title, status, depends_on, created_at, completed_at,
         vision, success_criteria, key_risks, proof_strategy,
         verification_contract, verification_integration, verification_operational, verification_uat,
-        definition_of_done, requirement_coverage, boundary_map_markdown)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        definition_of_done, requirement_coverage, boundary_map_markdown, sequence)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const m of manifest.milestones) {
       msStmt.run(
@@ -3629,7 +3678,7 @@ export function restoreManifest(manifest: StateManifest): void {
         m.vision, JSON.stringify(m.success_criteria), JSON.stringify(m.key_risks),
         JSON.stringify(m.proof_strategy),
         m.verification_contract, m.verification_integration, m.verification_operational, m.verification_uat,
-        JSON.stringify(m.definition_of_done), m.requirement_coverage, m.boundary_map_markdown,
+        JSON.stringify(m.definition_of_done), m.requirement_coverage, m.boundary_map_markdown, m.sequence ?? 0,
       );
     }
 

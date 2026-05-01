@@ -12,6 +12,7 @@ import {
   isDbAvailable,
   insertMilestone,
   insertRequirement,
+  insertAssessment,
   getAllMilestones,
   insertSlice,
   insertTask,
@@ -841,6 +842,13 @@ describe('derive-state-db', async () => {
       openDatabase(':memory:');
       insertMilestone({ id: 'M001', title: 'Stuck Remediation', status: 'active' });
       insertSlice({ id: 'S01', milestoneId: 'M001', title: 'Done Slice', status: 'complete', risk: 'low', depends: [] });
+      insertAssessment({
+        path: 'milestones/M001/M001-VALIDATION.md',
+        milestoneId: 'M001',
+        status: 'needs-remediation',
+        scope: 'milestone-validation',
+        fullContent: 'verdict: needs-remediation',
+      });
 
       invalidateStateCache();
       const dbState = await deriveStateFromDb(base);
@@ -882,6 +890,13 @@ describe('derive-state-db', async () => {
       openDatabase(':memory:');
       insertMilestone({ id: 'M001', title: 'Complete Test', status: 'active' });
       insertSlice({ id: 'S01', milestoneId: 'M001', title: 'Done Slice', status: 'complete', risk: 'low', depends: [] });
+      insertAssessment({
+        path: 'milestones/M001/M001-VALIDATION.md',
+        milestoneId: 'M001',
+        status: 'pass',
+        scope: 'milestone-validation',
+        fullContent: 'verdict: pass',
+      });
 
       invalidateStateCache();
       const dbState = await deriveStateFromDb(base);
@@ -1134,8 +1149,8 @@ describe('derive-state-db', async () => {
     }
   });
 
-  // ─── Test 22: Needs-discussion — CONTEXT-DRAFT exists ─────────────────
-  test('derive-state-db: needs-discussion via DB', async () => {
+  // ─── Test 22: Needs-discussion — DB status, not CONTEXT-DRAFT ─────────
+  test('derive-state-db: needs-discussion via DB status', async () => {
     const base = createFixtureBase();
     try {
       writeFile(base, 'milestones/M001/M001-CONTEXT-DRAFT.md', '# M001: Draft\n\nDraft content.');
@@ -1144,7 +1159,7 @@ describe('derive-state-db', async () => {
       const fileState = await _deriveStateImpl(base);
 
       openDatabase(':memory:');
-      insertMilestone({ id: 'M001', title: 'Draft', status: 'active' });
+      insertMilestone({ id: 'M001', title: 'Draft', status: 'needs-discussion' });
 
       invalidateStateCache();
       const dbState = await deriveStateFromDb(base);

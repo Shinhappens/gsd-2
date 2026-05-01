@@ -634,34 +634,7 @@ export async function updateRequirementInDb(
   try {
     const db = await import('./gsd-db.js');
 
-    let existing = db.getRequirementById(id);
-
-    // If requirement doesn't exist in DB, seed the entire requirements table
-    // from REQUIREMENTS.md first (#3346). This handles the standard workflow
-    // where requirements are authored in markdown during discussion but never
-    // imported into the database — making gsd_requirement_update always fail
-    // with "not_found" at milestone completion.
-    if (!existing) {
-      const reqFilePath = resolveGsdRootFile(basePath, 'REQUIREMENTS');
-      try {
-        const content = readFileSync(reqFilePath, 'utf-8');
-        const { parseRequirementsSections } = await import('./md-importer.js');
-        const parsed = parseRequirementsSections(content);
-        if (parsed.length > 0) {
-          logWarning('manifest', `Seeding ${parsed.length} requirements from REQUIREMENTS.md into DB (first update triggers import)`, { fn: 'updateRequirementInDb' });
-          for (const req of parsed) {
-            // Only seed if not already in DB (avoid overwriting concurrent inserts)
-            if (!db.getRequirementById(req.id)) {
-              db.upsertRequirement(req);
-            }
-          }
-          // Re-check after seeding
-          existing = db.getRequirementById(id);
-        }
-      } catch {
-        // REQUIREMENTS.md missing or unparseable — fall through to skeleton
-      }
-    }
+    const existing = db.getRequirementById(id);
 
     const base: Requirement = existing ?? {
       id,
@@ -717,11 +690,7 @@ export async function updateRequirementInDb(
     try {
       await saveFile(filePath, md);
     } catch (diskErr) {
-      logError('manifest', 'disk write failed, reverting DB row', { fn: 'updateRequirementInDb', error: String((diskErr as Error).message) });
-      if (existing) {
-        db.upsertRequirement(existing);
-      }
-      throw diskErr;
+      logWarning('projection', 'REQUIREMENTS.md projection write failed; DB requirement update remains committed', { fn: 'updateRequirementInDb', id, error: String((diskErr as Error).message) });
     }
     // Invalidate file-read caches so deriveState() sees the updated markdown.
     // Do NOT clear the artifacts table — we just wrote to it intentionally.

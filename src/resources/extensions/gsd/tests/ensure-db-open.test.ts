@@ -11,7 +11,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
-import { closeDatabase, isDbAvailable, getDecisionById, _getAdapter } from '../gsd-db.ts';
+import { closeDatabase, isDbAvailable, getDecisionById, SCHEMA_VERSION, _getAdapter } from '../gsd-db.ts';
 
 const _require = createRequire(import.meta.url);
 
@@ -384,7 +384,7 @@ describe('ensure-db-open', () => {
       assert.ok(db, 'adapter should be available after ensureDbOpen');
       assert.equal(
         db.prepare('SELECT MAX(version) as version FROM schema_version').get()?.version,
-        22,
+        SCHEMA_VERSION,
         'legacy DB should migrate to current schema version',
       );
 

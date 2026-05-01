@@ -15,10 +15,12 @@ import { invalidateStateCache, deriveStateFromDb } from '../state.ts';
 import {
   openDatabase,
   closeDatabase,
+  insertAssessment,
   insertMilestone,
   insertRequirement,
   insertSlice,
   insertTask,
+  setMilestoneQueueOrder,
   updateTaskStatus,
 } from '../gsd-db.ts';
 
@@ -265,7 +267,8 @@ describe('derive-state-helpers', () => {
       writeFile(base, 'milestones/M001/slices/S01/S01-PLAN.md', PLAN_CONTENT);
       writeFile(base, 'milestones/M001/slices/S01/tasks/.gitkeep', '');
       writeFile(base, 'milestones/M001/slices/S01/tasks/T01-PLAN.md', '# T01 Plan');
-      // T02 completed with blocker discovered — written in summary frontmatter
+      // T02 completed with blocker discovered. The disk summary is a projection;
+      // only the DB blocker flag is authoritative for deriveStateFromDb().
       writeFile(base, 'milestones/M001/slices/S01/tasks/T02-SUMMARY.md',
         '---\nblocker_discovered: true\n---\n\n# T02 Summary\n\nFound a blocker.');
 
@@ -274,7 +277,7 @@ describe('derive-state-helpers', () => {
       insertSlice({ id: 'S01', milestoneId: 'M001', title: 'First', status: 'active', risk: 'low', depends: [] });
       insertSlice({ id: 'S02', milestoneId: 'M001', title: 'Second', status: 'pending', risk: 'low', depends: ['S01'] });
       insertTask({ id: 'T01', sliceId: 'S01', milestoneId: 'M001', title: 'First Task', status: 'pending' });
-      insertTask({ id: 'T02', sliceId: 'S01', milestoneId: 'M001', title: 'Done Task', status: 'complete' });
+      insertTask({ id: 'T02', sliceId: 'S01', milestoneId: 'M001', title: 'Done Task', status: 'complete', blockerDiscovered: true });
 
       invalidateStateCache();
       const state = await deriveStateFromDb(base);
@@ -287,8 +290,8 @@ describe('derive-state-helpers', () => {
     }
   });
 
-  // ─── checkInterruptedWork: continue.md triggers resume hint ─────────
-  test('checkInterruptedWork: continue.md present triggers resume nextAction', async () => {
+  // ─── CONTINUE.md projection is ignored by DB derive ─────────────────
+  test('deriveStateFromDb: continue.md projection does not trigger resume nextAction', async () => {
     const base = createFixtureBase();
     try {
       writeFile(base, 'milestones/M001/M001-ROADMAP.md', ROADMAP_CONTENT);
@@ -308,8 +311,8 @@ describe('derive-state-helpers', () => {
       const state = await deriveStateFromDb(base);
 
       assert.equal(state.phase, 'executing', 'continue: phase is still executing');
-      assert.ok(state.nextAction.includes('Resume interrupted work'), 'continue: nextAction mentions resume');
-      assert.ok(state.nextAction.includes('continue.md'), 'continue: nextAction mentions continue.md');
+      assert.ok(!state.nextAction.includes('Resume interrupted work'), 'continue: nextAction does not mention resume');
+      assert.ok(!state.nextAction.includes('continue.md'), 'continue: nextAction does not mention continue.md');
     } finally {
       closeDatabase();
       cleanup(base);
@@ -389,6 +392,13 @@ describe('derive-state-helpers', () => {
       insertMilestone({ id: 'M001', title: 'First', status: 'active' });
       insertSlice({ id: 'S01', milestoneId: 'M001', title: 'First', status: 'complete', risk: 'low', depends: [] });
       insertSlice({ id: 'S02', milestoneId: 'M001', title: 'Second', status: 'complete', risk: 'low', depends: ['S01'] });
+      insertAssessment({
+        path: 'milestones/M001/M001-VALIDATION.md',
+        milestoneId: 'M001',
+        status: 'pass',
+        scope: 'milestone-validation',
+        fullContent: 'verdict: passed',
+      });
 
       invalidateStateCache();
       const state = await deriveStateFromDb(base);
@@ -419,18 +429,18 @@ describe('derive-state-helpers', () => {
       assert.equal(state.activeMilestone?.id, 'M001', 'roadmap-projection: M001 is active');
       assert.equal(state.activeSlice, null, 'roadmap-projection: no active slice imported');
       assert.equal(state.phase, 'pre-planning', 'roadmap-projection: no DB slices routes to pre-planning');
-      assert.equal(state.progress?.slices?.total, 0, 'roadmap-projection: no slices imported');
+      assert.equal(state.progress?.slices, undefined, 'roadmap-projection: no slice progress from projection');
     } finally {
       closeDatabase();
       cleanup(base);
     }
   });
 
-  // ─── Queue order: milestones sorted by custom queue order ───────────
-  test('deriveStateFromDb respects custom queue order from QUEUE-ORDER.json', async () => {
+  // ─── Queue order: DB sequence is authoritative ─────────────────────
+  test('deriveStateFromDb ignores QUEUE-ORDER.json and uses DB sequence', async () => {
     const base = createFixtureBase();
     try {
-      // M003 should come first per queue order, M001 second
+      // QUEUE-ORDER.json is a projection and should not drive DB derivation.
       const queueOrder = JSON.stringify({ order: ['M003', 'M001', 'M002'], updatedAt: new Date().toISOString() });
       writeFileSync(join(base, '.gsd', 'QUEUE-ORDER.json'), queueOrder);
       writeFile(base, 'milestones/M001/M001-CONTEXT.md', '# M001\n\nContext.');
@@ -438,17 +448,17 @@ describe('derive-state-helpers', () => {
       writeFile(base, 'milestones/M003/M003-CONTEXT.md', '# M003\n\nContext.');
 
       openDatabase(':memory:');
-      // Insert in natural order — queue ordering should override
+      // Insert in natural order, then store the authoritative DB sequence.
       insertMilestone({ id: 'M001', title: 'First', status: 'active' });
       insertMilestone({ id: 'M002', title: 'Second', status: 'active' });
       insertMilestone({ id: 'M003', title: 'Third', status: 'active' });
+      setMilestoneQueueOrder(['M002', 'M001', 'M003']);
 
       invalidateStateCache();
       const state = await deriveStateFromDb(base);
 
-      // M003 should be the active milestone (first in queue)
-      assert.equal(state.activeMilestone?.id, 'M003', 'queue-order: M003 is active (first in queue)');
-      assert.equal(state.registry[0]?.id, 'M003', 'queue-order: registry[0] is M003');
+      assert.equal(state.activeMilestone?.id, 'M002', 'queue-order: DB sequence chooses M002');
+      assert.equal(state.registry[0]?.id, 'M002', 'queue-order: registry[0] follows DB sequence');
     } finally {
       closeDatabase();
       cleanup(base);
@@ -467,6 +477,13 @@ describe('derive-state-helpers', () => {
       openDatabase(':memory:');
       insertMilestone({ id: 'M001', title: 'Remediation Test', status: 'active' });
       insertSlice({ id: 'S01', milestoneId: 'M001', title: 'Done', status: 'complete', risk: 'low', depends: [] });
+      insertAssessment({
+        path: 'milestones/M001/M001-VALIDATION.md',
+        milestoneId: 'M001',
+        status: 'needs-remediation',
+        scope: 'milestone-validation',
+        fullContent: 'verdict: needs-remediation',
+      });
 
       invalidateStateCache();
       const state = await deriveStateFromDb(base);

@@ -58,6 +58,7 @@ import {
   getReplanHistory,
   getSlice,
   getRequirementCounts,
+  getLatestAssessmentByScope,
   getPendingGateCountForTurn,
   type MilestoneRow,
   type SliceRow,
@@ -232,14 +233,7 @@ export async function getActiveMilestoneId(basePath: string): Promise<string | n
   if (isDbAvailable()) {
     const allMilestones = getAllMilestones();
     if (allMilestones.length > 0) {
-      // Respect queue-order.json so /gsd queue reordering is honored (#2556).
-      // Without this, the DB path uses lexicographic sort while the dispatch
-      // guard uses queue order — causing a deadlock.
-      const customOrder = loadQueueOrder(basePath);
-      const sortedIds = sortByQueueOrder(allMilestones.map(m => m.id), customOrder);
-      const byId = new Map(allMilestones.map(m => [m.id, m]));
-      for (const id of sortedIds) {
-        const m = byId.get(id)!;
+      for (const m of allMilestones) {
         if (isClosedStatus(m.status) || m.status === "parked") continue;
         return m.id;
       }
@@ -388,14 +382,10 @@ async function buildRegistryAndFindActive(
     }
 
     const slices = getMilestoneSlices(m.id);
-    if (slices.length === 0 && !isStatusDone(m.status) && m.status !== 'queued') {
-      if (isGhostMilestone(basePath, m.id)) continue;
-    }
 
     // DB-authoritative completeness (#4179): only trust completeMilestoneIds,
     // which is itself derived from DB status. SUMMARY-file presence alone must
-    // not imply completion. The summary file may still be consulted below as a
-    // title source for legitimately-complete milestones whose DB row has no title.
+    // not imply completion.
     if (completeMilestoneIds.has(m.id)) {
       const title = stripMilestonePrefix(m.title) || m.id;
       registry.push({ id: m.id, title, status: 'complete' });
@@ -404,14 +394,7 @@ async function buildRegistryAndFindActive(
 
     const allSlicesDone = slices.length > 0 && slices.every(s => isStatusDone(s.status));
 
-    let title = stripMilestonePrefix(m.title) || m.id;
-    if (title === m.id) {
-      const contextFile = resolveMilestoneFile(basePath, m.id, "CONTEXT");
-      const draftFile = resolveMilestoneFile(basePath, m.id, "CONTEXT-DRAFT");
-      const contextContent = contextFile ? await loadFile(contextFile) : null;
-      const draftContent = draftFile && !contextContent ? await loadFile(draftFile) : null;
-      title = extractContextTitle(contextContent || draftContent, m.id);
-    }
+    const title = stripMilestonePrefix(m.title) || m.id;
 
     if (!activeMilestoneFound) {
       const deps = m.depends_on;
@@ -423,41 +406,22 @@ async function buildRegistryAndFindActive(
       }
 
       if (m.status === 'queued' && slices.length === 0) {
-        const contextFile = resolveMilestoneFile(basePath, m.id, "CONTEXT");
-        const draftFile = resolveMilestoneFile(basePath, m.id, "CONTEXT-DRAFT");
-        if (!contextFile && !draftFile) {
-          if (!firstDeferredQueuedShell) {
-            firstDeferredQueuedShell = { id: m.id, title, deps };
-          }
-          registry.push({ id: m.id, title, status: 'pending', ...(deps.length > 0 ? { dependsOn: deps } : {}) });
-          continue;
+        if (!firstDeferredQueuedShell) {
+          firstDeferredQueuedShell = { id: m.id, title, deps };
         }
+        registry.push({ id: m.id, title, status: 'pending', ...(deps.length > 0 ? { dependsOn: deps } : {}) });
+        continue;
       }
 
       if (allSlicesDone) {
-        const validationFile = resolveMilestoneFile(basePath, m.id, "VALIDATION");
-        const validationContent = validationFile ? await loadFile(validationFile) : null;
-        const validationTerminal = validationContent ? isValidationTerminal(validationContent) : false;
-
-        // DB-authoritative (#4179): completeness is already decided by
-        // completeMilestoneIds above. If we reached this branch, the DB says
-        // the milestone is NOT complete — so any SUMMARY file on disk is an
-        // orphan (crashed complete-milestone, partial merge, manual edit) and
-        // must not short-circuit this path. When validation is terminal, fall
-        // through to the default active-push below so `complete-milestone` can
-        // re-run idempotently.
-        if (!validationTerminal) {
-          activeMilestone = { id: m.id, title };
-          activeMilestoneSlices = slices;
-          activeMilestoneFound = true;
-          registry.push({ id: m.id, title, status: 'active', ...(deps.length > 0 ? { dependsOn: deps } : {}) });
-          continue;
-        }
+        activeMilestone = { id: m.id, title };
+        activeMilestoneSlices = slices;
+        activeMilestoneFound = true;
+        registry.push({ id: m.id, title, status: 'active', ...(deps.length > 0 ? { dependsOn: deps } : {}) });
+        continue;
       }
 
-      const contextFile = resolveMilestoneFile(basePath, m.id, "CONTEXT");
-      const draftFile = resolveMilestoneFile(basePath, m.id, "CONTEXT-DRAFT");
-      if (!contextFile && draftFile) activeMilestoneHasDraft = true;
+      if (m.status === 'needs-discussion') activeMilestoneHasDraft = true;
 
       activeMilestone = { id: m.id, title };
       activeMilestoneSlices = slices;
@@ -553,10 +517,9 @@ async function handleAllSlicesDone(
   milestoneProgress: { done: number, total: number },
   sliceProgress: { done: number, total: number }
 ): Promise<GSDState> {
-  const validationFile = resolveMilestoneFile(basePath, activeMilestone.id, "VALIDATION");
-  const validationContent = validationFile ? await loadFile(validationFile) : null;
-  const validationTerminal = validationContent ? isValidationTerminal(validationContent) : false;
-  const verdict = validationContent ? extractVerdict(validationContent) : undefined;
+  const validation = getLatestAssessmentByScope(activeMilestone.id, "milestone-validation");
+  const verdict = typeof validation?.status === "string" ? validation.status : undefined;
+  const validationTerminal = verdict != null && verdict !== "";
 
   if (!validationTerminal) {
     return {
@@ -630,14 +593,6 @@ async function detectBlockers(basePath: string, milestoneId: string, sliceId: st
     if (ct.blocker_discovered) {
       return ct.id;
     }
-    const summaryFile = resolveTaskFile(basePath, milestoneId, sliceId, ct.id, "SUMMARY");
-    if (!summaryFile) continue;
-    const summaryContent = await loadFile(summaryFile);
-    if (!summaryContent) continue;
-    const summary = parseSummary(summaryContent);
-    if (summary.frontmatter.blocker_discovered) {
-      return ct.id;
-    }
   }
   return null;
 }
@@ -647,23 +602,10 @@ function checkReplanTrigger(basePath: string, milestoneId: string, sliceId: stri
   return !!sliceRow?.replan_triggered_at;
 }
 
-async function checkInterruptedWork(basePath: string, milestoneId: string, sliceId: string): Promise<boolean> {
-  const sDir = resolveSlicePath(basePath, milestoneId, sliceId);
-  const continueFile = sDir ? resolveSliceFile(basePath, milestoneId, sliceId, "CONTINUE") : null;
-  return !!(continueFile && await loadFile(continueFile)) ||
-    !!(sDir && await loadFile(join(sDir, "continue.md")));
-}
-
 export async function deriveStateFromDb(basePath: string): Promise<GSDState> {
   const requirements = getRequirementCounts();
 
   const allMilestones = getAllMilestones();
-
-  const customOrder = loadQueueOrder(basePath);
-  const sortedIds = sortByQueueOrder(allMilestones.map(m => m.id), customOrder);
-  const byId = new Map(allMilestones.map(m => [m.id, m]));
-  allMilestones.length = 0;
-  for (const id of sortedIds) allMilestones.push(byId.get(id)!);
 
   const milestoneLock = process.env.GSD_MILESTONE_LOCK;
   const milestones = milestoneLock
@@ -694,28 +636,16 @@ export async function deriveStateFromDb(basePath: string): Promise<GSDState> {
     return handleNoActiveMilestone(registry, requirements, milestoneProgress);
   }
 
-  const hasRoadmap = resolveMilestoneFile(basePath, activeMilestone.id, "ROADMAP") !== null;
-
   if (activeMilestoneSlices.length === 0) {
-    if (!hasRoadmap) {
-      const phase = activeMilestoneHasDraft ? 'needs-discussion' as const : 'pre-planning' as const;
-      const nextAction = activeMilestoneHasDraft
-        ? `Discuss draft context for milestone ${activeMilestone.id}.`
-        : `Plan milestone ${activeMilestone.id}.`;
-      return {
-        activeMilestone, activeSlice: null, activeTask: null,
-        phase, recentDecisions: [], blockers: [],
-        nextAction, registry, requirements,
-        progress: { milestones: milestoneProgress },
-      };
-    }
-
+    const phase = activeMilestoneHasDraft ? 'needs-discussion' as const : 'pre-planning' as const;
+    const nextAction = activeMilestoneHasDraft
+      ? `Discuss draft context for milestone ${activeMilestone.id}.`
+      : `Plan milestone ${activeMilestone.id}.`;
     return {
       activeMilestone, activeSlice: null, activeTask: null,
-      phase: 'pre-planning', recentDecisions: [], blockers: [],
-      nextAction: `Milestone ${activeMilestone.id} has a roadmap but no slices defined. Add slices to the roadmap.`,
-      registry, requirements,
-      progress: { milestones: milestoneProgress, slices: { done: 0, total: 0 } },
+      phase, recentDecisions: [], blockers: [],
+      nextAction, registry, requirements,
+      progress: { milestones: milestoneProgress },
     };
   }
 
@@ -874,14 +804,10 @@ export async function deriveStateFromDb(basePath: string): Promise<GSDState> {
     }
   }
 
-  const hasInterrupted = await checkInterruptedWork(basePath, activeMilestone.id, activeSlice.id);
-
   return {
     activeMilestone, activeSlice, activeTask,
     phase: 'executing', recentDecisions: [], blockers: [],
-    nextAction: hasInterrupted
-      ? `Resume interrupted work on ${activeTask.id}: ${activeTask.title} in slice ${activeSlice.id}. Read continue.md first.`
-      : `Execute ${activeTask.id}: ${activeTask.title} in slice ${activeSlice.id}.`,
+    nextAction: `Execute ${activeTask.id}: ${activeTask.title} in slice ${activeSlice.id}.`,
     registry, requirements,
     progress: { milestones: milestoneProgress, slices: sliceProgress, tasks: taskProgress },
   };

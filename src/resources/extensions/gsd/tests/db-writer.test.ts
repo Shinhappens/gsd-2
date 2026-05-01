@@ -481,7 +481,7 @@ describe('db-writer', () => {
     }
   });
 
-  test('updateRequirementInDb — seeds from REQUIREMENTS.md when DB empty (#3346)', async () => {
+  test('updateRequirementInDb — ignores REQUIREMENTS.md projection when DB empty', async () => {
     const tmpDir = makeTmpDir();
     const dbPath = path.join(tmpDir, '.gsd', 'gsd.db');
     openDatabase(dbPath);
@@ -515,31 +515,28 @@ describe('db-writer', () => {
       ].join('\n');
       fs.writeFileSync(path.join(tmpDir, '.gsd', 'REQUIREMENTS.md'), reqContent);
 
-      // DB is empty — no requirements seeded. Update R005 to "validated".
-      // Before #3346 fix: this would create a skeleton with empty fields.
-      // After fix: this seeds all 3 requirements from REQUIREMENTS.md first.
+      // DB is empty. REQUIREMENTS.md is a projection and must not be imported
+      // implicitly by a runtime DB write.
       await updateRequirementInDb('R005', {
         status: 'validated',
         validation: 'S02 — auth flow verified',
       }, tmpDir);
 
-      // R005 should have the update AND the original content from markdown
+      // R005 should have the requested update only; disk projection content is ignored.
       const r005 = getRequirementById('R005');
       assert.ok(r005, 'R005 should exist');
       assert.equal(r005!.status, 'validated', 'status should be updated');
       assert.equal(r005!.validation, 'S02 — auth flow verified', 'validation should be updated');
-      assert.equal(r005!.class, 'functional', 'class should be preserved from REQUIREMENTS.md');
-      assert.ok(r005!.description?.includes('authentication') || r005!.full_content?.includes('authentication'),
-        'original content should be preserved');
+      assert.equal(r005!.class, '', 'class should not be imported from REQUIREMENTS.md');
+      assert.ok(!r005!.description?.includes('authentication'), 'description should not be imported');
+      assert.ok(!r005!.full_content?.includes('authentication'), 'full content should not be imported');
 
-      // R007 and R001 should also be seeded (not just the one being updated)
+      // Other requirements in the projection are not seeded.
       const r007 = getRequirementById('R007');
-      assert.ok(r007, 'R007 should be seeded from REQUIREMENTS.md');
-      assert.equal(r007!.status, 'active', 'R007 status should be active');
+      assert.equal(r007, null, 'R007 should not be imported from REQUIREMENTS.md');
 
       const r001 = getRequirementById('R001');
-      assert.ok(r001, 'R001 should be seeded from REQUIREMENTS.md');
-      assert.equal(r001!.status, 'validated', 'R001 status should be validated (from section heading)');
+      assert.equal(r001, null, 'R001 should not be imported from REQUIREMENTS.md');
     } finally {
       closeDatabase();
       cleanupDir(tmpDir);
