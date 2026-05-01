@@ -398,3 +398,78 @@ test("reactive-execute prompt references tool calls instead of checkbox updates"
   assert.doesNotMatch(prompt, /checkbox edits/);
   assert.match(prompt, /completion tool calls/);
 });
+
+// ─── Project-shape classifier + 3-or-4-options-with-Other-hatch contract ──
+
+test("guided-discuss-project classifies project shape and persists the verdict to PROJECT.md", () => {
+  const prompt = readPrompt("guided-discuss-project");
+  assert.match(prompt, /Classify project shape/i, "must include the classifier section");
+  assert.match(prompt, /`simple`/);
+  assert.match(prompt, /`complex`/);
+  assert.match(prompt, /Default to `complex` when uncertain/i);
+  assert.match(prompt, /## Project Shape/, "must reference the persisted PROJECT.md section");
+  assert.match(prompt, /\*\*Complexity:\*\*\s*simple/);
+  assert.match(prompt, /\*\*Complexity:\*\*\s*complex/);
+});
+
+test("guided-discuss prompts require 3-or-4 options plus Other-let-me-discuss in complex mode", () => {
+  for (const name of [
+    "guided-discuss-project",
+    "guided-discuss-milestone",
+    "guided-discuss-slice",
+  ]) {
+    const prompt = readPrompt(name);
+    assert.match(
+      prompt,
+      /3 or 4 concrete, researched options/i,
+      `${name} must require 3 or 4 grounded options in complex mode`,
+    );
+    assert.match(
+      prompt,
+      /"Other — let me discuss"/,
+      `${name} must include the "Other — let me discuss" escape hatch`,
+    );
+    assert.match(
+      prompt,
+      /grounded in (the |your |)investigation/i,
+      `${name} must require options grounded in prior investigation`,
+    );
+  }
+});
+
+test("guided-discuss-requirements scopes the 3-or-4-options rule to free-form questions only", () => {
+  const prompt = readPrompt("guided-discuss-requirements");
+  assert.match(prompt, /3 or 4 concrete, researched options/i);
+  assert.match(prompt, /"Other — let me discuss"/);
+  // Class-assignment and status questions have fixed enumerations, so the rule must exempt them.
+  assert.match(prompt, /class-assignment.*status.*exempt/i);
+});
+
+test("downstream discuss prompts read project shape verdict from PROJECT.md", () => {
+  for (const name of [
+    "guided-discuss-milestone",
+    "guided-discuss-requirements",
+    "guided-discuss-slice",
+  ]) {
+    const prompt = readPrompt(name);
+    assert.match(
+      prompt,
+      /Project Shape/,
+      `${name} must reference Project Shape from PROJECT.md`,
+    );
+    assert.match(
+      prompt,
+      /default to `complex`/i,
+      `${name} must default to complex when the verdict is missing`,
+    );
+  }
+});
+
+test("project template includes the Project Shape section so the verdict has a home", () => {
+  const template = readFileSync(
+    join(process.cwd(), "src/resources/extensions/gsd/templates/project.md"),
+    "utf-8",
+  );
+  assert.match(template, /## Project Shape/);
+  assert.match(template, /\*\*Complexity:\*\*/);
+});
