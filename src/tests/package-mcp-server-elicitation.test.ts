@@ -144,6 +144,7 @@ test('ask_user_questions returns the packaged answers JSON shape for form elicit
           },
         ],
         response: {
+          endInterview: false,
           answers: {
             deployment: { selected: 'None of the above', notes: 'Need hybrid deployment.' },
           },
@@ -197,6 +198,7 @@ test('ask_user_questions structuredContent reflects an accepted single-select an
           },
         ],
         response: {
+          endInterview: false,
           answers: {
             confirm: { selected: 'Yes, you got it (Recommended)', notes: '' },
           },
@@ -354,6 +356,7 @@ test('buildAskUserQuestionsRoundResult normalizes elicitation content into the g
     },
   })
   assert.deepEqual(accepted, {
+    endInterview: false,
     answers: {
       confirm: { selected: 'Yes', notes: '' },
       focus: { selected: ['Frontend', 'Backend'], notes: '' },

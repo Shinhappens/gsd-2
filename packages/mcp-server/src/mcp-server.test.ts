@@ -948,6 +948,194 @@ describe('createMcpServer tool registration', () => {
     assert.equal(result.content[0]?.text, 'remote response');
   });
 
+  it('ask_user_questions surfaces remote success answers as structuredContent (regression #5267)', async () => {
+    const questions = [
+      {
+        id: 'depth_verification_M001',
+        header: 'Depth Check',
+        question: 'Did I capture the depth right?',
+        options: [
+          { label: 'Yes, you got it (Recommended)', description: 'Continue.' },
+          { label: 'Not quite', description: 'Clarify.' },
+        ],
+      },
+    ];
+
+    const result = await askUserQuestionsHandler(questions, undefined, {
+      async elicitInput() {
+        throw new Error('MCP host does not support elicitation');
+      },
+      isRemoteConfigured() {
+        return true;
+      },
+      async tryRemoteQuestions() {
+        return {
+          content: [{ type: 'text', text: '{"answers":{"depth_verification_M001":{"answers":["Yes, you got it (Recommended)"]}}}' }],
+          details: {
+            remote: true,
+            channel: 'discord',
+            timed_out: false,
+            promptId: 'p1',
+            threadUrl: null,
+            questions,
+            response: {
+              endInterview: false,
+              answers: {
+                depth_verification_M001: { selected: 'Yes, you got it (Recommended)', notes: '' },
+              },
+            },
+            status: 'answered',
+          },
+        };
+      },
+    });
+
+    assert.deepEqual(
+      (result as { structuredContent?: unknown }).structuredContent,
+      {
+        questions,
+        response: {
+          // endInterview mirrors the local RoundResult shape so register-hooks
+          // sees identical payloads on both code paths.
+          endInterview: false,
+          answers: {
+            depth_verification_M001: { selected: 'Yes, you got it (Recommended)', notes: '' },
+          },
+        },
+        cancelled: false,
+      },
+    );
+  });
+
+  it('ask_user_questions surfaces remote timeout as cancelled structuredContent (regression #5267)', async () => {
+    const questions = [
+      {
+        id: 'depth_verification_M001',
+        header: 'Depth Check',
+        question: 'Did I capture the depth right?',
+        options: [
+          { label: 'Yes, you got it (Recommended)', description: 'Continue.' },
+          { label: 'Not quite', description: 'Clarify.' },
+        ],
+      },
+    ];
+
+    const result = await askUserQuestionsHandler(questions, undefined, {
+      async elicitInput() {
+        throw new Error('MCP host does not support elicitation');
+      },
+      isRemoteConfigured() {
+        return true;
+      },
+      async tryRemoteQuestions() {
+        return {
+          content: [{ type: 'text', text: '{"timed_out":true,"channel":"discord","message":"User did not respond within 5 minutes."}' }],
+          details: { remote: true, channel: 'discord', timed_out: true, status: 'timed_out' },
+        };
+      },
+    });
+
+    assert.deepEqual(
+      (result as { structuredContent?: unknown }).structuredContent,
+      { questions, response: null, cancelled: true },
+    );
+  });
+
+  it('ask_user_questions returns cancelled structuredContent when remote is unconfigured and local declines (regression #5267)', async () => {
+    const questions = [
+      {
+        id: 'depth_verification_M001',
+        header: 'Depth Check',
+        question: 'Did I capture the depth right?',
+        options: [
+          { label: 'Yes, you got it (Recommended)', description: 'Continue.' },
+          { label: 'Not quite', description: 'Clarify.' },
+        ],
+      },
+    ];
+
+    const result = await askUserQuestionsHandler(questions, undefined, {
+      async elicitInput() {
+        return { action: 'decline' };
+      },
+      isRemoteConfigured() {
+        return false;
+      },
+      async tryRemoteQuestions() {
+        throw new Error('should not be called when remote is unconfigured');
+      },
+    });
+
+    assert.deepEqual(
+      (result as { structuredContent?: unknown }).structuredContent,
+      { questions, response: null, cancelled: true },
+    );
+    assert.equal(result.content[0]?.text, 'ask_user_questions was cancelled before receiving a response');
+  });
+
+  it('ask_user_questions returns cancelled structuredContent when configured remote returns null (regression #5267)', async () => {
+    const questions = [
+      {
+        id: 'depth_verification_M001',
+        header: 'Depth Check',
+        question: 'Did I capture the depth right?',
+        options: [
+          { label: 'Yes, you got it (Recommended)', description: 'Continue.' },
+          { label: 'Not quite', description: 'Clarify.' },
+        ],
+      },
+    ];
+
+    const result = await askUserQuestionsHandler(questions, undefined, {
+      async elicitInput() {
+        return { action: 'cancel' };
+      },
+      isRemoteConfigured() {
+        return true;
+      },
+      async tryRemoteQuestions() {
+        return null;
+      },
+    });
+
+    assert.deepEqual(
+      (result as { structuredContent?: unknown }).structuredContent,
+      { questions, response: null, cancelled: true },
+    );
+  });
+
+  it('ask_user_questions re-throws non-fallback local errors (regression #5267)', async () => {
+    const questions = [
+      {
+        id: 'depth_verification_M001',
+        header: 'Depth Check',
+        question: 'Did I capture the depth right?',
+        options: [
+          { label: 'Yes, you got it (Recommended)', description: 'Continue.' },
+          { label: 'Not quite', description: 'Clarify.' },
+        ],
+      },
+    ];
+
+    const result = await askUserQuestionsHandler(questions, undefined, {
+      async elicitInput() {
+        throw new TypeError('schema validation blew up');
+      },
+      isRemoteConfigured() {
+        return false;
+      },
+      async tryRemoteQuestions() {
+        throw new Error('should not be called');
+      },
+    });
+
+    // Non-fallback errors propagate to the outer try/catch and surface as an
+    // MCP `isError` result — no `structuredContent` is attached because the
+    // error path predates the structured success/cancel branches.
+    assert.equal('isError' in result && result.isError, true);
+    assert.match(result.content[0]?.text ?? '', /schema validation blew up/);
+  });
+
   it('ask_user_questions reports both local and remote errors when both paths fail', async () => {
     const questions = [
       {

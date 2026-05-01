@@ -833,6 +833,26 @@ function formatForTool(answer: RemoteAnswer): Record<string, { answers: string[]
 }
 
 /**
+ * Normalize a `RemoteAnswer` into the `RoundResult` shape the GSD
+ * discussion-gate hook reads from `tool_result` `details.response`. Mirrors
+ * `src/resources/extensions/remote-questions/manager.ts:toRoundResultResponse`.
+ * Without this, the remote channel (Discord / Slack / Telegram) would have
+ * the same gate-stuck problem as the local elicitation path. See #5267.
+ */
+export function toRoundResultResponse(answer: RemoteAnswer): {
+  endInterview: false;
+  answers: Record<string, { selected: string | string[]; notes: string }>;
+} {
+  const normalized: Record<string, { selected: string | string[]; notes: string }> = {};
+  for (const [id, data] of Object.entries(answer.answers)) {
+    const list = data.answers ?? [];
+    const selected: string | string[] = list.length <= 1 ? (list[0] ?? '') : list;
+    normalized[id] = { selected, notes: data.user_note ?? '' };
+  }
+  return { endInterview: false, answers: normalized };
+}
+
+/**
  * Dispatch questions to the configured remote channel and wait for a response.
  *
  * Returns null when no remote channel is configured.
@@ -926,6 +946,7 @@ export async function tryRemoteQuestions(
       promptId: prompt.id,
       threadUrl: ref.threadUrl ?? null,
       questions,
+      response: toRoundResultResponse(answer),
       status: 'answered',
     },
   };

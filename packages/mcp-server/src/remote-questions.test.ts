@@ -23,6 +23,7 @@ import { join } from 'node:path';
 // ask_user_questions handler integration test further below.
 import {
   isRemoteConfigured,
+  toRoundResultResponse,
   tryRemoteQuestions,
   type RemoteQuestion,
 } from './remote-questions.js';
@@ -46,6 +47,53 @@ const SAMPLE_QUESTIONS: RemoteQuestion[] = [
 function makePrefsFile(dir: string, content: string): void {
   writeFileSync(join(dir, 'PREFERENCES.md'), content, 'utf-8');
 }
+
+// ---------------------------------------------------------------------------
+// toRoundResultResponse — regression #5267
+// ---------------------------------------------------------------------------
+
+describe('toRoundResultResponse', () => {
+  it('normalizes a single-answer RemoteAnswer into RoundResult shape', () => {
+    const result = toRoundResultResponse({
+      answers: {
+        approach: { answers: ['Option A (Recommended)'] },
+      },
+    });
+    assert.deepEqual(result, {
+      endInterview: false,
+      answers: {
+        approach: { selected: 'Option A (Recommended)', notes: '' },
+      },
+    });
+  });
+
+  it('keeps multi-answer arrays intact for multi-select questions', () => {
+    const result = toRoundResultResponse({
+      answers: {
+        focus: { answers: ['Frontend', 'Backend'] },
+      },
+    });
+    assert.deepEqual(result.answers.focus, { selected: ['Frontend', 'Backend'], notes: '' });
+  });
+
+  it('lifts user_note into the notes field', () => {
+    const result = toRoundResultResponse({
+      answers: {
+        confirm: { answers: ['None of the above'], user_note: 'Need a hybrid path.' },
+      },
+    });
+    assert.deepEqual(result.answers.confirm, { selected: 'None of the above', notes: 'Need a hybrid path.' });
+  });
+
+  it('returns an empty selected string when the channel produced no answer', () => {
+    const result = toRoundResultResponse({
+      answers: {
+        approach: { answers: [] },
+      },
+    });
+    assert.deepEqual(result.answers.approach, { selected: '', notes: '' });
+  });
+});
 
 // ---------------------------------------------------------------------------
 // isRemoteConfigured — unit tests

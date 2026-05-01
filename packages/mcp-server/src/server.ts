@@ -345,6 +345,7 @@ interface AskUserQuestionsRoundResultAnswer {
 }
 
 interface AskUserQuestionsRoundResult {
+  endInterview: false;
   answers: Record<string, AskUserQuestionsRoundResultAnswer>;
 }
 
@@ -488,7 +489,10 @@ export function buildAskUserQuestionsRoundResult(
     answers[question.id] = { selected, notes };
   }
 
-  return { answers };
+  // `endInterview: false` mirrors the local extension's `RoundResult` shape and
+  // matches the remote path's `toRoundResultResponse` so register-hooks reads
+  // identical payloads regardless of channel. See peer review #5267-Q2.
+  return { endInterview: false, answers };
 }
 
 interface AskUserQuestionsHandlerDeps {
@@ -513,6 +517,18 @@ function isLocalElicitFallbackError(err: unknown): boolean {
 
 function formatErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Defensive guard for the `details.response` payload from `tryRemoteQuestions`.
+ * Accepts only an object with a plain `answers` map; anything else (null,
+ * stringified JSON, missing) falls back to `null` so the gate hook routes
+ * the cancel branch instead of crashing on `details.response.answers[id]`.
+ */
+function isRoundResultLike(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const answers = (value as Record<string, unknown>)['answers'];
+  return !!answers && typeof answers === 'object' && !Array.isArray(answers);
 }
 
 export async function askUserQuestionsHandler(
@@ -568,9 +584,33 @@ export async function askUserQuestionsHandler(
       if (remoteResult) {
         const details = remoteResult.details as Record<string, unknown> | undefined;
         if (details?.['timed_out'] || details?.['error']) {
-          return textContent(remoteResult.content[0]?.text ?? 'Remote questions timed out or failed');
+          // Mirror the timeout/error into structuredContent so the gate hook's
+          // `details?.cancelled || !details?.response` branch fires correctly
+          // (gate stays pending, model re-asks) instead of silently dropping
+          // because no `details` made it across the MCP wire. See #5267.
+          const failedStructured: AskUserQuestionsStructuredContent = {
+            questions,
+            response: null,
+            cancelled: true,
+          };
+          return {
+            content: [{ type: 'text' as const, text: remoteResult.content[0]?.text ?? 'Remote questions timed out or failed' }],
+            structuredContent: failedStructured as unknown as Record<string, unknown>,
+          };
         }
-        return textContent(remoteResult.content[0]?.text ?? '');
+        // Successful remote answer — surface the normalized RoundResult that
+        // remote-questions.ts attached to `details.response` so the gate hook
+        // sees `details.response.answers[id].selected` on this path too.
+        const remoteResponse = isRoundResultLike(details?.['response']) ? details!['response'] as AskUserQuestionsRoundResult : null;
+        const acceptedStructured: AskUserQuestionsStructuredContent = {
+          questions,
+          response: remoteResponse,
+          cancelled: false,
+        };
+        return {
+          content: [{ type: 'text' as const, text: remoteResult.content[0]?.text ?? '' }],
+          structuredContent: acceptedStructured as unknown as Record<string, unknown>,
+        };
       }
     }
 
