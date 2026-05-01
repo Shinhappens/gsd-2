@@ -21,8 +21,12 @@ Before your first action, print this banner verbatim in chat:
 ## Pre-flight
 
 1. Read `.gsd/PROJECT.md` end-to-end. If it does not exist, STOP and emit: `"PROJECT.md missing — run discuss-project first."`
-2. Extract: Core Value, Anti-goals, Constraints, Milestone Sequence.
+2. Extract: Core Value, Anti-goals, Constraints, Milestone Sequence, and the project shape verdict — read the `## Project Shape` section and look for `**Complexity:**` (verdict is either `simple` or `complex`; default to `complex` if the section is missing or unclear).
 3. Check for existing `.gsd/REQUIREMENTS.md` — if present, this is a refinement pass, not a fresh write. Read existing requirements and treat them as the working set.
+
+**Shape-dependent cadence:**
+- **`simple`** — favor a single fast pass: extract requirements directly from PROJECT.md, ask 1–2 plain-text clarifying questions only if a class or status assignment is genuinely ambiguous, then write REQUIREMENTS.md.
+- **`complex`** — full multi-round questioning with structured 3–4-option questions where alternatives matter.
 
 ---
 
@@ -51,7 +55,7 @@ Ask **1–3 questions per round**. Each round targets one dimension:
 
 **Never fabricate or simulate user input.** Wait for actual responses.
 
-**If `{{structuredQuestionsAvailable}}` is `true`:** use `ask_user_questions`. Every question object MUST include a stable lowercase `id`. For class assignments, present the allowed classes as multi-select options. For status, present the four statuses as exclusive options. Ask 1–3 questions per call. Wait for each tool result before asking the next round.
+**If `{{structuredQuestionsAvailable}}` is `true`:** use `ask_user_questions`. Every question object MUST include a stable lowercase `id`. For class assignments, present the allowed classes as multi-select options. For status, present the four statuses as exclusive options. In **`complex`** mode, any free-form question MUST present **3 or 4 concrete, researched options** plus a final **"Other — let me discuss"** option grounded in the investigation above. The class-assignment and status questions are exempt — they have fixed enumerations. Ask 1–3 questions per call. Wait for each tool result before asking the next round.
 
 **If `{{structuredQuestionsAvailable}}` is `false`:** ask in plain text. Keep each round to 1–3 questions.
 

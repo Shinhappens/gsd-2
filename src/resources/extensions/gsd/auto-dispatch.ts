@@ -77,6 +77,7 @@ import {
   resolveDeepProjectSetupState,
   type DeepProjectSetupStage,
 } from "./deep-project-setup-policy.js";
+import { annotateBackgroundable } from "./delegation-policy.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -89,6 +90,12 @@ export type DispatchAction =
       pauseAfterDispatch?: boolean;
       /** Name of the matched dispatch rule from the unified registry (journal provenance). */
       matchedRule?: string;
+      /**
+       * True when the matched unit type has a `good` verdict in delegation-policy.ts.
+       * Annotated in `resolveDispatch`. Consumers may use this to fork the prompt
+       * to a background sub-agent; default behavior is unchanged (synchronous).
+       */
+      backgroundable?: boolean;
     }
   | { action: "stop"; reason: string; level: "info" | "warning" | "error"; matchedRule?: string }
   | { action: "skip"; matchedRule?: string };
@@ -1366,7 +1373,7 @@ export async function resolveDispatch(
   // Delegate to registry when available
   try {
     const registry = getRegistry();
-    return await registry.evaluateDispatch(ctx);
+    return annotateBackgroundable(await registry.evaluateDispatch(ctx));
   } catch (err) {
     // Registry not initialized — fall back to inline loop
     logWarning("dispatch", `registry dispatch failed, falling back to inline rules: ${err instanceof Error ? err.message : String(err)}`);
@@ -1376,7 +1383,7 @@ export async function resolveDispatch(
     const result = await rule.match(ctx);
     if (result) {
       if (result.action !== "skip") result.matchedRule = rule.name;
-      return result;
+      return annotateBackgroundable(result);
     }
   }
 
@@ -1391,6 +1398,7 @@ export async function resolveDispatch(
     matchedRule: "<no-match>",
   };
 }
+
 
 /** Exposed for testing — returns the rule names in evaluation order. */
 export function getDispatchRuleNames(): string[] {
