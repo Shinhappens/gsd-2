@@ -128,7 +128,7 @@ function cachedReaddir(dirPath: string): string[] {
 }
 
 /**
- * Clear the directory listing cache.
+ * Clear the directory listing cache and the gsdRoot resolution cache.
  * Call after milestone transitions, file creation in planning directories,
  * or at the start/end of a dispatch cycle.
  */
@@ -137,6 +137,7 @@ export function clearPathCache(): void {
   dirListCache.clear();
   nativeTreeCache = null;
   nativeTreeBase = null;
+  gsdRootCache.clear();
 }
 
 // ─── Name Builders ─────────────────────────────────────────────────────────
@@ -342,6 +343,14 @@ export function _clearGsdRootCache(): void {
   gsdRootCache.clear();
 }
 
+/** Normalize a path for use as a gsdRootCache key (realpath + trailing-slash strip). */
+function normCacheKey(p: string): string {
+  let r: string;
+  try { r = realpathSync.native(p); } catch { r = p; }
+  const s = r.replaceAll("\\", "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? s.toLowerCase() : s;
+}
+
 /**
  * Resolve the `.gsd` directory for a given project base path.
  *
@@ -351,10 +360,12 @@ export function _clearGsdRootCache(): void {
  *   3. Walk up from basePath — handles moved .gsd in an ancestor (bounded by git root)
  *   4. basePath/.gsd         — creation fallback (init scenario)
  *
- * Result is cached per basePath for the process lifetime.
+ * Result is cached per normalized basePath for the process lifetime.
+ * Keys are realpath-normalized so /foo and /foo/ share the same cache entry.
  */
 export function gsdRoot(basePath: string): string {
-  const cached = gsdRootCache.get(basePath);
+  const cacheKey = normCacheKey(basePath);
+  const cached = gsdRootCache.get(cacheKey);
   if (cached) return cached;
 
   const result = probeGsdRoot(basePath);
@@ -365,7 +376,7 @@ export function gsdRoot(basePath: string): string {
   // valid (their basePath does not equal homedir).
   assertNotGlobalGsdHome(basePath, result);
 
-  gsdRootCache.set(basePath, result);
+  gsdRootCache.set(cacheKey, result);
   return result;
 }
 
