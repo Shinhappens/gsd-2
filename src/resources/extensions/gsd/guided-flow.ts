@@ -10,7 +10,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@g
 import type { GSDState } from "./types.js";
 import { showNextAction } from "../shared/tui.js";
 import { loadFile, saveFile } from "./files.js";
-import { isDbAvailable, getMilestoneSlices } from "./gsd-db.js";
+import { isDbAvailable, getMilestone, getMilestoneSlices } from "./gsd-db.js";
 import { parseRoadmapSlices } from "./roadmap-slices.js";
 import { loadPrompt, inlineTemplate } from "./prompt-loader.js";
 import {
@@ -429,6 +429,45 @@ export function checkAutoStartAfterDiscuss(): boolean {
   const contextFile = resolveMilestoneFile(basePath, milestoneId, "CONTEXT");
   const roadmapFile = resolveMilestoneFile(basePath, milestoneId, "ROADMAP");
   if (!contextFile && !roadmapFile) return false; // neither artifact yet — keep waiting
+
+  // Gate 1b: Discriminate plan-blocked from discuss-incomplete when the DB row is queued.
+  // If the DB is available and the row is still "queued" but CONTEXT.md already exists on
+  // disk, the discuss phase completed but gsd_plan_milestone was hard-blocked by the
+  // depth-verification gate.  Emit a recovery hint so the next agent turn can retry
+  // gsd_plan_milestone, then return false (keep blocking auto-start).
+  // If CONTEXT.md does not exist (discuss-incomplete), Gate 1 already blocked above.
+  if (isDbAvailable()) {
+    const dbRow = getMilestone(milestoneId);
+    if (dbRow?.status === "queued" && contextFile) {
+      logWarning(
+        "guided",
+        `Gate 1b: milestone ${milestoneId} queued with CONTEXT.md present — ` +
+        `plan_milestone was blocked; emitting recovery hint`,
+      );
+      ctx.ui.notify(
+        `Milestone ${milestoneId}: context file exists but milestone is still queued. ` +
+        `Retrying gsd_plan_milestone to complete the blocked planning step.`,
+        "warning",
+      );
+      try {
+        pi.sendMessage(
+          {
+            customType: "gsd-plan-milestone-blocked-recovery",
+            content:
+              `Milestone ${milestoneId} has ${contextFile} on disk but its DB row is still ` +
+              `"queued". The gsd_plan_milestone tool was previously blocked by the ` +
+              `depth-verification gate. Call gsd_plan_milestone now to complete the ` +
+              `planning phase.`,
+            display: false,
+          },
+          { triggerTurn: true },
+        );
+      } catch (e) {
+        logWarning("guided", `Gate 1b recovery sendMessage failed: ${(e as Error).message}`);
+      }
+      return false;
+    }
+  }
 
   // Gate 2: STATE.md must exist — written as the last step in the discuss
   // output phase. This prevents auto-start from firing during Phase 3
