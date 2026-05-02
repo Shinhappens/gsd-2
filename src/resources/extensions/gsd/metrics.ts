@@ -783,6 +783,12 @@ export function pruneMetricsLedger(base: string, keepCount: number): number {
   if (ledger) {
     ledger.units = ledger.units.slice(-keepCount);
   }
+  // Invalidate all scoped ledger cache entries. Prune is rare; clearing the
+  // entire map is simpler than tracking which entry belongs to `base`. Without
+  // this, scopedLedgers entries for the pruned workspace hold a pre-prune
+  // MetricsLedger that snapshotUnitMetricsByScope would merge back in, causing
+  // pruned units to reappear in subsequent snapshots.
+  scopedLedgers.clear();
   return removed;
 }
 
