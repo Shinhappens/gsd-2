@@ -119,7 +119,7 @@ function shouldPersistWriteGateSnapshot(env: NodeJS.ProcessEnv = process.env): b
   return v !== "0" && v !== "false";
 }
 
-function writeGateSnapshotPath(basePath: string = process.cwd()): string {
+function writeGateSnapshotPath(basePath: string): string {
   return join(basePath, ".gsd", "runtime", "write-gate-state.json");
 }
 
@@ -132,7 +132,7 @@ function currentWriteGateSnapshot(): WriteGateSnapshot {
   };
 }
 
-function persistWriteGateSnapshot(basePath: string = process.cwd()): void {
+function persistWriteGateSnapshot(basePath: string): void {
   if (!shouldPersistWriteGateSnapshot()) return;
   const path = writeGateSnapshotPath(basePath);
   mkdirSync(join(basePath, ".gsd", "runtime"), { recursive: true });
@@ -152,7 +152,7 @@ function persistWriteGateSnapshot(basePath: string = process.cwd()): void {
   }
 }
 
-function clearPersistedWriteGateSnapshot(basePath: string = process.cwd()): void {
+function clearPersistedWriteGateSnapshot(basePath: string): void {
   if (!shouldPersistWriteGateSnapshot()) return;
   const path = writeGateSnapshotPath(basePath);
   try {
@@ -185,7 +185,7 @@ const EMPTY_SNAPSHOT: WriteGateSnapshot = {
   pendingGateId: null,
 };
 
-export function loadWriteGateSnapshot(basePath: string = process.cwd()): WriteGateSnapshot {
+export function loadWriteGateSnapshot(basePath: string): WriteGateSnapshot {
   const path = writeGateSnapshotPath(basePath);
   if (!existsSync(path)) {
     // When persist mode is active and the file has been deleted, treat it as a
@@ -225,24 +225,24 @@ export function isQueuePhaseActive(): boolean {
   return activeQueuePhase;
 }
 
-export function setQueuePhaseActive(active: boolean): void {
+export function setQueuePhaseActive(active: boolean, basePath: string): void {
   activeQueuePhase = active;
-  persistWriteGateSnapshot();
+  persistWriteGateSnapshot(basePath);
 }
 
-export function resetWriteGateState(): void {
+export function resetWriteGateState(basePath: string): void {
   verifiedDepthMilestones.clear();
   verifiedApprovalGates.clear();
   pendingGateId = null;
-  persistWriteGateSnapshot();
+  persistWriteGateSnapshot(basePath);
 }
 
-export function clearDiscussionFlowState(): void {
+export function clearDiscussionFlowState(basePath: string): void {
   verifiedDepthMilestones.clear();
   verifiedApprovalGates.clear();
   activeQueuePhase = false;
   pendingGateId = null;
-  clearPersistedWriteGateSnapshot();
+  clearPersistedWriteGateSnapshot(basePath);
 }
 
 export function markDepthVerified(milestoneId?: string | null, basePath: string = process.cwd()): void {
@@ -292,20 +292,20 @@ function extractContextMilestoneId(inputPath: string): string | null {
 /**
  * Mark a gate as pending (called when ask_user_questions is invoked with a gate ID).
  */
-export function setPendingGate(gateId: string): void {
+export function setPendingGate(gateId: string, basePath: string): void {
   pendingGateId = gateId;
   verifiedApprovalGates.delete(gateId);
   const milestoneId = extractDepthVerificationMilestoneId(gateId);
   if (milestoneId) verifiedDepthMilestones.delete(milestoneId);
-  persistWriteGateSnapshot();
+  persistWriteGateSnapshot(basePath);
 }
 
 /**
  * Clear the pending gate (called when the user confirms).
  */
-export function clearPendingGate(): void {
+export function clearPendingGate(basePath: string): void {
   pendingGateId = null;
-  persistWriteGateSnapshot();
+  persistWriteGateSnapshot(basePath);
 }
 
 /**

@@ -230,7 +230,7 @@ type WorkflowToolExecutors = {
 };
 
 type WorkflowWriteGateModule = {
-  loadWriteGateSnapshot: (basePath?: string) => {
+  loadWriteGateSnapshot: (basePath: string) => {
     verifiedDepthMilestones: string[];
     activeQueuePhase: boolean;
     pendingGateId: string | null;
