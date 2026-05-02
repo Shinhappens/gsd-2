@@ -76,6 +76,7 @@ import {
   nativeMergeAbort,
 } from "./native-git-bridge.js";
 import { gsdHome } from "./gsd-home.js";
+import { type MilestoneScope, type GsdWorkspace, createWorkspace } from "./workspace.js";
 
 const PROJECT_PREFERENCES_FILE = "PREFERENCES.md";
 const LEGACY_PROJECT_PREFERENCES_FILE = "preferences.md";
@@ -254,8 +255,16 @@ function forceOverwriteAssessmentsWithVerdict(
 
 // ─── Module State ──────────────────────────────────────────────────────────
 
-/** Original project root before chdir into auto-worktree. */
-let originalBase: string | null = null;
+/** Active workspace registry — replaces the legacy `originalBase` singleton. */
+let activeWorkspace: GsdWorkspace | null = null;
+
+function setActiveWorkspace(ws: GsdWorkspace | null): void {
+  activeWorkspace = ws;
+}
+
+function getActiveWorkspace(): GsdWorkspace | null {
+  return activeWorkspace;
+}
 
 function clearProjectRootStateFiles(basePath: string, milestoneId: string): void {
   const gsdDir = gsdRoot(basePath);
@@ -345,6 +354,41 @@ export const isSafeToAutoResolve = (filePath: string): boolean =>
  * gsd.db in the worktree so it rebuilds from fresh disk state (#853).
  * Non-fatal — sync failure should never block dispatch.
  */
+/**
+ * Scope-typed variant of syncProjectRootToWorktree.
+ *
+ * Takes an explicit (rootScope, worktreeScope) pair where rootScope is the
+ * project root and worktreeScope is the auto-worktree. Direction is encoded
+ * in argument order. Asserts both scopes belong to the same workspace identity
+ * to prevent silent mismatch bugs.
+ */
+export function syncProjectRootToWorktreeByScope(
+  rootScope: MilestoneScope,
+  worktreeScope: MilestoneScope,
+): void {
+  if (rootScope.workspace.identityKey !== worktreeScope.workspace.identityKey) {
+    throw new Error(
+      `syncProjectRootToWorktreeByScope: scope identity mismatch — ` +
+      `rootScope.identityKey="${rootScope.workspace.identityKey}" ` +
+      `worktreeScope.identityKey="${worktreeScope.workspace.identityKey}"`,
+    );
+  }
+  if (rootScope.milestoneId !== worktreeScope.milestoneId) {
+    throw new Error(
+      `syncProjectRootToWorktreeByScope: milestoneId mismatch — ` +
+      `rootScope.milestoneId="${rootScope.milestoneId}" worktreeScope.milestoneId="${worktreeScope.milestoneId}"`,
+    );
+  }
+  const projectRoot = rootScope.workspace.projectRoot;
+  const worktreePath_ = worktreeScope.workspace.worktreeRoot ?? worktreeScope.workspace.projectRoot;
+  const milestoneId = rootScope.milestoneId;
+  syncProjectRootToWorktree(projectRoot, worktreePath_, milestoneId);
+}
+
+/**
+ * @deprecated Use syncProjectRootToWorktreeByScope instead.
+ * TODO(C-future): remove once all callers migrated.
+ */
 export function syncProjectRootToWorktree(
   projectRoot: string,
   worktreePath_: string,
@@ -431,11 +475,43 @@ export function syncProjectRootToWorktree(
 }
 
 /**
+ * Scope-typed variant of syncStateToProjectRoot.
+ *
+ * Takes an explicit (worktreeScope, rootScope) pair. Direction is encoded in
+ * argument order (worktree → root). Asserts both scopes belong to the same
+ * workspace identity to prevent silent mismatch bugs.
+ */
+export function syncStateToProjectRootByScope(
+  worktreeScope: MilestoneScope,
+  rootScope: MilestoneScope,
+): void {
+  if (worktreeScope.workspace.identityKey !== rootScope.workspace.identityKey) {
+    throw new Error(
+      `syncStateToProjectRootByScope: scope identity mismatch — ` +
+      `worktreeScope.identityKey="${worktreeScope.workspace.identityKey}" ` +
+      `rootScope.identityKey="${rootScope.workspace.identityKey}"`,
+    );
+  }
+  if (worktreeScope.milestoneId !== rootScope.milestoneId) {
+    throw new Error(
+      `syncStateToProjectRootByScope: milestoneId mismatch — ` +
+      `worktreeScope.milestoneId="${worktreeScope.milestoneId}" rootScope.milestoneId="${rootScope.milestoneId}"`,
+    );
+  }
+  const worktreePath_ = worktreeScope.workspace.worktreeRoot ?? worktreeScope.workspace.projectRoot;
+  const projectRoot = rootScope.workspace.projectRoot;
+  const milestoneId = worktreeScope.milestoneId;
+  syncStateToProjectRoot(worktreePath_, projectRoot, milestoneId);
+}
+
+/**
  * Sync worktree diagnostics from worktree to project root.
  * Only runs when inside an auto-worktree (worktreePath differs from projectRoot).
  * DB/project-root state remains authoritative; markdown projections are not
  * copied from the worktree back to the project root.
  * Non-fatal — sync failure should never block dispatch.
+ * @deprecated Use syncStateToProjectRootByScope instead.
+ * TODO(C-future): remove once all callers migrated.
  */
 export function syncStateToProjectRoot(
   worktreePath_: string,
@@ -626,6 +702,30 @@ export function cleanStaleRuntimeUnits(
 // ─── Worktree ↔ Main Repo Sync (#1311) ──────────────────────────────────────
 
 /**
+ * Scope-typed variant of syncGsdStateToWorktree.
+ *
+ * Takes an explicit (rootScope, worktreeScope) pair. Note: milestoneId is not
+ * used by syncGsdStateToWorktree — this variant only requires workspace
+ * identity. Asserts both scopes belong to the same workspace identity to
+ * prevent silent mismatch bugs.
+ */
+export function syncGsdStateToWorktreeByScope(
+  rootScope: MilestoneScope,
+  worktreeScope: MilestoneScope,
+): { synced: string[] } {
+  if (rootScope.workspace.identityKey !== worktreeScope.workspace.identityKey) {
+    throw new Error(
+      `syncGsdStateToWorktreeByScope: scope identity mismatch — ` +
+      `rootScope.identityKey="${rootScope.workspace.identityKey}" ` +
+      `worktreeScope.identityKey="${worktreeScope.workspace.identityKey}"`,
+    );
+  }
+  const mainBasePath = rootScope.workspace.projectRoot;
+  const worktreePath_ = worktreeScope.workspace.worktreeRoot ?? worktreeScope.workspace.projectRoot;
+  return syncGsdStateToWorktree(mainBasePath, worktreePath_);
+}
+
+/**
  * Sync .gsd/ state from the main repo into the worktree.
  *
  * When .gsd/ is a symlink to the external state directory, both the main
@@ -639,6 +739,8 @@ export function cleanStaleRuntimeUnits(
  * Only adds missing content — never overwrites existing files in the worktree.
  * Worktree files are compatibility projections; DB/project root remains
  * authoritative for runtime state.
+ * @deprecated Use syncGsdStateToWorktreeByScope instead.
+ * TODO(C-future): remove once all callers migrated.
  */
 export function syncGsdStateToWorktree(
   mainBasePath: string,
@@ -1042,6 +1144,40 @@ export function enterBranchModeForMilestone(
  * remains authoritative; this never downgrades checked boxes in a local
  * worktree projection.
  */
+/**
+ * Scope-typed variant of reconcilePlanCheckboxes.
+ *
+ * Takes an explicit (rootScope, worktreeScope) pair. milestoneId is taken
+ * from rootScope. Asserts both scopes belong to the same workspace identity
+ * to prevent silent mismatch bugs.
+ */
+export function reconcilePlanCheckboxesByScope(
+  rootScope: MilestoneScope,
+  worktreeScope: MilestoneScope,
+): void {
+  if (rootScope.workspace.identityKey !== worktreeScope.workspace.identityKey) {
+    throw new Error(
+      `reconcilePlanCheckboxesByScope: scope identity mismatch — ` +
+      `rootScope.identityKey="${rootScope.workspace.identityKey}" ` +
+      `worktreeScope.identityKey="${worktreeScope.workspace.identityKey}"`,
+    );
+  }
+  if (rootScope.milestoneId !== worktreeScope.milestoneId) {
+    throw new Error(
+      `reconcilePlanCheckboxesByScope: milestoneId mismatch — ` +
+      `rootScope.milestoneId="${rootScope.milestoneId}" worktreeScope.milestoneId="${worktreeScope.milestoneId}"`,
+    );
+  }
+  const projectRoot = rootScope.workspace.projectRoot;
+  const wtPath = worktreeScope.workspace.worktreeRoot ?? worktreeScope.workspace.projectRoot;
+  const milestoneId = rootScope.milestoneId;
+  reconcilePlanCheckboxes(projectRoot, wtPath, milestoneId);
+}
+
+/**
+ * @deprecated Use reconcilePlanCheckboxesByScope instead.
+ * TODO(C-future): remove once all callers migrated.
+ */
 function reconcilePlanCheckboxes(
   projectRoot: string,
   wtPath: string,
@@ -1218,10 +1354,10 @@ export function createAutoWorktree(
 
   try {
     process.chdir(info.path);
-    originalBase = basePath;
+    setActiveWorkspace(createWorkspace(basePath));
   } catch (err) {
     // If chdir fails, the worktree was created but we couldn't enter it.
-    // Don't store originalBase -- caller can retry or clean up.
+    // Don't set activeWorkspace -- caller can retry or clean up.
     throw new GSDError(
       GSD_IO_ERROR,
       `Auto-worktree created at ${info.path} but chdir failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -1302,48 +1438,87 @@ export function teardownAutoWorktree(
   const { preserveBranch = false } = opts;
   const previousCwd = process.cwd();
 
+  // Wrap the entire teardown body in a single try/finally so activeWorkspace
+  // is ALWAYS cleared — even if process.chdir throws (e.g. originalBasePath
+  // was deleted before teardown ran). Previously the finally only covered
+  // removeWorktree, leaving the registry stale on a chdir failure (H3 fix).
   try {
-    process.chdir(originalBasePath);
-    originalBase = null;
-  } catch (err) {
-    throw new GSDError(
-      GSD_IO_ERROR,
-      `Failed to chdir back to ${originalBasePath} during teardown: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-
-  nudgeGitBranchCache(previousCwd);
-  removeWorktree(originalBasePath, milestoneId, {
-    branch,
-    deleteBranch: !preserveBranch,
-  });
-
-  // Verify cleanup succeeded — warn if the worktree directory is still on disk.
-  // On Windows, bash-based cleanup can silently fail when paths contain
-  // backslashes (#1436), leaving ~1 GB+ orphaned directories.
-  const wtDir = worktreePath(originalBasePath, milestoneId);
-  if (existsSync(wtDir)) {
-    logWarning(
-      "reconcile",
-      `Worktree directory still exists after teardown: ${wtDir}. ` +
-        `This is likely an orphaned directory consuming disk space. ` +
-        `Remove it manually with: rm -rf "${wtDir.replaceAll("\\", "/")}"`,
-      { worktree: milestoneId },
-    );
-    // Attempt a direct filesystem removal as a fallback — but ONLY if the
-    // path is safely inside .gsd/worktrees/ to prevent #2365 data loss.
-    if (isInsideWorktreesDir(originalBasePath, wtDir)) {
-      try {
-        rmSync(wtDir, { recursive: true, force: true });
-      } catch (err) {
-        // Non-fatal — the warning above tells the user how to clean up
-        logWarning("worktree", `worktree directory removal failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    } else {
-      console.error(
-        `[GSD] REFUSING fallback rmSync — path is outside .gsd/worktrees/: ${wtDir}`,
+    try {
+      process.chdir(originalBasePath);
+    } catch (err) {
+      throw new GSDError(
+        GSD_IO_ERROR,
+        `Failed to chdir back to ${originalBasePath} during teardown: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+
+    // Mirror cleanup steps from mergeMilestoneToMain abort path:
+
+    // 1. Remove transient state files (STATE.md, auto.lock, {MID}-META.json).
+    //    Non-fatal — must not block teardown.
+    try {
+      clearProjectRootStateFiles(originalBasePath, milestoneId);
+    } catch (err) {
+      logWarning("worktree", `clearProjectRootStateFiles failed during teardown: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // 2. Reconcile worktree-local gsd.db into project root DB if both exist.
+    //    Non-fatal — handles legacy worktrees that have a local copy.
+    if (isDbAvailable()) {
+      try {
+        const contract = resolveGsdPathContract(previousCwd, originalBasePath);
+        const worktreeDbPath = join(contract.worktreeGsd ?? join(previousCwd, ".gsd"), "gsd.db");
+        const mainDbPath = contract.projectDb;
+        if (existsSync(worktreeDbPath) && !isSamePath(worktreeDbPath, mainDbPath)) {
+          reconcileWorktreeDb(mainDbPath, worktreeDbPath);
+        }
+      } catch (err) {
+        /* non-fatal */
+        logError("worktree", `DB reconciliation failed during teardown: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    nudgeGitBranchCache(previousCwd);
+
+    // 3. Remove the worktree. Errors propagate naturally — the outer finally
+    //    ensures activeWorkspace is cleared regardless.
+    removeWorktree(originalBasePath, milestoneId, {
+      branch,
+      deleteBranch: !preserveBranch,
+    });
+
+    // Verify cleanup succeeded — warn if the worktree directory is still on disk.
+    // On Windows, bash-based cleanup can silently fail when paths contain
+    // backslashes (#1436), leaving ~1 GB+ orphaned directories.
+    const wtDir = worktreePath(originalBasePath, milestoneId);
+    if (existsSync(wtDir)) {
+      logWarning(
+        "reconcile",
+        `Worktree directory still exists after teardown: ${wtDir}. ` +
+          `This is likely an orphaned directory consuming disk space. ` +
+          `Remove it manually with: rm -rf "${wtDir.replaceAll("\\", "/")}"`,
+        { worktree: milestoneId },
+      );
+      // Attempt a direct filesystem removal as a fallback — but ONLY if the
+      // path is safely inside .gsd/worktrees/ to prevent #2365 data loss.
+      if (isInsideWorktreesDir(originalBasePath, wtDir)) {
+        try {
+          rmSync(wtDir, { recursive: true, force: true });
+        } catch (err) {
+          // Non-fatal — the warning above tells the user how to clean up
+          logWarning("worktree", `worktree directory removal failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      } else {
+        console.error(
+          `[GSD] REFUSING fallback rmSync — path is outside .gsd/worktrees/: ${wtDir}`,
+        );
+      }
+    }
+  } finally {
+    // Clear module state unconditionally — regardless of which step above
+    // failed. A stale activeWorkspace causes getActiveAutoWorktreeContext()
+    // to return wrong data for subsequent operations.
+    setActiveWorkspace(null);
   }
 }
 
@@ -1356,8 +1531,9 @@ export function isInAutoWorktree(basePath: string): boolean {
   const targetPath = isGsdWorktreePath(basePath) ? basePath : process.cwd();
   if (!isGsdWorktreePath(targetPath)) return false;
 
-  const projectRoot = resolveWorktreeProjectRoot(basePath, originalBase);
-  const targetProjectRoot = resolveWorktreeProjectRoot(targetPath, originalBase);
+  const storedBase = getAutoWorktreeOriginalBase();
+  const projectRoot = resolveWorktreeProjectRoot(basePath, storedBase);
+  const targetProjectRoot = resolveWorktreeProjectRoot(targetPath, storedBase);
   if (
     normalizeWorktreePathForCompare(projectRoot) !==
     normalizeWorktreePathForCompare(targetProjectRoot)
@@ -1453,7 +1629,7 @@ export function enterAutoWorktree(
 
   try {
     process.chdir(p);
-    originalBase = basePath;
+    setActiveWorkspace(createWorkspace(basePath));
   } catch (err) {
     throw new GSDError(
       GSD_IO_ERROR,
@@ -1470,11 +1646,11 @@ export function enterAutoWorktree(
  * Returns null if not currently in an auto-worktree.
  */
 export function getAutoWorktreeOriginalBase(): string | null {
-  return originalBase;
+  return getActiveWorkspace()?.projectRoot ?? null;
 }
 
 export function _resetAutoWorktreeOriginalBaseForTests(): void {
-  originalBase = null;
+  setActiveWorkspace(null);
 }
 
 export function getActiveAutoWorktreeContext(): {
@@ -1482,7 +1658,9 @@ export function getActiveAutoWorktreeContext(): {
   worktreeName: string;
   branch: string;
 } | null {
-  if (!originalBase) return null;
+  const ws = getActiveWorkspace();
+  if (!ws) return null;
+  const originalBase = ws.projectRoot;
   const cwd = process.cwd();
   if (!isGsdWorktreePath(cwd)) return null;
   const cwdProjectRoot = resolveWorktreeProjectRoot(cwd, originalBase);
@@ -1563,11 +1741,11 @@ export function mergeMilestoneToMain(
   //    integration branch captures dirty files from OTHER milestones under a
   //    misleading commit message, contaminating the main branch (#2929).
   //
-  //    When originalBase is null (branch mode, no worktree), autoCommitDirtyState
+  //    When activeWorkspace is null (branch mode, no worktree), autoCommitDirtyState
   //    runs unconditionally — the caller is responsible for cwd placement.
   {
     let shouldAutoCommit = true;
-    if (originalBase !== null) {
+    if (getActiveWorkspace() !== null) {
       try {
         const currentBranch = nativeGetCurrentBranch(worktreeCwd);
         shouldAutoCommit = currentBranch === milestoneBranch;
@@ -2302,7 +2480,7 @@ export function mergeMilestoneToMain(
   }
 
   // 14. Clear module state
-  originalBase = null;
+  setActiveWorkspace(null);
   nudgeGitBranchCache(previousCwd);
 
   // 15. Anchor cwd at the project root on success-return. Step 12 removed

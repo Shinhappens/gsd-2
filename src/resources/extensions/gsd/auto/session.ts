@@ -22,6 +22,7 @@ import type { GitServiceImpl } from "../git-service.js";
 import type { CaptureEntry } from "../captures.js";
 import type { BudgetAlertLevel } from "../auto-budget.js";
 import { resolveWorktreeProjectRoot } from "../worktree-root.js";
+import type { MilestoneScope } from "../workspace.js";
 
 // ─── Exported Types ──────────────────────────────────────────────────────────
 
@@ -94,6 +95,8 @@ export class AutoSession {
   // ── Paths ────────────────────────────────────────────────────────────────
   basePath = "";
   originalBasePath = "";
+  // TODO(C8): remove basePath/originalBasePath once all readers use s.scope
+  scope: MilestoneScope | null = null;
   previousProjectRootEnv: string | null = null;
   hadProjectRootEnv = false;
   projectRootEnvCaptured = false;
@@ -247,6 +250,7 @@ export class AutoSession {
     // Paths
     this.basePath = "";
     this.originalBasePath = "";
+    this.scope = null;
     this.previousProjectRootEnv = null;
     this.hadProjectRootEnv = false;
     this.projectRootEnvCaptured = false;

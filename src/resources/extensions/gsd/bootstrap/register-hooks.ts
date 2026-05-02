@@ -76,7 +76,7 @@ export function registerHooks(
       const { initHealthWidget } = await import("../health-widget.js");
       initHealthWidget(ctx);
     }
-    resetWriteGateState();
+    resetWriteGateState(process.cwd());
     resetToolCallLoopGuard();
     approvalQuestionAbortInFlight = false;
     await resetAskUserQuestionsTurnCache();
@@ -126,10 +126,10 @@ export function registerHooks(
   pi.on("session_switch", async (_event, ctx) => {
     initNotificationStore(process.cwd());
     installNotifyInterceptor(ctx);
-    resetWriteGateState();
+    resetWriteGateState(process.cwd());
     resetToolCallLoopGuard();
     await resetAskUserQuestionsTurnCache();
-    clearDiscussionFlowState();
+    clearDiscussionFlowState(process.cwd());
     await syncServiceTierStatus(ctx);
     await applyDisabledModelProviderPolicy(ctx);
     // Skip MCP auto-prep when running inside an auto-worktree. The worktree
@@ -155,12 +155,13 @@ export function registerHooks(
     const { getEcosystemReadyPromise } = await import("../ecosystem/loader.js");
     await getEcosystemReadyPromise();
 
+    const beforeAgentBasePath = process.cwd();
     const pendingApprovalGate = getPendingGate();
     if (pendingApprovalGate && isExplicitApprovalResponse(event.prompt, pendingApprovalGate)) {
-      markApprovalGateVerified(pendingApprovalGate);
+      markApprovalGateVerified(pendingApprovalGate, beforeAgentBasePath);
       const milestoneId = extractDepthVerificationMilestoneId(pendingApprovalGate);
-      if (milestoneId) markDepthVerified(milestoneId);
-      clearPendingGate();
+      if (milestoneId) markDepthVerified(milestoneId, beforeAgentBasePath);
+      clearPendingGate(beforeAgentBasePath);
     }
 
     // GSD's own context injection (existing behavior — unchanged).
@@ -346,7 +347,7 @@ export function registerHooks(
     if (!shouldPauseForUserApprovalQuestion(unitType, [event.message])) return;
 
     const gateId = approvalGateIdForUnit(unitType, unitId);
-    if (gateId) setPendingGate(gateId);
+    if (gateId) setPendingGate(gateId, process.cwd());
 
     approvalQuestionAbortInFlight = true;
     ctx.ui.notify(
@@ -393,7 +394,7 @@ export function registerHooks(
       const questions: any[] = (event.input as any)?.questions ?? [];
       const questionId = questions.find((question) => typeof question?.id === "string" && isGateQuestionId(question.id))?.id;
       if (typeof questionId === "string") {
-        setPendingGate(questionId);
+        setPendingGate(questionId, discussionBasePath);
       }
     }
 
@@ -555,7 +556,8 @@ export function registerHooks(
     }
     const toolName = canonicalToolName(event.toolName);
     if (toolName !== "ask_user_questions") return;
-    const milestoneId = await getDiscussionMilestoneIdFor(process.cwd());
+    const basePath = process.cwd();
+    const milestoneId = await getDiscussionMilestoneIdFor(basePath);
     const queueActive = isQueuePhaseActive();
 
     const details = event.details as any;
@@ -588,10 +590,10 @@ export function registerHooks(
         if (pendingQuestion) {
           const answer = details.response?.answers?.[currentPendingGate];
           if (isDepthConfirmationAnswer(answer?.selected, pendingQuestion.options)) {
-            markApprovalGateVerified(currentPendingGate);
+            markApprovalGateVerified(currentPendingGate, basePath);
             const milestoneIdFromGate = extractDepthVerificationMilestoneId(currentPendingGate);
-            if (milestoneIdFromGate) markDepthVerified(milestoneIdFromGate);
-            clearPendingGate();
+            if (milestoneIdFromGate) markDepthVerified(milestoneIdFromGate, basePath);
+            clearPendingGate(basePath);
           }
         }
       }
@@ -607,9 +609,9 @@ export function registerHooks(
         const inferredMilestoneId = extractDepthVerificationMilestoneId(question.id) ?? milestoneId;
         if (isDepthConfirmationAnswer(answer?.selected, question.options)) {
           if (currentPendingGate && question.id !== currentPendingGate) break;
-          markApprovalGateVerified(question.id);
-          markDepthVerified(inferredMilestoneId);
-          clearPendingGate();
+          markApprovalGateVerified(question.id, basePath);
+          markDepthVerified(inferredMilestoneId, basePath);
+          clearPendingGate(basePath);
         }
         break;
       }
@@ -617,8 +619,6 @@ export function registerHooks(
 
     if (!milestoneId && !queueActive) return;
     if (!milestoneId) return;
-
-    const basePath = process.cwd();
     const milestoneDir = resolveMilestonePath(basePath, milestoneId);
     if (!milestoneDir) return;
 

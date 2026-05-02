@@ -115,7 +115,7 @@ export async function handleAgentEnd(
   }
 
   if (checkAutoStartAfterDiscuss()) {
-    clearDiscussionFlowState();
+    clearDiscussionFlowState(resolveAgentEndBasePath() ?? process.cwd());
     return;
   }
 

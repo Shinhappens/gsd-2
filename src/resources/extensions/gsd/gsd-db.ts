@@ -25,6 +25,7 @@ import { existsSync, copyFileSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Decision, Requirement, GateRow, GateId, GateScope, GateStatus, GateVerdict } from "./types.js";
 import { GSDError, GSD_STALE_STATE } from "./errors.js";
+import type { GsdWorkspace, MilestoneScope } from "./workspace.js";
 import { getGateIdsForTurn, type OwnerTurn } from "./gate-registry.js";
 import { logError, logWarning } from "./workflow-logger.js";
 // Type-only import to avoid a circular runtime dep. The runtime side of
@@ -1259,6 +1260,182 @@ let _exitHandlerRegistered = false;
 let _dbOpenAttempted = false;
 let _lastDbError: Error | null = null;
 let _lastDbPhase: "open" | "initSchema" | "vacuum-recovery" | null = null;
+/**
+ * Identity key of the workspace whose connection is currently active
+ * (currentDb). Set by openDatabaseByWorkspace(); null when the active
+ * connection was opened via the legacy openDatabase(path) path.
+ */
+let _currentIdentityKey: string | null = null;
+
+/**
+ * Workspace-scoped connection cache.
+ * Key: GsdWorkspace.identityKey (realpath-normalized project root).
+ * Value: the DB path and open adapter for that workspace.
+ *
+ * Sibling worktrees of the same project share the same identityKey (set by
+ * createWorkspace) and therefore reuse the same cached connection, preserving
+ * shared-WAL semantics. Different projects get distinct cache entries.
+ *
+ * NOTE: Only one connection is "active" at a time (currentDb/currentPath).
+ * The cache allows fast re-activation of a previously opened connection when
+ * callers switch between known workspaces via openDatabaseByWorkspace().
+ */
+const _dbCache = new Map<string, { dbPath: string; db: DbAdapter }>();
+
+/** Test helper: expose the internal cache for inspection. Not for production use. */
+export function _getDbCache(): ReadonlyMap<string, { dbPath: string; db: DbAdapter }> {
+  return _dbCache;
+}
+
+/**
+ * Close and evict every entry in the workspace connection cache, then call
+ * closeDatabase() to close the active connection.
+ *
+ * Use this for test teardown or process-shutdown paths where every open
+ * connection must be flushed. Normal callers should use closeDatabase() or
+ * closeDatabaseByWorkspace() instead.
+ */
+export function closeAllDatabases(): void {
+  // Close all non-active cached connections first.
+  for (const [key, entry] of _dbCache) {
+    if (entry.db === currentDb) continue; // handled by closeDatabase() below
+    _dbCache.delete(key);
+    try { entry.db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch { /* best-effort */ }
+    try { entry.db.exec("PRAGMA incremental_vacuum(64)"); } catch { /* best-effort */ }
+    try { entry.db.close(); } catch { /* best-effort */ }
+  }
+  closeDatabase();
+}
+
+/**
+ * Open (or reuse) the database connection scoped to the given workspace.
+ *
+ * Uses workspace.identityKey as the cache key, so sibling worktrees of the
+ * same project resolve to the same connection. On a cache hit the existing
+ * adapter is reactivated as the current connection without re-opening the
+ * file. On a cache miss, delegates to openDatabase() for the full
+ * open + schema-init + migration flow, then caches the result.
+ *
+ * When switching to a different workspace, the previously active connection
+ * is preserved in the cache (not closed), so callers can switch back to it
+ * cheaply via a subsequent openDatabaseByWorkspace() call.
+ *
+ * @param workspace A GsdWorkspace created by createWorkspace().
+ * @returns true if the connection is open and ready, false otherwise.
+ */
+export function openDatabaseByWorkspace(workspace: GsdWorkspace): boolean {
+  const key = workspace.identityKey;
+  const dbPath = workspace.contract.projectDb;
+
+  const cached = _dbCache.get(key);
+  if (cached) {
+    // Reactivate the cached connection as the current singleton.
+    currentDb = cached.db;
+    currentPath = cached.dbPath;
+    currentPid = process.pid;
+    _dbOpenAttempted = true;
+    _currentIdentityKey = key;
+    return true;
+  }
+
+  // Cache miss — need to open a new connection.
+  //
+  // If there is a currently active workspace connection, stash it in the
+  // cache under its identity key before calling openDatabase(), because
+  // openDatabase() will call closeDatabase() when the path changes (which
+  // would destroy the existing adapter). By nulling out currentDb first,
+  // we prevent openDatabase() from closing the live adapter.
+  let oldDb: typeof currentDb = null;
+  let oldPath: typeof currentPath = null;
+  let oldPid: typeof currentPid = 0;
+  let oldKey: typeof _currentIdentityKey = null;
+
+  if (currentDb !== null && _currentIdentityKey !== null) {
+    // Snapshot the old globals so we can restore them on failure.
+    oldDb = currentDb;
+    oldPath = currentPath;
+    oldPid = currentPid;
+    oldKey = _currentIdentityKey;
+    // Save the current connection so it stays alive in the cache.
+    _dbCache.set(_currentIdentityKey, {
+      dbPath: currentPath!,
+      db: currentDb,
+    });
+    // Detach from globals so openDatabase() opens fresh without closing it.
+    currentDb = null;
+    currentPath = null;
+    currentPid = 0;
+    _currentIdentityKey = null;
+  }
+
+  // Run the full open/schema/migration flow for the new workspace.
+  // openDatabase() can throw on corrupt DB or permission error — catch so we
+  // can restore the previous connection rather than leaving globals null.
+  let opened: boolean;
+  try {
+    opened = openDatabase(dbPath);
+  } catch (err) {
+    // Failed to open the new DB. Restore the previous workspace connection so
+    // the caller's workspace remains active (it is still safe in _dbCache).
+    if (oldDb !== null) {
+      currentDb = oldDb;
+      currentPath = oldPath;
+      currentPid = oldPid;
+      _currentIdentityKey = oldKey;
+    }
+    throw err;
+  }
+  if (opened && currentDb) {
+    _dbCache.set(key, { dbPath, db: currentDb });
+    _currentIdentityKey = key;
+  } else if (!opened && oldDb !== null) {
+    // Restore the previous connection so the caller's workspace remains active.
+    // The failed attempt left no live adapter, so the globals stayed null.
+    currentDb = oldDb;
+    currentPath = oldPath;
+    currentPid = oldPid;
+    _currentIdentityKey = oldKey;
+  }
+  return opened;
+}
+
+/**
+ * Open (or reuse) the database connection scoped to the workspace in a
+ * MilestoneScope. Thin delegation to openDatabaseByWorkspace().
+ */
+export function openDatabaseByScope(scope: MilestoneScope): boolean {
+  return openDatabaseByWorkspace(scope.workspace);
+}
+
+/**
+ * Close the database connection for the given workspace and remove it from
+ * the cache. If the workspace's connection is currently active (currentDb),
+ * performs a full closeDatabase() including WAL checkpoint. Otherwise only
+ * removes the cache entry (the adapter was already replaced by a later open).
+ */
+export function closeDatabaseByWorkspace(workspace: GsdWorkspace): void {
+  const key = workspace.identityKey;
+  const cached = _dbCache.get(key);
+  if (!cached) return;
+
+  _dbCache.delete(key);
+
+  if (currentDb === cached.db) {
+    // This workspace's connection is the active one — full close.
+    closeDatabase();
+  } else {
+    // Connection was displaced by a later open; close the adapter directly.
+    try {
+      cached.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } catch (e) { logWarning("db", `WAL checkpoint (byWorkspace) failed: ${(e as Error).message}`); }
+    try {
+      cached.db.exec("PRAGMA incremental_vacuum(64)");
+    } catch (e) { logWarning("db", `incremental vacuum (byWorkspace) failed: ${(e as Error).message}`); }
+    try {
+      cached.db.close();
+    } catch (e) { logWarning("db", `database close (byWorkspace) failed: ${(e as Error).message}`); }
+  }
+}
 
 export function getDbProvider(): ProviderName | null {
   loadProvider();
@@ -1389,6 +1566,13 @@ export function closeDatabase(): void {
     try {
       currentDb.close();
     } catch (e) { logWarning("db", `database close failed: ${(e as Error).message}`); }
+    // If this connection was workspace-tracked, evict it from the cache so
+    // subsequent openDatabaseByWorkspace() calls re-open rather than reactivate
+    // a closed adapter.
+    if (_currentIdentityKey !== null) {
+      _dbCache.delete(_currentIdentityKey);
+      _currentIdentityKey = null;
+    }
     currentDb = null;
     currentPath = null;
     currentPid = 0;
