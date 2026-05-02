@@ -829,6 +829,25 @@ function deduplicateUnits(units: UnitMetrics[]): UnitMetrics[] {
 // orphaned from a crashed process. Set to 2× the acquire timeout.
 export const STALE_LOCK_THRESHOLD_MS = 4000;
 
+// Retry interval between lock acquire attempts (ms). Caps syscall rate at
+// ~200 attempts over a 2s timeout instead of ~20,000 without any sleep.
+// Exposed for tests.
+export const LOCK_RETRY_INTERVAL_MS = 5;
+
+// Sync sleep via Atomics.wait — true OS-level sleep, no CPU spin.
+// Int32Array must reference a SharedArrayBuffer; we wait on index 0 which
+// will never be woken by a Atomics.notify, so the wait always times out.
+const _lockSleepBuf = new Int32Array(new SharedArrayBuffer(4));
+function syncSleep(ms: number): void {
+  Atomics.wait(_lockSleepBuf, 0, 0, ms);
+}
+
+// Counts the number of sleepy retries (non-stale-evicting) made by acquireLock
+// across all calls since the last reset. Exported for test instrumentation only.
+let _lockSleepyRetries = 0;
+export function getLockSleepyRetries(): number { return _lockSleepyRetries; }
+export function resetLockSleepyRetries(): void { _lockSleepyRetries = 0; }
+
 /**
  * Acquire an exclusive .lock sentinel file via O_EXCL.
  *
@@ -843,6 +862,12 @@ export const STALE_LOCK_THRESHOLD_MS = 4000;
  *    A warning is logged so operators can detect crash patterns.
  *  - PID stamp: on success, writes the acquiring process's PID and a
  *    timestamp into the lock file so external monitors can identify orphans.
+ *  - Retry sleep: after each non-stale-evicting retry, sleeps
+ *    LOCK_RETRY_INTERVAL_MS (5ms) via Atomics.wait so the process yields to
+ *    the OS. This caps syscall rate at ~200–400/s under contention instead of
+ *    the ~20,000/s that would result from a tight openSync loop.
+ *    After a stale-lock eviction (lock already removed), no sleep is injected
+ *    — we retry immediately to close the short race window.
  *
  * Returns true on success, false on timeout.
  */
@@ -867,12 +892,16 @@ function acquireLock(lockPath: string, timeoutMs = 2000): boolean {
             `stale metrics lock at ${lockPath} (age ${Date.now() - st.mtimeMs}ms); forcibly removing and retrying`,
           );
           try { unlinkSync(lockPath); } catch { /* already gone */ }
-          // Do NOT sleep — retry the open immediately after clearing.
+          // Do NOT sleep after stale-lock eviction — retry the open
+          // immediately. The lock file was just removed; a short race window
+          // exists and sleeping here would unnecessarily delay recovery.
           continue;
         }
       } catch { /* lock file disappeared between the failed open and stat — retry */ }
-      // No busy-spin: just check deadline and loop. Each iteration costs one
-      // openSync syscall (~100µs), which is far cheaper than a zero-work spin.
+      // Sleep between retries to yield to the OS and cap syscall rate.
+      // Uses Atomics.wait for a true blocking sleep (no CPU spin).
+      _lockSleepyRetries++;
+      syncSleep(LOCK_RETRY_INTERVAL_MS);
     }
   }
   return false;
