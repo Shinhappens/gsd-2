@@ -1304,7 +1304,6 @@ export function teardownAutoWorktree(
 
   try {
     process.chdir(originalBasePath);
-    originalBase = null;
   } catch (err) {
     throw new GSDError(
       GSD_IO_ERROR,
@@ -1312,11 +1311,42 @@ export function teardownAutoWorktree(
     );
   }
 
+  // Mirror cleanup steps from mergeMilestoneToMain abort path:
+
+  // 1. Remove transient state files (STATE.md, auto.lock, {MID}-META.json).
+  //    Non-fatal — must not block teardown.
+  try {
+    clearProjectRootStateFiles(originalBasePath, milestoneId);
+  } catch (err) {
+    logWarning("worktree", `clearProjectRootStateFiles failed during teardown: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // 2. Reconcile worktree-local gsd.db into project root DB if both exist.
+  //    Non-fatal — handles legacy worktrees that have a local copy.
+  if (isDbAvailable()) {
+    try {
+      const contract = resolveGsdPathContract(previousCwd, originalBasePath);
+      const worktreeDbPath = join(contract.worktreeGsd ?? join(previousCwd, ".gsd"), "gsd.db");
+      const mainDbPath = contract.projectDb;
+      if (existsSync(worktreeDbPath) && !isSamePath(worktreeDbPath, mainDbPath)) {
+        reconcileWorktreeDb(mainDbPath, worktreeDbPath);
+      }
+    } catch (err) {
+      /* non-fatal */
+      logError("worktree", `DB reconciliation failed during teardown: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   nudgeGitBranchCache(previousCwd);
   removeWorktree(originalBasePath, milestoneId, {
     branch,
     deleteBranch: !preserveBranch,
   });
+
+  // 3. Clear module state AFTER removeWorktree — matching mergeMilestoneToMain
+  //    order so originalBase is non-null if removeWorktree throws (worktree dir
+  //    would be orphaned on disk but originalBase still valid for recovery).
+  originalBase = null;
 
   // Verify cleanup succeeded — warn if the worktree directory is still on disk.
   // On Windows, bash-based cleanup can silently fail when paths contain
