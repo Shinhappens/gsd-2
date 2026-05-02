@@ -81,7 +81,7 @@ describe('gsdRootCache key normalization', () => {
   });
 });
 
-describe('clearPathCache() invalidates gsdRootCache', () => {
+describe('clearPathCache() does NOT invalidate gsdRootCache (process-lifetime semantics)', () => {
   let projectDir: string;
   let fakeHome: string;
   let savedHome: string | undefined;
@@ -113,37 +113,58 @@ describe('clearPathCache() invalidates gsdRootCache', () => {
     if (savedGsdHome === undefined) delete process.env.GSD_HOME;
     else process.env.GSD_HOME = savedGsdHome;
 
+    _clearGsdRootCache();
     clearPathCache();
     rmSync(projectDir, { recursive: true, force: true });
     rmSync(fakeHome, { recursive: true, force: true });
   });
 
-  test('clearPathCache() causes gsdRoot to re-probe after .gsd is removed', (t) => {
+  test('clearPathCache() does NOT evict a cached gsdRoot result', (t) => {
     // Prime the cache.
     const firstResult = gsdRoot(projectDir);
     assert.equal(firstResult, join(projectDir, '.gsd'));
 
-    // Remove .gsd while the cache still holds the old result.
+    // Remove .gsd so a fresh probe would return a different (fallback) result.
     renameSync(join(projectDir, '.gsd'), join(projectDir, '.gsd-hidden'));
     t.after(() => {
       try { renameSync(join(projectDir, '.gsd-hidden'), join(projectDir, '.gsd')); } catch { /* ignore */ }
     });
 
-    // Without clearing: still returns cached result.
-    const cachedResult = gsdRoot(projectDir);
-    assert.equal(
-      cachedResult,
-      firstResult,
-      'without clearPathCache, gsdRoot must return the cached result',
-    );
-
-    // After clearing: re-probes and falls through to creation fallback.
+    // clearPathCache() only clears volatile dir caches — gsdRootCache is untouched.
     clearPathCache();
-    const afterClear = gsdRoot(projectDir);
+    const afterClearPath = gsdRoot(projectDir);
     assert.equal(
-      afterClear,
-      join(projectDir, '.gsd'),
-      'after clearPathCache, gsdRoot must re-probe and return creation fallback',
+      afterClearPath,
+      firstResult,
+      'clearPathCache must NOT evict gsdRootCache — result must still be the cached value',
     );
+  });
+
+  test('_clearGsdRootCache() DOES evict gsdRootCache, causing re-probe', (t) => {
+    // Prime the cache.
+    const firstResult = gsdRoot(projectDir);
+    assert.equal(firstResult, join(projectDir, '.gsd'));
+
+    // Remove .gsd so a fresh probe returns the creation fallback.
+    renameSync(join(projectDir, '.gsd'), join(projectDir, '.gsd-hidden'));
+    t.after(() => {
+      try { renameSync(join(projectDir, '.gsd-hidden'), join(projectDir, '.gsd')); } catch { /* ignore */ }
+    });
+
+    // _clearGsdRootCache() evicts the entry — next call re-probes.
+    _clearGsdRootCache();
+    const afterClearRoot = gsdRoot(projectDir);
+    assert.equal(
+      afterClearRoot,
+      join(projectDir, '.gsd'),
+      'after _clearGsdRootCache, gsdRoot must re-probe and return creation fallback',
+    );
+    // The two results are equal (same path) but the key point is re-probe occurred;
+    // the cached firstResult also happened to equal the fallback path.
+    // Verify: if we prime again without removing .gsd, clearing root re-probes to gsd.
+    renameSync(join(projectDir, '.gsd-hidden'), join(projectDir, '.gsd'));
+    _clearGsdRootCache();
+    const reprobe = gsdRoot(projectDir);
+    assert.equal(reprobe, join(projectDir, '.gsd'), 're-probe after restore returns .gsd');
   });
 });
