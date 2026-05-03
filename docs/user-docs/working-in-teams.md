@@ -29,6 +29,7 @@ Share planning artifacts (milestones, roadmaps, decisions) while keeping runtime
 .gsd/auto.lock
 .gsd/completed-units.json
 .gsd/STATE.md
+.gsd/gsd.db*
 .gsd/metrics.json
 .gsd/activity/
 .gsd/runtime/
@@ -45,7 +46,7 @@ Share planning artifacts (milestones, roadmaps, decisions) while keeping runtime
 - `.gsd/milestones/` — roadmaps, plans, summaries, research
 
 **What stays local** (gitignored):
-- Lock files, metrics, state cache, runtime records, worktrees, activity logs
+- Database files, lock files, metrics, state projections, runtime records, worktrees, activity logs
 
 ### 3. Commit the Preferences
 

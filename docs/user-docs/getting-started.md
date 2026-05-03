@@ -374,15 +374,16 @@ Milestone  →  a shippable version (4-10 slices)
 
 The iron rule: **a task must fit in one context window.** If it can't, it's two tasks.
 
-All state lives on disk in `.gsd/`:
+GSD keeps authoritative runtime state in the project-root SQLite database and renders markdown projections into `.gsd/` for review, prompts, and git history:
 
 ```
 .gsd/
+  gsd.db              — authoritative runtime database (local, gitignored)
   PROJECT.md          — what the project is right now
   REQUIREMENTS.md     — requirement contract
   DECISIONS.md        — append-only architectural decisions
   KNOWLEDGE.md        — cross-session rules and patterns
-  STATE.md            — quick-glance status
+  STATE.md            — quick-glance status rendered from the database
   milestones/
     M001/
       M001-ROADMAP.md — slice plan with dependencies

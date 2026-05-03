@@ -15,6 +15,7 @@ import {
   type SkillsPolicy,
   type UnitContextManifest,
 } from "../unit-context-manifest.ts";
+import { ALLOWED_PLANNING_DISPATCH_AGENTS } from "../bootstrap/write-gate.ts";
 
 // ─── Coverage: every known unit type has a manifest ──────────────────────
 
@@ -199,8 +200,8 @@ test("#4934: every manifest declares a tools policy", () => {
   }
 });
 
-test("#4934: tools.mode is one of the four declared policies", () => {
-  const validModes = new Set(["all", "read-only", "planning", "docs"]);
+test("#4934: tools.mode is one of the declared policies", () => {
+  const validModes = new Set(["all", "read-only", "planning", "planning-dispatch", "docs"]);
   for (const [unitType, manifest] of Object.entries(UNIT_MANIFESTS)) {
     const mode = (manifest as { tools: { mode: string } }).tools.mode;
     assert.ok(
@@ -219,7 +220,51 @@ test('#4934: only execute-task and reactive-execute may use tools.mode "all" (fu
         allowedAllUnits.has(unitType),
         `manifest "${unitType}" declares tools.mode = "all" but is not on the execute-track. ` +
         'Only execute-task and reactive-execute should have full source write access; ' +
-        'planning/discuss/research units must use "planning" (or "docs" for rewrite-docs).',
+        'planning/discuss/research units must use "planning" or "planning-dispatch" (or "docs" for rewrite-docs).',
+      );
+    }
+  }
+});
+
+test('planning-dispatch mode is reserved for slice-level decomposition and completion units', () => {
+  const allowedDispatchUnits = new Set([
+    "plan-slice",
+    "refine-slice",
+    "complete-slice",
+    "complete-milestone",
+    // Deep planning mode: research-project orchestrates 4 parallel research
+    // subagents (stack/features/architecture/pitfalls). Subagent dispatch is
+    // the unit's core mechanism — without it, the unit cannot do its job.
+    "research-project",
+    "validate-milestone",
+  ]);
+  for (const [unitType, manifest] of Object.entries(UNIT_MANIFESTS)) {
+    const mode = (manifest as { tools: { mode: string } }).tools.mode;
+    if (mode === "planning-dispatch") {
+      assert.ok(
+        allowedDispatchUnits.has(unitType),
+        `manifest "${unitType}" declares tools.mode = "planning-dispatch" but is not on the dispatch-allowed allowlist. ` +
+        'planning-dispatch is intentionally narrow — extend the allowlist consciously when a new unit type genuinely benefits from subagent delegation.',
+      );
+    }
+  }
+});
+
+test('planning-dispatch manifests declare non-empty allowedSubagents lists', () => {
+  for (const [unitType, manifest] of Object.entries(UNIT_MANIFESTS)) {
+    if (manifest.tools.mode !== "planning-dispatch") continue;
+    assert.ok(
+      Array.isArray(manifest.tools.allowedSubagents) && manifest.tools.allowedSubagents.length > 0,
+      `manifest "${unitType}" has planning-dispatch policy but no allowedSubagents — explicit allowlist is required for runtime dispatch gating`,
+    );
+    for (const agent of manifest.tools.allowedSubagents) {
+      assert.ok(
+        typeof agent === "string" && agent.length > 0,
+        `manifest "${unitType}" has empty/invalid allowedSubagents entry: ${JSON.stringify(agent)}`,
+      );
+      assert.ok(
+        ALLOWED_PLANNING_DISPATCH_AGENTS.has(agent),
+        `manifest "${unitType}" allows "${agent}", but the runtime planning-dispatch registry will hard-block it`,
       );
     }
   }

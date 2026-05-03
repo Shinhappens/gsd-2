@@ -37,7 +37,7 @@ import { composeInlinedContext, type ArtifactResolver } from "./unit-context-com
 import { logWarning } from "./workflow-logger.js";
 import { inlineGraphSubgraph } from "./graph-context.js";
 import { buildExtractionStepsBlock } from "./commands-extract-learnings.js";
-import { warnIfManifestHasMissingSkills } from "./skill-manifest.js";
+import { resolveSkillManifest, warnIfManifestHasMissingSkills } from "./skill-manifest.js";
 
 // ─── Preamble Cap ─────────────────────────────────────────────────────────────
 
@@ -99,16 +99,17 @@ function capPreamble(preamble: string): string {
 function formatExecutorConstraints(
   sessionContextWindow?: number,
   modelRegistry?: MinimalModelRegistry,
+  sessionProvider?: string,
 ): string {
   let windowTokens: number;
   try {
     const prefs = loadEffectiveGSDPreferences();
-    windowTokens = resolveExecutorContextWindow(modelRegistry, prefs?.preferences, sessionContextWindow);
+    windowTokens = resolveExecutorContextWindow(modelRegistry, prefs?.preferences, sessionContextWindow, sessionProvider);
   } catch (e) {
     logWarning("prompt", `resolveExecutorContextWindow failed: ${(e as Error).message}`);
     // Delegate to the budget engine without prefs (the path that just threw)
     // so DEFAULT_CONTEXT_WINDOW stays the single source of truth.
-    windowTokens = resolveExecutorContextWindow(undefined, undefined, sessionContextWindow);
+    windowTokens = resolveExecutorContextWindow(undefined, undefined, sessionContextWindow, sessionProvider);
   }
   const budgets = computeBudgets(windowTokens);
   const { min, max } = budgets.taskCountRange;
@@ -776,6 +777,25 @@ function formatSkillActivationBlock(skillNames: string[]): string {
   return `<skill_activation>${calls}.</skill_activation>`;
 }
 
+/**
+ * Manifest-driven recommendations block — informational only, does NOT
+ * auto-invoke. Lists per-unit-type skills that are installed but not already
+ * activated by explicit user intent (always_use_skills / prefer_skills /
+ * skill_rules / task-plan skills_used). Surfaces relevant skills to the
+ * model so they can be invoked when the model judges them useful.
+ *
+ * This is the additive complement to the existing activation directive:
+ * activation force-invokes (explicit intent), recommendations remind
+ * (manifest defaults). User intent is preserved as the stronger signal
+ * (RFC #4779 design principle); this block only adds visibility.
+ */
+function formatSkillRecommendationsBlock(unitType: string | undefined, skillNames: string[]): string {
+  if (!unitType) return "";
+  const safe = skillNames.filter(name => SAFE_SKILL_NAME.test(name));
+  if (safe.length === 0) return "";
+  return `<skill_recommendations unit="${unitType}">For this unit type, also consider invoking: ${safe.join(", ")}. Use Skill({ skill: 'name' }) when relevant — these are recommendations, not requirements.</skill_recommendations>`;
+}
+
 export function buildSkillActivationBlock(params: {
   base: string;
   milestoneId: string;
@@ -846,10 +866,49 @@ export function buildSkillActivationBlock(params: {
     }
   }
 
+  // Heuristic auto-match (gated on skill_discovery: "auto").
+  // For each installed skill, check if its name or description appears in the
+  // unit's context tokens (milestone/slice/task titles). Only consider skills
+  // already on the unit-type manifest allowlist — this keeps the heuristic
+  // narrow and avoids wildly off-topic activations.
+  // Users who set `skill_discovery: "off"` or "suggest" do not get
+  // auto-matched skills (the recommendations block still surfaces manifest
+  // skills passively); only "auto" actually adds them to the activation
+  // directive set. Default `skill_discovery` is "suggest", so this is opt-in.
+  if ((prefs?.skill_discovery ?? "suggest") === "auto") {
+    const manifestAllow = resolveSkillManifest(params.unitType);
+    const allowSet = manifestAllow ? new Set(manifestAllow) : null;
+    for (const skill of visibleSkills) {
+      const normalized = normalizeSkillReference(skill.name);
+      if (matched.has(normalized) || avoided.has(normalized)) continue;
+      // Respect the manifest allowlist when present; wildcard (null) lets all
+      // installed skills compete for keyword match.
+      if (allowSet && !allowSet.has(normalized)) continue;
+      if (skillMatchesContext(skill, contextTokens)) {
+        matched.add(normalized);
+      }
+    }
+  }
+
   const ordered = [...matched]
     .filter(name => installedNames.has(name) && !avoided.has(name))
     .sort();
-  return formatSkillActivationBlock(ordered);
+  const activationBlock = formatSkillActivationBlock(ordered);
+
+  // Manifest-driven recommendations (additive, does not override explicit intent).
+  // Only surface skills the manifest declares for this unit type that are
+  // installed and not already in matched/avoided.
+  const matchedSet = new Set(ordered);
+  const manifestList = resolveSkillManifest(params.unitType);
+  const recommendations = (manifestList ?? [])
+    .filter(name => installedNames.has(name) && !avoided.has(name) && !matchedSet.has(name))
+    .sort();
+  const recommendationsBlock = formatSkillRecommendationsBlock(params.unitType, recommendations);
+
+  if (!activationBlock && !recommendationsBlock) return "";
+  if (!activationBlock) return recommendationsBlock;
+  if (!recommendationsBlock) return activationBlock;
+  return `${activationBlock}\n${recommendationsBlock}`;
 }
 
 /**
@@ -1209,6 +1268,7 @@ export async function buildDiscussMilestonePrompt(
   const discussTemplates = inlineTemplate("context", "Context");
 
   const basePrompt = loadPrompt("guided-discuss-milestone", {
+    workingDirectory: base,
     milestoneId: mid,
     milestoneTitle: midTitle,
     inlinedTemplates: discussTemplates,
@@ -1226,6 +1286,95 @@ export async function buildDiscussMilestonePrompt(
   }
 
   return basePrompt;
+}
+
+/**
+ * Build a prompt for the workflow-preferences unit type (deep mode).
+ * Default-writing stage: records high-impact workflow defaults in
+ * .gsd/PREFERENCES.md. Runs ONCE per project, early
+ * in deep-mode bootstrap before discuss-project.
+ */
+export async function buildWorkflowPreferencesPrompt(
+  base: string,
+  structuredQuestionsAvailable = "false",
+): Promise<string> {
+  return loadPrompt("guided-workflow-preferences", {
+    workingDirectory: base,
+    structuredQuestionsAvailable,
+  });
+}
+
+/**
+ * Build a prompt for the research-project (parallel) unit type (deep mode).
+ * Orchestrator that spawns 4 parallel Task() calls covering stack, features,
+ * architecture, and pitfalls. Each subagent writes its findings to .gsd/research/.
+ * Fires after research-decision marker says "research" and project research files
+ * are missing. Skipped entirely if user picked "skip".
+ */
+export async function buildResearchProjectPrompt(
+  base: string,
+  structuredQuestionsAvailable = "false",
+): Promise<string> {
+  return loadPrompt("guided-research-project", {
+    workingDirectory: base,
+    structuredQuestionsAvailable,
+  });
+}
+
+/**
+ * Build a prompt for the research-decision unit type (deep mode).
+ * Fixed-question stage: asks "research first or skip?" via ask_user_questions
+ * and writes .gsd/runtime/research-decision.json. Fires after discuss-requirements
+ * and before research-project-parallel.
+ */
+export async function buildResearchDecisionPrompt(
+  base: string,
+  structuredQuestionsAvailable = "false",
+): Promise<string> {
+  return loadPrompt("guided-research-decision", {
+    workingDirectory: base,
+    structuredQuestionsAvailable,
+  });
+}
+
+/**
+ * Build a prompt for the discuss-project unit type (deep mode).
+ * Project-level interview: produces .gsd/PROJECT.md.
+ * Fires before any milestone-level work when planning_depth === "deep" and
+ * PROJECT.md is missing.
+ */
+export async function buildDiscussProjectPrompt(
+  base: string,
+  structuredQuestionsAvailable = "false",
+): Promise<string> {
+  const inlinedTemplates = inlineTemplate("project", "Project");
+
+  return loadPrompt("guided-discuss-project", {
+    workingDirectory: base,
+    inlinedTemplates,
+    structuredQuestionsAvailable,
+    commitInstruction: "Do not commit planning artifacts — .gsd/ is managed externally.",
+  });
+}
+
+/**
+ * Build a prompt for the discuss-requirements unit type (deep mode).
+ * Requirements-level interview: produces .gsd/REQUIREMENTS.md using the
+ * structured R### format. Reads PROJECT.md as authoritative context.
+ * Fires when planning_depth === "deep", PROJECT.md exists, and REQUIREMENTS.md is missing.
+ */
+export async function buildDiscussRequirementsPrompt(
+  base: string,
+  structuredQuestionsAvailable = "false",
+): Promise<string> {
+  const inlinedTemplates = inlineTemplate("requirements", "Requirements");
+
+  return loadPrompt("guided-discuss-requirements", {
+    workingDirectory: base,
+    inlinedTemplates,
+    structuredQuestionsAvailable,
+    commitInstruction: "Do not commit planning artifacts — .gsd/ is managed externally.",
+  });
 }
 
 export async function buildResearchMilestonePrompt(mid: string, midTitle: string, base: string): Promise<string> {
@@ -1479,10 +1628,11 @@ async function renderSlicePrompt(options: {
   extraVars?: Record<string, string>;
   sessionContextWindow?: number;
   modelRegistry?: MinimalModelRegistry;
+  sessionProvider?: string;
 }): Promise<string> {
   const {
     mid, sid, sTitle, base, level, promptTemplate, prependBlocks = [], extraVars = {},
-    sessionContextWindow, modelRegistry,
+    sessionContextWindow, modelRegistry, sessionProvider,
   } = options;
 
   const roadmapPath = resolveMilestoneFile(base, mid, "ROADMAP");
@@ -1535,7 +1685,7 @@ async function renderSlicePrompt(options: {
   if (overridesInline) inlined.unshift(overridesInline);
 
   const inlinedContext = capPreamble(`## Inlined Context (preloaded — do not re-read these files)\n\n${inlined.join("\n\n---\n\n")}`);
-  const executorContextConstraints = formatExecutorConstraints(sessionContextWindow, modelRegistry);
+  const executorContextConstraints = formatExecutorConstraints(sessionContextWindow, modelRegistry, sessionProvider);
   const outputRelPath = relSliceFile(base, mid, sid, "PLAN");
   const commitInstruction = "Do not commit — .gsd/ planning docs are managed externally and not tracked in git.";
 
@@ -1569,6 +1719,7 @@ export async function buildPlanSlicePrompt(
     softScopeHint?: string;
     sessionContextWindow?: number;
     modelRegistry?: MinimalModelRegistry;
+    sessionProvider?: string;
     /** Failure context from a prior pre-exec gate run (#4551). When present, a
      *  "Fix these specific issues" section is appended so the LLM addresses the
      *  exact problems instead of producing an identical plan that fails again. */
@@ -1612,6 +1763,7 @@ export async function buildPlanSlicePrompt(
     prependBlocks,
     sessionContextWindow: options?.sessionContextWindow,
     modelRegistry: options?.modelRegistry,
+    sessionProvider: options?.sessionProvider,
   });
 }
 
@@ -1624,7 +1776,7 @@ export async function buildPlanSlicePrompt(
  */
 export async function buildRefineSlicePrompt(
   mid: string, _midTitle: string, sid: string, sTitle: string, base: string, level?: InlineLevel,
-  options?: { sessionContextWindow?: number; modelRegistry?: MinimalModelRegistry },
+  options?: { sessionContextWindow?: number; modelRegistry?: MinimalModelRegistry; sessionProvider?: string },
 ): Promise<string> {
   // Pull the stored sketch scope from the DB — the hard constraint we plan within.
   let sketchScope = "";
@@ -1653,6 +1805,7 @@ export async function buildRefineSlicePrompt(
     extraVars: { sketchScope },
     sessionContextWindow: options?.sessionContextWindow,
     modelRegistry: options?.modelRegistry,
+    sessionProvider: options?.sessionProvider,
   });
 }
 
@@ -1665,6 +1818,8 @@ export interface ExecuteTaskPromptOptions {
   sessionContextWindow?: number;
   /** Model registry forwarded to the budget engine for executor-model lookup. */
   modelRegistry?: MinimalModelRegistry;
+  /** Session model provider, used for provider-specific effective context windows. */
+  sessionProvider?: string;
 }
 
 export async function buildExecuteTaskPrompt(
@@ -1756,7 +1911,7 @@ export async function buildExecuteTaskPrompt(
 
   // Compute verification budget for the executor's context window (issue #707)
   const prefs = loadEffectiveGSDPreferences();
-  const contextWindow = resolveExecutorContextWindow(opts.modelRegistry, prefs?.preferences, opts.sessionContextWindow);
+  const contextWindow = resolveExecutorContextWindow(opts.modelRegistry, prefs?.preferences, opts.sessionContextWindow, opts.sessionProvider);
   const budgets = computeBudgets(contextWindow);
   const verificationBudget = `~${Math.round(budgets.verificationBudgetChars / 1000)}K chars`;
 
@@ -2439,7 +2594,7 @@ export async function buildReactiveExecutePrompt(
   mid: string, midTitle: string, sid: string, sTitle: string,
   readyTaskIds: string[], base: string,
   subagentModel?: string,
-  opts?: { sessionContextWindow?: number; modelRegistry?: MinimalModelRegistry },
+  opts?: { sessionContextWindow?: number; modelRegistry?: MinimalModelRegistry; sessionProvider?: string },
 ): Promise<string> {
   const { loadSliceTaskIO, deriveTaskGraph, graphMetrics } = await import("./reactive-graph.js");
 
@@ -2485,6 +2640,7 @@ export async function buildReactiveExecutePrompt(
         carryForwardPaths: depPaths,
         sessionContextWindow: opts?.sessionContextWindow,
         modelRegistry: opts?.modelRegistry,
+        sessionProvider: opts?.sessionProvider,
       },
     );
 
@@ -2587,6 +2743,7 @@ export async function buildParallelResearchSlicesPrompt(
   }
 
   return loadPrompt("parallel-research-slices", {
+    workingDirectory: basePath,
     mid,
     midTitle,
     sliceCount: String(slices.length),
@@ -2623,12 +2780,15 @@ export async function buildGateEvaluatePrompt(
 
   const subagentSections: string[] = [];
   const gateListLines: string[] = [];
+  const normalizedBase = base.replaceAll("\\", "/");
 
   for (const def of gateDefs) {
     gateListLines.push(`- **${def.id}**: ${def.question}`);
 
     const subPrompt = [
       `You are evaluating quality gate **${def.id}** for slice ${sid} (${sTitle}).`,
+      "",
+      `**Working directory:** \`${normalizedBase}\`. All file reads, writes, and shell commands MUST operate relative to this directory. Do NOT \`cd\` to any other directory.`,
       "",
       `## Question: ${def.question}`,
       "",
@@ -2746,6 +2906,7 @@ export async function buildRewriteDocsPrompt(
   const documentList = docList.length > 0 ? docList.join("\n") : "- No active plan documents found.";
 
   return loadPrompt("rewrite-docs", {
+    workingDirectory: base,
     milestoneId: mid,
     milestoneTitle: midTitle,
     sliceId: sid ?? "none",

@@ -246,6 +246,11 @@ Examples:
     await handleAddTests(trimmed.replace(/^add-tests\s*/, "").trim(), ctx, pi);
     return true;
   }
+  if (trimmed === "eval-review" || trimmed.startsWith("eval-review ")) {
+    const { handleEvalReview } = await import("../../commands-eval-review.js");
+    await handleEvalReview(trimmed.replace(/^eval-review\s*/, "").trim(), ctx, pi);
+    return true;
+  }
   if (trimmed === "extract-learnings" || trimmed.startsWith("extract-learnings ")) {
     const { handleExtractLearnings } = await import("../../commands-extract-learnings.js");
     await handleExtractLearnings(trimmed.replace(/^extract-learnings\s*/, "").trim(), ctx, pi);
@@ -260,6 +265,16 @@ Examples:
     const { handleScan } = await import("../../commands-scan.js");
     // \s* (not \s+) is intentional: handles both /gsd scan (no args) and /gsd scan --focus X
     await handleScan(trimmed.replace(/^scan\s*/, "").trim(), ctx, pi);
+    return true;
+  }
+  if (
+    trimmed === "worktree" ||
+    trimmed.startsWith("worktree ") ||
+    trimmed === "wt" ||
+    trimmed.startsWith("wt ")
+  ) {
+    const { handleWorktree } = await import("../../commands-worktree.js");
+    await handleWorktree(trimmed.replace(/^(worktree|wt)\s*/, "").trim(), ctx);
     return true;
   }
   return false;

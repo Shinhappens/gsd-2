@@ -12,9 +12,49 @@ import { dirname, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { lockSync, unlockSync } from "proper-lockfile";
-import semver from "semver";
+import { gsdHome } from "./gsd-home.js";
 
-const gsdHome = process.env.GSD_HOME || join(homedir(), ".gsd");
+/**
+ * Strict numeric comparison of two npm-style version strings.
+ *
+ * Returns true when `a` is strictly greater than `b`. Compares the dotted
+ * release components numerically (so `1.10.0` > `1.9.0`) and treats any
+ * prerelease suffix (`-beta.1`, `-rc.2`) as less than the equivalent
+ * release version (`1.0.0` > `1.0.0-beta.1`). Sufficient for npm package
+ * version comparison in the extension installer; we don't need the full
+ * semver range/intersect machinery here.
+ *
+ * Replaces the earlier `import semver from "semver"` — that import broke
+ * `tsc -p tsconfig.json` whenever `@types/semver` failed to install
+ * (Issue #4946) because the file is pulled in transitively despite being
+ * under the `src/resources` exclude.
+ */
+export function isVersionGreater(a: string, b: string): boolean {
+  const split = (v: string): { release: number[]; pre: string | null } => {
+    const dash = v.indexOf("-");
+    const release = (dash === -1 ? v : v.slice(0, dash))
+      .split(".")
+      .map(part => Number.parseInt(part, 10) || 0);
+    const pre = dash === -1 ? null : v.slice(dash + 1);
+    return { release, pre };
+  };
+  const sa = split(a);
+  const sb = split(b);
+  const len = Math.max(sa.release.length, sb.release.length);
+  for (let i = 0; i < len; i++) {
+    const ai = sa.release[i] ?? 0;
+    const bi = sb.release[i] ?? 0;
+    if (ai !== bi) return ai > bi;
+  }
+  // Release components equal — a release version beats any prerelease,
+  // and prerelease strings are compared lexicographically (good enough
+  // for `beta.1` vs `beta.2`, the only realistic case here).
+  if (sa.pre === null && sb.pre !== null) return true;
+  if (sa.pre !== null && sb.pre === null) return false;
+  if (sa.pre !== null && sb.pre !== null) return sa.pre > sb.pre;
+  return false;
+}
+
 
 // ─── Types (mirrored from extension-registry.ts) ────────────────────────────
 
@@ -56,11 +96,11 @@ interface ExtensionRegistry {
 // ─── Registry I/O ───────────────────────────────────────────────────────────
 
 function getRegistryPath(): string {
-  return join(gsdHome, "extensions", "registry.json");
+  return join(gsdHome(), "extensions", "registry.json");
 }
 
 function getAgentExtensionsDir(): string {
-  return join(gsdHome, "agent", "extensions");
+  return join(gsdHome(), "agent", "extensions");
 }
 
 function loadRegistry(): ExtensionRegistry {
@@ -211,7 +251,7 @@ function discoverManifests(): Map<string, ExtensionManifest> {
 }
 
 function getInstalledExtDir(): string {
-  return join(gsdHome, "extensions");
+  return join(gsdHome(), "extensions");
 }
 
 // Source: derived from npm/git URL conventions (from RESEARCH.md)
@@ -538,7 +578,7 @@ async function updateSingleExtension(
     return;
   }
 
-  if (semver.gt(latest, current)) {
+  if (isVersionGreater(latest, current)) {
     ctx.ui.notify(`Updating "${id}": v${current} → v${latest}...`, "info");
     await handleInstall(packageName, ctx);
   } else {
@@ -599,7 +639,7 @@ async function updateAllExtensions(
       continue;
     }
 
-    if (semver.gt(latest, current)) {
+    if (isVersionGreater(latest, current)) {
       ctx.ui.notify(`  ${entry.id}: v${current} → v${latest} (updating)`, "info");
       await handleInstall(packageName, ctx);
       updated++;

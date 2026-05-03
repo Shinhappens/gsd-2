@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { minimatch } from "minimatch";
 
 import type { ToolsPolicy } from "../unit-context-manifest.js";
+import { logWarning } from "../workflow-logger.js";
 
 /**
  * Regex matching milestone CONTEXT.md file names in both legacy M001
@@ -62,19 +63,42 @@ const QUEUE_SAFE_TOOLS = new Set([
  */
 const BASH_READ_ONLY_RE = /^\s*(cat|head|tail|less|more|wc|file|stat|du|df|which|type|echo|printf|ls|find|grep|rg|awk|sed\b(?!.*-i)|sort|uniq|diff|comm|tr|cut|tee\s+-a\s+\/dev\/null|git\s+(log|show|diff|status|branch|tag|remote|rev-parse|ls-files|blame|shortlog|describe|stash\s+list|config\s+--get|cat-file)|gh\s+(issue|pr|api|repo|release)\s+(view|list|diff|status|checks)|mkdir\s+-p\s+\.gsd|rtk\s|npm\s+run\s+(test|test:\w+|lint|lint:\w+|typecheck|type-check|type-check:\w+|check|verify|audit|outdated|format:check|ci|validate)\b|npm\s+(ls|list|info|view|show|outdated|audit|explain|doctor|ping|--version|-v)\b|npx\s|tsx\s|node\s+(--print|--version|-v\b)|python[23]?\s+(-c\s+'[^']*'|--version|-V\b|-m\s+(pip\s+show|pip\s+list|site))|pip[23]?\s+(show|list|freeze|check|index\s+versions)\b|jq\s|yq\s|curl\s+(-s\b|--silent\b)(?!\s+[^|>]*\s-[oO]\b)(?!\s+[^|>]*\s--output\b)[^|>]*$|openssl\s+(version|x509|s_client)|env\b|printenv\b|true\b|false\b)/;
 
-const verifiedDepthMilestones = new Set<string>();
-let activeQueuePhase = false;
+interface InMemoryWriteGateState {
+  verifiedDepthMilestones: Set<string>;
+  verifiedApprovalGates: Set<string>;
+  activeQueuePhase: boolean;
+  pendingGateId: string | null;
+}
+
+function createEmptyWriteGateState(): InMemoryWriteGateState {
+  return {
+    verifiedDepthMilestones: new Set<string>(),
+    verifiedApprovalGates: new Set<string>(),
+    activeQueuePhase: false,
+    pendingGateId: null,
+  };
+}
+
+const writeGateStatesByBasePath = new Map<string, InMemoryWriteGateState>();
+
+function writeGateStateKey(basePath: string): string {
+  return resolve(basePath);
+}
+
+function getWriteGateState(basePath: string = process.cwd()): InMemoryWriteGateState {
+  const key = writeGateStateKey(basePath);
+  let state = writeGateStatesByBasePath.get(key);
+  if (!state) {
+    state = createEmptyWriteGateState();
+    writeGateStatesByBasePath.set(key, state);
+  }
+  return state;
+}
 
 /**
- * Discussion gate enforcement state.
- *
- * When ask_user_questions is called with a recognized gate question ID,
- * we track the pending gate. Until the gate is confirmed (user selects the
- * first/recommended option), all non-read-only tool calls are blocked.
- * This mechanically prevents the model from rationalizing past failed or
- * cancelled gate questions.
+ * Discussion gate enforcement state is scoped per basePath so multiple
+ * workspaces can coexist in the same process without sharing gate state.
  */
-let pendingGateId: string | null = null;
 
 /**
  * Recognized gate question ID patterns.
@@ -86,17 +110,22 @@ const GATE_QUESTION_PATTERNS = [
 
 /**
  * Tools that are safe to call while a gate is pending.
- * Includes read-only tools and ask_user_questions itself (so the model can re-ask).
+ * Only ask_user_questions may run: once the assistant asks for confirmation,
+ * further reads/searches bury the actual question in tool output.
  */
 const GATE_SAFE_TOOLS = new Set([
   "ask_user_questions",
-  "read", "grep", "find", "ls", "glob",
-  "search-the-web", "resolve_library", "get_library_docs", "fetch_page",
-  "search_and_read",
 ]);
+
+export function canonicalToolName(toolName: string): string {
+  if (!toolName.startsWith("mcp__")) return toolName;
+  const toolSeparator = toolName.indexOf("__", "mcp__".length);
+  return toolSeparator >= 0 ? toolName.slice(toolSeparator + 2) : toolName;
+}
 
 export interface WriteGateSnapshot {
   verifiedDepthMilestones: string[];
+  verifiedApprovalGates?: string[];
   activeQueuePhase: boolean;
   pendingGateId: string | null;
 }
@@ -112,24 +141,26 @@ function shouldPersistWriteGateSnapshot(env: NodeJS.ProcessEnv = process.env): b
   return v !== "0" && v !== "false";
 }
 
-function writeGateSnapshotPath(basePath: string = process.cwd()): string {
+function writeGateSnapshotPath(basePath: string): string {
   return join(basePath, ".gsd", "runtime", "write-gate-state.json");
 }
 
-function currentWriteGateSnapshot(): WriteGateSnapshot {
+function currentWriteGateSnapshot(basePath: string = process.cwd()): WriteGateSnapshot {
+  const state = getWriteGateState(basePath);
   return {
-    verifiedDepthMilestones: [...verifiedDepthMilestones].sort(),
-    activeQueuePhase,
-    pendingGateId,
+    verifiedDepthMilestones: [...state.verifiedDepthMilestones].sort(),
+    verifiedApprovalGates: [...state.verifiedApprovalGates].sort(),
+    activeQueuePhase: state.activeQueuePhase,
+    pendingGateId: state.pendingGateId,
   };
 }
 
-function persistWriteGateSnapshot(basePath: string = process.cwd()): void {
+function persistWriteGateSnapshot(basePath: string): void {
   if (!shouldPersistWriteGateSnapshot()) return;
   const path = writeGateSnapshotPath(basePath);
   mkdirSync(join(basePath, ".gsd", "runtime"), { recursive: true });
   const tempPath = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-  writeFileSync(tempPath, JSON.stringify(currentWriteGateSnapshot(), null, 2), "utf-8");
+  writeFileSync(tempPath, JSON.stringify(currentWriteGateSnapshot(basePath), null, 2), "utf-8");
   try {
     renameSync(tempPath, path);
   } catch (err: unknown) {
@@ -144,7 +175,7 @@ function persistWriteGateSnapshot(basePath: string = process.cwd()): void {
   }
 }
 
-function clearPersistedWriteGateSnapshot(basePath: string = process.cwd()): void {
+function clearPersistedWriteGateSnapshot(basePath: string): void {
   if (!shouldPersistWriteGateSnapshot()) return;
   const path = writeGateSnapshotPath(basePath);
   try {
@@ -159,8 +190,12 @@ function normalizeWriteGateSnapshot(value: unknown): WriteGateSnapshot {
   const verified = Array.isArray(record.verifiedDepthMilestones)
     ? record.verifiedDepthMilestones.filter((item): item is string => typeof item === "string")
     : [];
+  const verifiedGates = Array.isArray(record.verifiedApprovalGates)
+    ? record.verifiedApprovalGates.filter((item): item is string => typeof item === "string")
+    : [];
   return {
     verifiedDepthMilestones: [...new Set(verified)].sort(),
+    verifiedApprovalGates: [...new Set(verifiedGates)].sort(),
     activeQueuePhase: record.activeQueuePhase === true,
     pendingGateId: typeof record.pendingGateId === "string" ? record.pendingGateId : null,
   };
@@ -168,36 +203,40 @@ function normalizeWriteGateSnapshot(value: unknown): WriteGateSnapshot {
 
 const EMPTY_SNAPSHOT: WriteGateSnapshot = {
   verifiedDepthMilestones: [],
+  verifiedApprovalGates: [],
   activeQueuePhase: false,
   pendingGateId: null,
 };
 
-export function loadWriteGateSnapshot(basePath: string = process.cwd()): WriteGateSnapshot {
+export function loadWriteGateSnapshot(basePath: string): WriteGateSnapshot {
   const path = writeGateSnapshotPath(basePath);
   if (!existsSync(path)) {
     // When persist mode is active and the file has been deleted, treat it as a
     // full state reset so deleting the file clears the HARD BLOCK gate.
     // In non-persist mode the file is never written, so fall back to in-memory.
     if (shouldPersistWriteGateSnapshot()) return EMPTY_SNAPSHOT;
-    return currentWriteGateSnapshot();
+    return currentWriteGateSnapshot(basePath);
   }
   try {
     return normalizeWriteGateSnapshot(JSON.parse(readFileSync(path, "utf-8")));
   } catch {
-    return currentWriteGateSnapshot();
+    return currentWriteGateSnapshot(basePath);
   }
 }
 
-export function isDepthVerified(): boolean {
-  return verifiedDepthMilestones.size > 0;
+export function isDepthVerified(basePath: string = process.cwd()): boolean {
+  return getWriteGateState(basePath).verifiedDepthMilestones.size > 0;
 }
 
 /**
  * Check whether a specific milestone has passed depth verification.
  */
-export function isMilestoneDepthVerified(milestoneId: string | null | undefined): boolean {
+export function isMilestoneDepthVerified(
+  milestoneId: string | null | undefined,
+  basePath: string = process.cwd(),
+): boolean {
   if (!milestoneId) return false;
-  return verifiedDepthMilestones.has(milestoneId);
+  return getWriteGateState(basePath).verifiedDepthMilestones.has(milestoneId);
 }
 
 export function isMilestoneDepthVerifiedInSnapshot(
@@ -208,32 +247,46 @@ export function isMilestoneDepthVerifiedInSnapshot(
   return snapshot.verifiedDepthMilestones.includes(milestoneId);
 }
 
-export function isQueuePhaseActive(): boolean {
-  return activeQueuePhase;
+export function isQueuePhaseActive(basePath: string = process.cwd()): boolean {
+  return getWriteGateState(basePath).activeQueuePhase;
 }
 
-export function setQueuePhaseActive(active: boolean): void {
-  activeQueuePhase = active;
-  persistWriteGateSnapshot();
+export function setQueuePhaseActive(active: boolean, basePath: string): void {
+  getWriteGateState(basePath).activeQueuePhase = active;
+  persistWriteGateSnapshot(basePath);
 }
 
-export function resetWriteGateState(): void {
-  verifiedDepthMilestones.clear();
-  pendingGateId = null;
-  persistWriteGateSnapshot();
+export function resetWriteGateState(basePath: string): void {
+  const state = getWriteGateState(basePath);
+  state.verifiedDepthMilestones.clear();
+  state.verifiedApprovalGates.clear();
+  state.pendingGateId = null;
+  persistWriteGateSnapshot(basePath);
 }
 
-export function clearDiscussionFlowState(): void {
-  verifiedDepthMilestones.clear();
-  activeQueuePhase = false;
-  pendingGateId = null;
-  clearPersistedWriteGateSnapshot();
+export function clearDiscussionFlowState(basePath: string): void {
+  writeGateStatesByBasePath.delete(writeGateStateKey(basePath));
+  clearPersistedWriteGateSnapshot(basePath);
 }
 
 export function markDepthVerified(milestoneId?: string | null, basePath: string = process.cwd()): void {
   if (!milestoneId) return;
-  verifiedDepthMilestones.add(milestoneId);
+  getWriteGateState(basePath).verifiedDepthMilestones.add(milestoneId);
   persistWriteGateSnapshot(basePath);
+}
+
+export function markApprovalGateVerified(gateId?: string | null, basePath: string = process.cwd()): void {
+  if (!gateId) return;
+  getWriteGateState(basePath).verifiedApprovalGates.add(gateId);
+  persistWriteGateSnapshot(basePath);
+}
+
+export function isApprovalGateVerifiedInSnapshot(
+  snapshot: WriteGateSnapshot,
+  gateId?: string | null,
+): boolean {
+  if (!gateId) return false;
+  return (snapshot.verifiedApprovalGates ?? []).includes(gateId);
 }
 
 /**
@@ -263,24 +316,28 @@ function extractContextMilestoneId(inputPath: string): string | null {
 /**
  * Mark a gate as pending (called when ask_user_questions is invoked with a gate ID).
  */
-export function setPendingGate(gateId: string): void {
-  pendingGateId = gateId;
-  persistWriteGateSnapshot();
+export function setPendingGate(gateId: string, basePath: string): void {
+  const state = getWriteGateState(basePath);
+  state.pendingGateId = gateId;
+  state.verifiedApprovalGates.delete(gateId);
+  const milestoneId = extractDepthVerificationMilestoneId(gateId);
+  if (milestoneId) state.verifiedDepthMilestones.delete(milestoneId);
+  persistWriteGateSnapshot(basePath);
 }
 
 /**
  * Clear the pending gate (called when the user confirms).
  */
-export function clearPendingGate(): void {
-  pendingGateId = null;
-  persistWriteGateSnapshot();
+export function clearPendingGate(basePath: string): void {
+  getWriteGateState(basePath).pendingGateId = null;
+  persistWriteGateSnapshot(basePath);
 }
 
 /**
  * Get the currently pending gate, if any.
  */
-export function getPendingGate(): string | null {
-  return pendingGateId;
+export function getPendingGate(basePath: string = process.cwd()): string | null {
+  return getWriteGateState(basePath).pendingGateId;
 }
 
 /**
@@ -288,7 +345,7 @@ export function getPendingGate(): string | null {
  * is pending (ask_user_questions was called but not confirmed).
  *
  * Returns { block: true, reason } if the tool should be blocked.
- * Read-only tools and ask_user_questions itself are always allowed.
+ * ask_user_questions itself is allowed so the model can re-ask the gate.
  */
 export function shouldBlockPendingGate(
   toolName: string,
@@ -306,16 +363,14 @@ export function shouldBlockPendingGateInSnapshot(
 ): { block: boolean; reason?: string } {
   if (!snapshot.pendingGateId) return { block: false };
 
-  if (GATE_SAFE_TOOLS.has(toolName)) return { block: false };
-
-  // Bash read-only commands are also safe
-  if (toolName === "bash") return { block: false }; // bash is checked separately below
+  if (GATE_SAFE_TOOLS.has(canonicalToolName(toolName))) return { block: false };
 
   return {
     block: true,
     reason: [
       `HARD BLOCK: Discussion gate "${snapshot.pendingGateId}" has not been confirmed by the user.`,
-      `You MUST re-call ask_user_questions with the gate question before making any other tool calls.`,
+      `The assistant already asked for user confirmation, so do not call more tools.`,
+      `Wait for the user's answer, or re-call ask_user_questions with the gate question if the question was not delivered.`,
       `If the previous ask_user_questions call failed, errored, was cancelled, or the user's response`,
       `did not match a provided option, you MUST re-ask — never rationalize past the block.`,
       `Do NOT proceed, do NOT use alternative approaches, do NOT skip the gate.`,
@@ -325,7 +380,7 @@ export function shouldBlockPendingGateInSnapshot(
 
 /**
  * Check whether a bash command should be blocked because a discussion gate is pending.
- * Read-only bash commands are allowed; mutating commands are blocked.
+ * All bash is blocked while waiting for confirmation so the question stays visible.
  */
 export function shouldBlockPendingGateBash(
   command: string,
@@ -343,14 +398,12 @@ export function shouldBlockPendingGateBashInSnapshot(
 ): { block: boolean; reason?: string } {
   if (!snapshot.pendingGateId) return { block: false };
 
-  // Allow read-only bash commands
-  if (BASH_READ_ONLY_RE.test(command)) return { block: false };
-
   return {
     block: true,
     reason: [
       `HARD BLOCK: Discussion gate "${snapshot.pendingGateId}" has not been confirmed by the user.`,
-      `You MUST re-call ask_user_questions with the gate question before running mutating commands.`,
+      `The assistant already asked for user confirmation, so do not run bash commands.`,
+      `Wait for the user's answer, or re-call ask_user_questions with the gate question if the question was not delivered.`,
       `If the previous ask_user_questions call failed, errored, was cancelled, or the user's response`,
       `did not match a provided option, you MUST re-ask — never rationalize past the block.`,
     ].join(" "),
@@ -464,6 +517,56 @@ export function shouldBlockContextArtifactSaveInSnapshot(
   };
 }
 
+const FINAL_ROOT_ARTIFACTS = new Set(["PROJECT", "REQUIREMENTS"]);
+
+function requiredRootApprovalGateForArtifact(artifactType: string): string | null {
+  if (artifactType === "PROJECT") return "depth_verification_project_confirm";
+  if (artifactType === "REQUIREMENTS") return "depth_verification_requirements_confirm";
+  return null;
+}
+
+/**
+ * Final root project artifacts are the output of the project/requirements
+ * approval gates. Drafts remain writable so the agent can prepare previews,
+ * but PROJECT.md and REQUIREMENTS.md must wait for explicit approval. Deep
+ * mode can additionally require a positive verified gate, not just no pending
+ * gate, so missed detectors fail closed.
+ */
+export function shouldBlockRootArtifactSaveInSnapshot(
+  snapshot: WriteGateSnapshot,
+  artifactType: string,
+  opts: { requireVerifiedApproval?: boolean } = {},
+): { block: boolean; reason?: string } {
+  if (!FINAL_ROOT_ARTIFACTS.has(artifactType)) return { block: false };
+
+  if (snapshot.pendingGateId) {
+    return {
+      block: true,
+      reason: [
+        `HARD BLOCK: Cannot save ${artifactType}.md because discussion gate "${snapshot.pendingGateId}" has not been confirmed by the user.`,
+        `This is a mechanical gate — wait for explicit user approval before writing final project setup artifacts.`,
+        `If approval was requested in plain text, the user must reply with explicit approval before this write is allowed.`,
+      ].join(" "),
+    };
+  }
+
+  if (opts.requireVerifiedApproval) {
+    const requiredGate = requiredRootApprovalGateForArtifact(artifactType);
+    if (requiredGate && !isApprovalGateVerifiedInSnapshot(snapshot, requiredGate)) {
+      return {
+        block: true,
+        reason: [
+          `HARD BLOCK: Cannot save ${artifactType}.md before explicit approval gate "${requiredGate}" is verified.`,
+          `Deep planning root artifacts are fail-closed: absence of a pending gate is not approval.`,
+          `Ask the user to confirm the ${artifactType}.md preview and wait for an explicit approval response.`,
+        ].join(" "),
+      };
+    }
+  }
+
+  return { block: false };
+}
+
 /**
  * Queue-mode execution guard (#2545).
  *
@@ -547,6 +650,49 @@ const PLANNING_WRITE_TOOLS = new Set(["write", "edit", "multi_edit", "notebook_e
 const PLANNING_SUBAGENT_TOOLS = new Set(["subagent", "task"]);
 
 /**
+ * Canonical registry for agents that planning-dispatch may consider. Unit
+ * manifests still declare per-unit subsets via ToolsPolicy.allowedSubagents.
+ */
+const PLANNING_DISPATCH_AGENT_REGISTRY = {
+  scout: { readOnlySpecialist: true },
+  planner: { readOnlySpecialist: true },
+  reviewer: { readOnlySpecialist: true },
+  security: { readOnlySpecialist: true },
+  tester: { readOnlySpecialist: true },
+} as const satisfies Record<string, { readonly readOnlySpecialist: boolean }>;
+
+export const ALLOWED_PLANNING_DISPATCH_AGENTS = new Set<string>(
+  Object.entries(PLANNING_DISPATCH_AGENT_REGISTRY)
+    .filter(([, metadata]) => metadata.readOnlySpecialist)
+    .map(([agentId]) => agentId),
+);
+
+let warnedMissingPlanningDispatchAgentClasses = false;
+
+function isReadOnlySpecialist(agentId: string): boolean {
+  const metadata = PLANNING_DISPATCH_AGENT_REGISTRY[agentId as keyof typeof PLANNING_DISPATCH_AGENT_REGISTRY];
+  return metadata?.readOnlySpecialist === true;
+}
+
+function allowedPlanningDispatchAgentsList(): string {
+  return [...ALLOWED_PLANNING_DISPATCH_AGENTS].join(", ");
+}
+
+function warnMissingPlanningDispatchAgentClasses(unitType: string, mode: string, toolName: string): void {
+  if (warnedMissingPlanningDispatchAgentClasses) return;
+  warnedMissingPlanningDispatchAgentClasses = true;
+  // TODO(#5060): Remove this migration shim once all subagent/task callers are verified to forward agent identities.
+  const message = `[write-gate] planning-dispatch: shouldBlockPlanningUnit called for tool "${toolName}" ` +
+    `on unit "${unitType}" without agentClasses - stale caller; blocking dispatch.`;
+  console.warn(message);
+  logWarning("intercept", message, {
+    unitType,
+    mode,
+    toolName,
+  });
+}
+
+/**
  * Read-only / planning-safe tools that any non-"all" mode allows. Mirrors
  * QUEUE_SAFE_TOOLS / GATE_SAFE_TOOLS but is the inclusive default for
  * planning units (which need their full discussion + research surface).
@@ -592,6 +738,10 @@ function blockReason(unitType: string, mode: string, what: string): string {
  *   - "read-only"  → blocks all writes, bash, and subagent dispatch.
  *   - "planning"   → blocks writes to paths outside <basePath>/.gsd/,
  *                    bash that isn't read-only, and subagent dispatch.
+ *   - "planning-dispatch"
+ *                  → like "planning", but permits subagent dispatch only
+ *                    when every forwarded agent class is globally allowed
+ *                    and listed in the policy's allowedSubagents.
  *   - "docs"       → like "planning" but also allows writes to paths
  *                    matching `allowedPathGlobs` relative to basePath.
  *
@@ -601,6 +751,11 @@ function blockReason(unitType: string, mode: string, what: string): string {
  * `policy` of null means "no manifest resolved" — pass-through. Callers
  * that have no active unit (interactive sessions) pass null and this
  * predicate is a no-op.
+ *
+ * `agentClasses` is supplied by the tool hook for subagent-shaped calls. If
+ * absent, planning-dispatch fails closed so stale callers cannot silently
+ * bypass the agent allowlists. An explicitly supplied-but-empty list is
+ * allowed through so the downstream tool call can reject the malformed input.
  */
 export function shouldBlockPlanningUnit(
   toolName: string,
@@ -608,6 +763,7 @@ export function shouldBlockPlanningUnit(
   basePath: string,
   unitType: string,
   policy: ToolsPolicy | null | undefined,
+  agentClasses?: readonly string[],
 ): { block: boolean; reason?: string } {
   if (!policy) return { block: false };
   if (policy.mode === "all") return { block: false };
@@ -625,11 +781,59 @@ export function shouldBlockPlanningUnit(
     return { block: true, reason: blockReason(unitType, policy.mode, `tool "${tool}" is not on the read-only allowlist`) };
   }
 
-  // planning / docs modes share the same surface for safe tools, bash, and subagent.
+  // planning / planning-dispatch / docs modes share the same surface for safe tools, bash, and subagent.
   if (PLANNING_SAFE_TOOLS.has(tool)) return { block: false };
   if (tool.startsWith("gsd_")) return { block: false };
 
   if (PLANNING_SUBAGENT_TOOLS.has(tool)) {
+    if (policy.mode === "planning-dispatch") {
+      const requested = (agentClasses ?? []).map(a => a.trim()).filter(Boolean);
+      const allowedSubagents = Array.isArray(policy.allowedSubagents) ? policy.allowedSubagents : [];
+      const allowed = new Set(allowedSubagents);
+      // When agentClasses is undefined, the caller has not been updated to extract
+      // agent identities yet. Block and warn so stale callers surface in telemetry
+      // instead of silently bypassing the gate.
+      if (agentClasses === undefined) {
+        warnMissingPlanningDispatchAgentClasses(unitType, policy.mode, tool);
+        return {
+          block: true,
+          reason: blockReason(
+            unitType,
+            policy.mode,
+            `subagent dispatch blocked: stale caller did not supply agent identities for "${tool}"; update extractSubagentAgentClasses to handle this input shape`,
+          ),
+        };
+      }
+      // agentClasses was explicitly provided but resolved to an empty list (for
+      // example, a bare tool call with no agent field). Pass through; no agents
+      // to validate means the downstream tool call itself will fail.
+      if (requested.length === 0) {
+        return { block: false };
+      }
+      const globallyDisallowed = requested.find(a => !isReadOnlySpecialist(a));
+      if (globallyDisallowed) {
+        return {
+          block: true,
+          reason: blockReason(
+            unitType,
+            policy.mode,
+            `subagent dispatch of "${globallyDisallowed}" not permitted; only read-only specialists (${allowedPlanningDispatchAgentsList()}) may be dispatched from planning-dispatch units`,
+          ),
+        };
+      }
+      const disallowedByPolicy = requested.find(a => !allowed.has(a));
+      if (disallowedByPolicy) {
+        return {
+          block: true,
+          reason: blockReason(
+            unitType,
+            policy.mode,
+            `subagent dispatch of "${disallowedByPolicy}" not permitted by ToolsPolicy.allowedSubagents; permitted agents for this unit: ${allowedSubagents.join(", ")}`,
+          ),
+        };
+      }
+      return { block: false };
+    }
     return { block: true, reason: blockReason(unitType, policy.mode, `subagent dispatch is not permitted in planning units`) };
   }
 

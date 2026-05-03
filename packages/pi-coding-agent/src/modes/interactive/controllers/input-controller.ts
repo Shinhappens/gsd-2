@@ -133,7 +133,7 @@ export function setupEditorSubmitHandler(host: InteractiveModeStateHost & {
 		// submitPromptsDirectly is false — still dispatch via session.prompt so user input
 		// is not silently discarded.
 		try {
-			await host.session.prompt(text);
+			await host.session.prompt(text, { images });
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			host.showError(errorMessage);

@@ -159,6 +159,7 @@ function getSlashCommandName(text: string): string {
 
 function createHost(options: HostOptions = {}) {
 	const prompted: string[] = [];
+	const promptOptions: any[] = [];
 	const errors: string[] = [];
 	const warnings: string[] = [];
 	const tips: string[] = [];
@@ -186,8 +187,9 @@ function createHost(options: HostOptions = {}) {
 			isBashRunning: false,
 			isCompacting: false,
 			isStreaming: false,
-			prompt: async (text: string) => {
+			prompt: async (text: string, options?: any) => {
 				prompted.push(text);
+				promptOptions.push(options);
 			},
 		},
 		ui: {
@@ -235,6 +237,7 @@ function createHost(options: HostOptions = {}) {
 	return {
 		host: host as typeof host & { defaultEditor: typeof editor & { onSubmit: (text: string) => Promise<void> } },
 		prompted,
+		promptOptions,
 		errors,
 		warnings,
 		tips,
@@ -243,6 +246,19 @@ function createHost(options: HostOptions = {}) {
 		getSettingsOpened: () => settingsOpened,
 	};
 }
+
+test("input-controller: regular prompt submit preserves pending images", async () => {
+	const { host, prompted, promptOptions } = createHost();
+	host.pendingImages.push({ ...TEST_IMAGE });
+
+	await host.defaultEditor.onSubmit("describe this image [Image #1]");
+
+	assert.deepEqual(prompted, ["describe this image [Image #1]"]);
+	assert.equal(promptOptions[0]?.images?.length, 1);
+	assert.equal(promptOptions[0].images[0].mimeType, "image/png");
+	assert.equal(promptOptions[0].images[0].data, TEST_IMAGE.data);
+	assert.equal(host.pendingImages.length, 0);
+});
 
 test("input-controller: built-in slash commands stay in TUI dispatch", async () => {
 	const { host, prompted, errors, getSettingsOpened, getEditorText } = createHost();

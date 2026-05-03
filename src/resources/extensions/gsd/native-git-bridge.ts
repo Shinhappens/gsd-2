@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { GSDError, GSD_GIT_ERROR } from "./errors.js";
 import { GIT_NO_PROMPT_ENV } from "./git-constants.js";
 import { getErrorMessage } from "./error-utils.js";
+import { isInfrastructureError } from "./auto/infra-errors.js";
 
 // Issue #453: keep auto-mode bookkeeping on the stable git CLI path unless a
 // caller explicitly opts into the native helper.
@@ -324,6 +325,20 @@ export function nativeIsRepo(basePath: string): boolean {
   }
   try {
     execFileSync("git", ["rev-parse", "--git-dir"], { cwd: basePath, stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Return true only when the repository has a reachable committed HEAD. */
+export function nativeHasCommittedHead(basePath: string): boolean {
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
+      cwd: basePath,
+      stdio: ["ignore", "ignore", "ignore"],
+      env: GIT_NO_PROMPT_ENV,
+    });
     return true;
   } catch {
     return false;
@@ -846,6 +861,10 @@ export function nativeAddAllWithExclusions(basePath: string, exclusions: readonl
     });
   } catch (err: unknown) {
     const stderr = (err as { stderr?: string })?.stderr ?? "";
+    const infraCode = isInfrastructureError(err) ?? isInfrastructureError(stderr);
+    if (infraCode) {
+      throw err;
+    }
     // git exits 1 when pathspec exclusions reference paths already covered
     // by .gitignore. The staging itself succeeds — only suppress that case.
     if (stderr.includes("ignored by one of your .gitignore files")) {
@@ -860,7 +879,8 @@ export function nativeAddAllWithExclusions(basePath: string, exclusions: readonl
       fallbackStageWithSymlinkedDotGsd(basePath);
       return;
     }
-    throw new GSDError(GSD_GIT_ERROR, `git add -A with exclusions failed in ${basePath}: ${getErrorMessage(err)}`);
+    const stderrDetail = stderr.trim() ? `; stderr: ${stderr.trim()}` : "";
+    throw new GSDError(GSD_GIT_ERROR, `git add -A with exclusions failed in ${basePath}: ${getErrorMessage(err)}${stderrDetail}`);
   }
 }
 
@@ -895,32 +915,9 @@ export function nativeResetPaths(basePath: string, paths: string[]): void {
 }
 
 /**
- * Read `commit.gpgsign` from the repo config. Returns true only if the value
- * is the literal string "true". Any other state (unset, false, error) → false.
- *
- * Used by nativeCommit to route signing-required commits through the git CLI,
- * because the libgit2 native path does not invoke configured signers.
- * (Issue #4980 CRIT-2)
- */
-function shouldSignCommits(basePath: string): boolean {
-  try {
-    const result = execFileSync("git", ["config", "--get", "commit.gpgsign"], {
-      cwd: basePath,
-      stdio: ["ignore", "pipe", "pipe"],
-      encoding: "utf-8",
-      env: GIT_NO_PROMPT_ENV,
-    }).trim();
-    return result === "true";
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Create a commit from the current index.
  * Returns the commit SHA on success, or null if nothing to commit.
- * Native: libgit2 commit create.
- * Fallback: `git commit -F -` (runs hooks; honors commit.gpgsign).
+ * Uses `git commit -F -` so normal user hooks run and commit.gpgsign is honored.
  *
  * The fallback intentionally does NOT use --no-verify — user pre-commit /
  * commit-msg / prepare-commit-msg hooks must fire on every GSD-automated
@@ -931,22 +928,9 @@ export function nativeCommit(
   message: string,
   options?: { allowEmpty?: boolean; input?: string },
 ): string | null {
-  const native = loadNative();
-  // libgit2's commit-create does not invoke configured GPG/SSH signers. When
-  // commit.gpgsign=true, route through the git CLI fallback so signing
-  // happens. (Issue #4980 CRIT-2)
-  if (native && !shouldSignCommits(basePath)) {
-    try {
-      return native.gitCommit(basePath, message, options?.allowEmpty);
-    } catch (e) {
-      const msg = getErrorMessage(e);
-      if (msg.includes("nothing to commit")) return null;
-      throw e;
-    }
-  }
-
-  // Fallback / signed-commit path: use git CLI with stdin pipe for safe
-  // multi-line messages. Hooks run; commit.gpgsign honored.
+  // Use git CLI with stdin pipe for safe multi-line messages. Hooks run;
+  // commit.gpgsign honored. libgit2 commit-create bypasses hooks, so automated
+  // GSD commits intentionally stay on the CLI path even when native git is on.
   try {
     const args = ["commit", "-F", "-"];
     if (options?.allowEmpty) args.push("--allow-empty");
@@ -1142,7 +1126,7 @@ export function nativeBranchDelete(basePath: string, branch: string, force = tru
     native.gitBranchDelete(basePath, branch, force);
     return;
   }
-  gitFileExec(basePath, ["branch", force ? "-D" : "-d", branch], true);
+  gitFileExec(basePath, ["branch", force ? "-D" : "-d", branch]);
 }
 
 /**

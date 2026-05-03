@@ -19,11 +19,39 @@ Plan → Execute (per task) → Complete → Reassess Roadmap → Next Slice
 - **Reassess** — checks if the roadmap still makes sense
 - **Validate** — reconciliation gate after all slices; catches gaps before sealing the milestone
 
+## Deep planning mode
+
+Enable project-level deep planning with `/gsd new-project --deep`, `/gsd new-milestone --deep`, or this project preference:
+
+```yaml
+planning_depth: deep
+```
+
+Deep mode runs one-time discovery gates before normal milestone planning:
+
+```
+Workflow Preferences -> Project Context -> Requirements -> Research Decision -> Optional Project Research -> Milestone Context/Roadmap
+```
+
+| Artifact | Stage | Purpose |
+|----------|-------|---------|
+| `.gsd/PREFERENCES.md` | `--deep` / `workflow-preferences` | Holds `planning_depth: deep` and captured workflow settings |
+| `.gsd/PROJECT.md` | `discuss-project` | Project vision, users, anti-goals, constraints, milestone sequence |
+| `.gsd/REQUIREMENTS.md` | `discuss-requirements` | Capability contract with Active, Validated, Deferred, and Out of Scope requirements |
+| `.gsd/runtime/research-decision.json` | `research-decision` | Records whether to run project research or skip it |
+| `.gsd/research/STACK.md`, `FEATURES.md`, `ARCHITECTURE.md`, `PITFALLS.md` | `research-project` | Optional four-way project research when the decision is `research` |
+
+The research-decision unit only records the choice. If the decision is `research`, the next gate fans out four project research passes. Those outputs inform planning and requirement review; they do not silently create binding requirements.
+
 ## Key properties
 
 ### Fresh session per unit
 
 Every task, research phase, and planning step gets a clean context window. The dispatch prompt includes everything needed — task plans, prior summaries, dependency context, decisions register — so the LLM starts oriented.
+
+### Runtime tool policy
+
+Each auto-mode unit has a `UnitContextManifest` with an enforced `ToolsPolicy`. Execution units use `all` mode and can edit project files, run shell commands, and dispatch subagents. Most planning units use `planning` mode: they can write `.gsd/` planning artifacts and run read-only shell commands, but cannot dispatch subagents. Selected planning and closeout units use `planning-dispatch` mode, which keeps those source-write and bash restrictions while allowing `subagent` dispatch for isolated recon, planning, or review work.
 
 ### Context pre-loading
 
@@ -43,7 +71,7 @@ The amount of context inlined is controlled by your [token profile](/guides/toke
 GSD isolates milestone work using one of three modes (configured via `git.isolation` in preferences):
 
 - **`none`** (default) — work happens on your current branch. No isolation overhead.
-- **`worktree`** — each milestone runs in its own git worktree. Squash-merged to main on completion.
+- **`worktree`** — each milestone runs in its own git worktree. Requires at least one commit; zero-commit repos temporarily run as `none` until `HEAD` exists. Squash-merged to main on completion.
 - **`branch`** — work happens on a `milestone/<MID>` branch in the project root. Useful for submodule-heavy repos.
 
 See [git strategy](/guides/git-strategy) for details.
@@ -111,11 +139,14 @@ Generate manually with `/gsd export --html`, or for all milestones with `/gsd ex
 
 ### Reactive task execution
 
-When `reactive_execution: true` is set, GSD derives a dependency graph from IO annotations in task plans. Tasks that don't conflict are dispatched in parallel via subagents.
+Reactive task execution is enabled by default. GSD derives a dependency graph from IO annotations in task plans and, when at least three ready tasks are available by default, dispatches non-conflicting tasks in parallel via subagents.
 
 ```yaml
-reactive_execution: true    # disabled by default
+reactive_execution:
+  enabled: false    # opt out
 ```
+
+Set `reactive_execution.enabled: true` explicitly to use the earlier two-ready-task threshold. Optional tuning includes `max_parallel` (default `2`, range `1`-`8`), `isolation_mode: same-tree`, and `subagent_model`.
 
 ## Controlling auto mode
 

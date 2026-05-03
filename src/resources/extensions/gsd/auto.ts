@@ -128,7 +128,6 @@ import {
 } from "./metrics.js";
 import { setLogBasePath, logWarning, logError } from "./workflow-logger.js";
 import { preflightCleanRoot, postflightPopStash } from "./clean-root-preflight.js";
-import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
@@ -176,6 +175,7 @@ import { getErrorMessage } from "./error-utils.js";
 import { recoverFailedMigration } from "./migrate-external.js";
 import { initRegistry, convertDispatchRules } from "./rule-registry.js";
 import { emitJournalEvent as _emitJournalEvent, type JournalEntry } from "./journal.js";
+import { isClosedStatus } from "./status-guards.js";
 import {
   type AutoDashboardData,
   updateProgressWidget as _updateProgressWidget,
@@ -195,6 +195,7 @@ import {
 import { isDbAvailable, getMilestone } from "./gsd-db.js";
 import { countPendingCaptures } from "./captures.js";
 import { CMUX_CHANNELS, type CmuxLogLevel } from "../shared/cmux-events.js";
+import { ensureDbOpen } from "./bootstrap/dynamic-tools.js";
 
 function makeCmuxEmitters(pi: ExtensionAPI) {
   return {
@@ -217,9 +218,13 @@ import {
 } from "./auto-post-unit.js";
 import { bootstrapAutoSession, openProjectDbIfPresent, type BootstrapDeps } from "./auto-start.js";
 import { initHealthWidget } from "./health-widget.js";
-import { runLegacyAutoLoop, runUokKernelLoop, resolveAgentEnd, resolveAgentEndCancelled, _resetPendingResolve, isSessionSwitchInFlight, type LoopDeps, type ErrorContext } from "./auto-loop.js";
+import { runLegacyAutoLoop, runUokKernelLoop } from "./auto/loop.js";
+import { resolveAgentEnd, resolveAgentEndCancelled, _resetPendingResolve, isSessionSwitchInFlight } from "./auto/resolve.js";
+import type { LoopDeps } from "./auto/loop-deps.js";
+import type { ErrorContext } from "./auto/types.js";
 import { runAutoLoopWithUok } from "./uok/kernel.js";
 import { resolveUokFlags } from "./uok/flags.js";
+import { validateDirectory } from "./validate-directory.js";
 // Slice-level parallelism (#2340)
 import { getEligibleSlices } from "./slice-parallel-eligibility.js";
 import { startSliceParallel } from "./slice-parallel-orchestrator.js";
@@ -232,7 +237,6 @@ import { reorderForCaching } from "./prompt-ordering.js";
 // ─── Session State ─────────────────────────────────────────────────────────
 
 import {
-  AutoSession,
   STUB_RECOVERY_THRESHOLD,
   NEW_SESSION_TIMEOUT_MS,
 } from "./auto/session.js";
@@ -250,11 +254,14 @@ export type {
   UnitRouting,
   StartModel,
 } from "./auto/session.js";
+import { autoSession as s } from "./auto-runtime-state.js";
+import { gsdHome } from "./gsd-home.js";
+import { createWorkspace, scopeMilestone } from "./workspace.js";
 
 // ── ENCAPSULATION INVARIANT ─────────────────────────────────────────────────
 // ALL mutable auto-mode state lives in the AutoSession class (auto/session.ts).
 // This file must NOT declare module-level `let` or `var` variables for state.
-// The single `s` instance below is the only mutable module-level binding.
+// The single shared `s` instance below is the only mutable AutoSession binding.
 //
 // When adding features or fixing bugs:
 //   - New mutable state → add a property to AutoSession, not a module-level variable
@@ -263,7 +270,6 @@ export type {
 //
 // Tests in auto-session-encapsulation.test.ts enforce this invariant.
 // ─────────────────────────────────────────────────────────────────────────────
-const s = new AutoSession();
 
 /** Throttle STATE.md rebuilds — at most once per 30 seconds */
 const STATE_REBUILD_MIN_INTERVAL_MS = 30_000;
@@ -317,6 +323,32 @@ function restoreMilestoneLockEnv(): void {
   s.previousMilestoneLockEnv = null;
   s.hadMilestoneLockEnv = false;
   s.milestoneLockEnvCaptured = false;
+}
+
+/**
+ * Rebuild s.scope from the current s.basePath / s.originalBasePath / s.currentMilestoneId.
+ *
+ * Pass the worktree path as rawPath when entering a worktree so createWorkspace
+ * can detect the worktree layout and set mode="worktree". When no worktree is
+ * active, rawPath should equal the project root.
+ *
+ * Clears s.scope when milestoneId is absent — scope is only meaningful when a
+ * milestone is active.
+ *
+ * TODO(C8): remove basePath/originalBasePath once all readers use s.scope.
+ */
+function rebuildScope(rawPath: string, milestoneId: string | null): void {
+  if (!milestoneId) {
+    s.scope = null;
+    return;
+  }
+  try {
+    const workspace = createWorkspace(rawPath);
+    s.scope = scopeMilestone(workspace, milestoneId);
+  } catch {
+    // Non-fatal — scope is additive. Existing readers still use basePath.
+    s.scope = null;
+  }
 }
 
 function normalizeSessionFilePath(raw: unknown): string | null {
@@ -374,10 +406,7 @@ export function startAutoDetached(
 
 /** Returns true if the project is configured for `isolation:worktree` mode. */
 export function shouldUseWorktreeIsolation(basePath?: string): boolean {
-  const prefs = loadEffectiveGSDPreferences(basePath)?.preferences?.git;
-  if (prefs?.isolation === "worktree") return true;
-  // Default is false — worktree isolation requires explicit opt-in
-  return false;
+  return getIsolationMode(basePath) === "worktree";
 }
 
 /** Crash recovery prompt — set by startAuto, consumed by the main loop */
@@ -505,6 +534,26 @@ export function isAutoActive(): boolean {
 /** Test-only seam for validating auto-mode guards (#4704). Do not use in production code. */
 export function _setAutoActiveForTest(active: boolean): void {
   s.active = active;
+}
+
+/**
+ * Test-only seam: emit the missing-worktree warning exactly as the resume path
+ * does.  Allows unit tests to verify the warning is produced without
+ * bootstrapping the full auto-mode entry point.  Do not use in production code.
+ */
+export function _warnIfWorktreeMissingForTest(
+  worktreePath: string | null | undefined,
+  milestoneId: string,
+): boolean {
+  if (worktreePath && !existsSync(worktreePath)) {
+    logWarning(
+      "session",
+      `Worktree was expected at ${worktreePath} but is missing. Continuing in project-root mode. To restart with a fresh worktree, run /gsd-debug or recreate the milestone.`,
+      { file: "auto.ts", milestoneId },
+    );
+    return true;
+  }
+  return false;
 }
 
 export function isAutoPaused(): boolean {
@@ -1168,8 +1217,7 @@ export async function pauseAuto(
       milestoneLock: s.sessionMilestoneLock ?? undefined,
     };
     const runtimeDir = join(gsdRoot(s.originalBasePath || s.basePath), "runtime");
-    mkdirSync(runtimeDir, { recursive: true });
-    writeFileSync(
+    atomicWriteSync(
       join(runtimeDir, "paused-session.json"),
       JSON.stringify(pausedMeta, null, 2),
       "utf-8",
@@ -1188,6 +1236,19 @@ export async function pauseAuto(
       logWarning("engine", `unit closeout on pause failed: ${err instanceof Error ? err.message : String(err)}`, { file: "auto.ts" });
     }
     s.currentUnit = null;
+  }
+
+  // Keep STATE.md aligned with the DB-backed state before releasing pause state.
+  // Without this, an interrupted deep run can leave STATE.md saying "no active
+  // milestone" even after the DB/disk reconciliation has recovered the next unit.
+  if (s.basePath) {
+    try {
+      await rebuildState(s.basePath);
+    } catch (e) {
+      debugLog("pause-rebuild-state-failed", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 
   if (lockBase()) {
@@ -1433,6 +1494,12 @@ export async function startAuto(
   // Escape stale worktree cwd from a previous milestone (#608).
   base = escapeStaleWorktree(base);
 
+  const dirCheck = validateDirectory(base);
+  if (dirCheck.severity === "blocked") {
+    ctx.ui.notify(dirCheck.reason!, "error");
+    return;
+  }
+
   // Heal .gsd.migrating before any branching — covers both fresh-start and
   // resume paths (#4416). The matching call in auto-start.ts covers the
   // bootstrap-only path; this call ensures the resume path is also protected.
@@ -1488,14 +1555,29 @@ export async function startAuto(
           );
         if (shouldResumePausedSession) {
           // Validate the milestone still exists and isn't already complete (#1664).
+          // DB status is authoritative when available; SUMMARY.md is a legacy
+          // fallback only for unmigrated/offline projects.
           const mDir = resolveMilestonePath(base, meta.milestoneId);
-          const summaryFile = resolveMilestoneFile(base, meta.milestoneId, "SUMMARY");
           let summaryIsTerminal = false;
-          if (summaryFile) {
-            try {
-              summaryIsTerminal = classifyMilestoneSummaryContent(readFileSync(summaryFile, "utf-8")) !== "failure";
-            } catch {
-              summaryIsTerminal = false;
+          let dbAvailable = isDbAvailable();
+          let milestoneRow = dbAvailable ? getMilestone(meta.milestoneId) : null;
+          if (!milestoneRow) {
+            const opened = await ensureDbOpen(base);
+            dbAvailable = opened || isDbAvailable();
+            if (dbAvailable) {
+              milestoneRow = getMilestone(meta.milestoneId);
+            }
+          }
+          if (dbAvailable) {
+            summaryIsTerminal = !!milestoneRow && isClosedStatus(milestoneRow.status);
+          } else {
+            const summaryFile = resolveMilestoneFile(base, meta.milestoneId, "SUMMARY");
+            if (summaryFile) {
+              try {
+                summaryIsTerminal = classifyMilestoneSummaryContent(readFileSync(summaryFile, "utf-8")) !== "failure";
+              } catch {
+                summaryIsTerminal = false;
+              }
             }
           }
           if (!mDir || summaryIsTerminal) {
@@ -1518,6 +1600,22 @@ export async function startAuto(
             s.autoStartTime = meta.autoStartTime || Date.now();
             s.sessionMilestoneLock = meta.milestoneLock ?? null;
             s.paused = true;
+            // Build scope from persisted state. Use worktreePath when present and
+            // still on disk so mode is detected correctly; fall back to project root.
+            {
+              const persistedWorktreePath = meta.worktreePath ?? null;
+              if (persistedWorktreePath && !existsSync(persistedWorktreePath)) {
+                logWarning(
+                  "session",
+                  `Worktree was expected at ${persistedWorktreePath} but is missing. Continuing in project-root mode. To restart with a fresh worktree, run /gsd-debug or recreate the milestone.`,
+                  { file: "auto.ts", milestoneId: meta.milestoneId ?? "" },
+                );
+              }
+              const rawForScope = (persistedWorktreePath && existsSync(persistedWorktreePath))
+                ? persistedWorktreePath
+                : (s.originalBasePath || base);
+              rebuildScope(rawForScope, s.currentMilestoneId);
+            }
             try { unlinkSync(pausedPath); } catch (e) {
               if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
                 logWarning("session", `pause file cleanup failed: ${e instanceof Error ? e.message : String(e)}`, { file: "auto.ts" });
@@ -1602,10 +1700,19 @@ export async function startAuto(
     // session (e.g. isolation mode changed, detectWorktreeName differs across
     // process restarts).  We guard with existsSync so a stale or deleted
     // worktree directory safely falls back to the project root.
-    const resumeWorktreePath = freshStartAssessment.pausedSession?.worktreePath;
+    const resumeWorktreePath = freshStartAssessment.pausedSession?.worktreePath ?? null;
+    if (resumeWorktreePath && !existsSync(resumeWorktreePath)) {
+      logWarning(
+        "session",
+        `Worktree was expected at ${resumeWorktreePath} but is missing. Continuing in project-root mode. To restart with a fresh worktree, run /gsd-debug or recreate the milestone.`,
+        { file: "auto.ts", milestoneId: s.currentMilestoneId ?? "" },
+      );
+    }
     if (resumeWorktreePath && existsSync(resumeWorktreePath)) {
       s.basePath = resumeWorktreePath;
     }
+    // Rebuild scope now that s.basePath reflects the actual worktree (or project root).
+    rebuildScope(s.basePath, s.currentMilestoneId);
     // Ensure the workflow-logger audit log is pinned to the project root
     // even when auto-mode is entered via a path that bypasses the
     // bootstrap/dynamic-tools ensureDbOpen() → setLogBasePath() chain
@@ -1634,6 +1741,8 @@ export async function startAuto(
       buildResolver().enterMilestone(s.currentMilestoneId, {
         notify: ctx.ui.notify.bind(ctx.ui),
       });
+      // s.basePath may have been updated to a worktree path by enterMilestone.
+      rebuildScope(s.basePath, s.currentMilestoneId);
     }
 
     registerSigtermHandler(lockBase());
@@ -1652,7 +1761,7 @@ export async function startAuto(
     // tree; deployed extensions live at ~/.gsd/agent/extensions/gsd/ where the
     // relative path resolves to ~/.gsd/agent/resource-loader.js which doesn't exist.
     // Using GSD_PKG_ROOT constructs a correct absolute path in both contexts (#3949).
-    const agentDir = process.env.GSD_CODING_AGENT_DIR || join(process.env.GSD_HOME || homedir(), ".gsd", "agent");
+    const agentDir = process.env.GSD_CODING_AGENT_DIR || join(gsdHome(), "agent");
     const pkgRoot = process.env.GSD_PKG_ROOT;
     const resourceLoaderPath = pkgRoot
       ? pathToFileURL(join(pkgRoot, "dist", "resource-loader.js")).href
@@ -1747,6 +1856,10 @@ export async function startAuto(
     freshStartAssessment,
   );
   if (!ready) return;
+
+  // Build scope after bootstrap has populated s.basePath / s.originalBasePath /
+  // s.currentMilestoneId (including worktree setup inside bootstrapAutoSession).
+  rebuildScope(s.basePath, s.currentMilestoneId);
 
   captureProjectRootEnv(s.originalBasePath || s.basePath);
   try {
@@ -1865,15 +1978,20 @@ export async function dispatchHookUnit(
   hookModel: string | undefined,
   targetBasePath: string,
 ): Promise<boolean> {
+  const wasActive = s.active;
+  const previousBasePath = s.basePath;
+  const previousCurrentUnit = s.currentUnit ? { ...s.currentUnit } : null;
+
   if (!s.active) {
     s.active = true;
     s.stepMode = true;
     s.cmdCtx = ctx as ExtensionCommandContext;
-    s.basePath = targetBasePath;
     s.autoStartTime = Date.now();
     s.currentUnit = null;
     s.pendingQuickTasks = [];
   }
+
+  s.basePath = targetBasePath;
 
   const hookUnitType = `hook/${hookName}`;
   const hookStartedAt = Date.now();
@@ -1883,6 +2001,23 @@ export async function dispatchHookUnit(
     id: triggerUnitId,
     startedAt: hookStartedAt,
   };
+
+  // Ensure cwd matches basePath BEFORE newSession() captures it (#1389).
+  // newSession() snapshots process.cwd() during construction; chdir-ing
+  // afterward leaves the session rooted to whatever cwd was when the call
+  // was made. Must be synchronous — no awaits between chdir and newSession.
+  try { if (process.cwd() !== s.basePath) process.chdir(s.basePath); } catch (err) {
+    const msg = `Failed to chdir before hook newSession (basePath: ${s.basePath}): ${err instanceof Error ? err.message : String(err)}`;
+    logWarning("engine", msg, { file: "auto.ts", basePath: s.basePath, error: err instanceof Error ? err.message : String(err) });
+    ctx.ui.notify(`${msg}. Cancelling hook dispatch to avoid running in the wrong directory.`, "error");
+    if (wasActive) {
+      s.basePath = previousBasePath;
+      s.currentUnit = previousCurrentUnit;
+    } else {
+      s.reset();
+    }
+    return false;
+  }
 
   const result = await s.cmdCtx!.newSession();
   if (result.cancelled) {
@@ -1939,11 +2074,6 @@ export async function dispatchHookUnit(
 
   ctx.ui.setStatus("gsd-auto", s.stepMode ? "next" : "auto");
   ctx.ui.notify(`Running post-unit hook: ${hookName}`, "info");
-
-  // Ensure cwd matches basePath before hook dispatch (#1389)
-  try { if (process.cwd() !== s.basePath) process.chdir(s.basePath); } catch (err) {
-    logWarning("engine", `chdir failed before hook dispatch: ${err instanceof Error ? err.message : String(err)}`, { file: "auto.ts" });
-  }
 
   debugLog("dispatchHookUnit", {
     phase: "send-message",

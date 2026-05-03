@@ -276,6 +276,26 @@ phases:
 
 > **注意：** Roadmap reassessment 需要显式设置 `reassess_after_slice: true`。如果没有它，无论 `skip_reassess` 怎么配，reassessment 都不会运行。
 
+### `reactive_execution`
+
+控制一个 slice 内部的自动并行 task 派发。该功能默认开启；只有当 task plan 的 IO 注解能生成不含歧义的依赖图，并且存在足够的 ready、互不冲突 tasks 时才会真正派发。
+
+```yaml
+reactive_execution:
+  enabled: false    # 显式关闭；省略此配置则保持默认开启
+```
+
+默认值与调优项：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | boolean | `true` | 设为 `false` 可强制顺序执行。显式设为 `true` 时使用较低的 2 个 ready tasks 阈值。 |
+| `max_parallel` | number | `2` | 单个 reactive batch 最多派发的 tasks 数，范围 `1`-`8`。 |
+| `isolation_mode` | string | `same-tree` | 执行隔离模式。当前只支持 `same-tree`。 |
+| `subagent_model` | string | `models.subagent` fallback | reactive task subagents 的可选 model override。 |
+
+省略 `enabled` 时，GSD 使用默认开启语义，只有至少 3 个 ready tasks 时才尝试并行批次。显式设置 `enabled: true` 时，会使用早期 opt-in 语义下的 2 个 ready tasks 阈值。
+
 ### `skill_discovery`
 
 控制 GSD 在自动模式中如何发现并应用 skills。
@@ -423,7 +443,7 @@ git:
   commit_type: feat           # 覆盖 conventional commit 前缀
   main_branch: main           # 主分支名称
   merge_strategy: squash      # worktree 分支合并方式："squash" 或 "merge"
-  isolation: worktree         # git isolation："worktree"、"branch" 或 "none"
+  isolation: none             # git isolation："none"（默认）、"worktree" 或 "branch"
   commit_docs: true           # 是否把 .gsd/ 产物提交到 git（设为 false 时仅保留本地）
   manage_gitignore: true      # 设为 false 时，GSD 不再修改 .gitignore
   worktree_post_create: .gsd/hooks/post-worktree-create  # worktree 创建后执行的脚本
@@ -441,7 +461,7 @@ git:
 | `commit_type` | string | （自动推断） | 覆盖 conventional commit 前缀（`feat`、`fix`、`refactor`、`docs`、`test`、`chore`、`perf`、`ci`、`build`、`style`） |
 | `main_branch` | string | `"main"` | 主分支名称 |
 | `merge_strategy` | string | `"squash"` | worktree 分支合并方式：`"squash"`（合并为单个提交）或 `"merge"`（保留单独提交） |
-| `isolation` | string | `"worktree"` | 自动模式隔离方式：`"worktree"`（独立目录）、`"branch"`（直接在项目根目录工作，适合子模块多的仓库）、`"none"`（无隔离，直接提交到当前分支） |
+| `isolation` | string | `"none"` | 自动模式隔离方式：`"none"`（无隔离，直接提交到当前分支）、`"worktree"`（独立目录）或 `"branch"`（直接在项目根目录工作，适合子模块多的仓库）。`worktree` 要求有已提交的 `HEAD`；零提交仓库会临时按 `none` 运行，直到第一次提交存在 |
 | `commit_docs` | boolean | `true` | 是否把 `.gsd/` planning 产物提交到 git。设为 `false` 则仅保留本地 |
 | `manage_gitignore` | boolean | `true` | 设为 `false` 后，GSD 将完全不修改 `.gitignore`，不会添加基础规则，也不会做自愈 |
 | `worktree_post_create` | string | （无） | worktree 创建后执行的脚本。环境变量中会传入 `SOURCE_DIR` 和 `WORKTREE_DIR` |
@@ -814,7 +834,7 @@ auto_supervisor:
 git:
   auto_push: true
   merge_strategy: squash
-  isolation: worktree         # "worktree", "branch", or "none"
+  isolation: none             # "none"（默认）、"worktree" 或 "branch"
   commit_docs: true
 
 # Skills

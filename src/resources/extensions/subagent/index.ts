@@ -36,6 +36,7 @@ import {
 } from "./isolation.js";
 import { registerWorker, updateWorker } from "./worker-registry.js";
 import { loadEffectiveGSDPreferences } from "../gsd/preferences.js";
+import { emitJournalEvent } from "../gsd/journal.js";
 import { CmuxClient, shellEscape } from "../cmux/index.js";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -260,13 +261,15 @@ function writePromptToTempFile(agentName: string, prompt: string): { dir: string
 	return { dir: tmpDir, filePath };
 }
 
-function buildSubagentProcessArgs(
+export function buildSubagentProcessArgs(
 	agent: AgentConfig,
 	task: string,
 	tmpPromptPath: string | null,
+	modelOverride?: string,
 ): string[] {
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (agent.model) args.push("--model", agent.model);
+	const effectiveModel = modelOverride ?? agent.model;
+	if (effectiveModel) args.push("--model", effectiveModel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 	if (tmpPromptPath) args.push("--append-system-prompt", tmpPromptPath);
 	args.push(`Task: ${task}`);
@@ -336,6 +339,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	modelOverride?: string,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -381,7 +385,7 @@ async function runSingleAgent(
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
+		model: modelOverride ?? agent.model,
 		step,
 	};
 
@@ -400,7 +404,7 @@ async function runSingleAgent(
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
 		}
-		const args = buildSubagentProcessArgs(agent, task, tmpPromptPath);
+		const args = buildSubagentProcessArgs(agent, task, tmpPromptPath, modelOverride);
 		let wasAborted = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
@@ -480,10 +484,11 @@ async function runSingleAgentInCmuxSplit(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	modelOverride?: string,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
-		return runSingleAgent(defaultCwd, agents, agentName, task, cwd, step, signal, onUpdate, makeDetails);
+		return runSingleAgent(defaultCwd, agents, agentName, task, cwd, step, signal, onUpdate, makeDetails, modelOverride);
 	}
 
 	let tmpPromptDir: string | null = null;
@@ -498,7 +503,7 @@ async function runSingleAgentInCmuxSplit(
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
+		model: modelOverride ?? agent.model,
 		step,
 	};
 
@@ -528,12 +533,12 @@ async function runSingleAgentInCmuxSplit(
 			? await cmuxClient.createSplit(directionOrSurfaceId as "right" | "down" | "left" | "up")
 			: directionOrSurfaceId;
 		if (!cmuxSurfaceId) {
-			return runSingleAgent(defaultCwd, agents, agentName, task, cwd, step, signal, onUpdate, makeDetails);
+			return runSingleAgent(defaultCwd, agents, agentName, task, cwd, step, signal, onUpdate, makeDetails, modelOverride);
 		}
 
 		const bundledPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "").split(path.delimiter).map((s) => s.trim()).filter(Boolean);
 		const extensionArgs = bundledPaths.flatMap((p) => ["--extension", p]);
-		const processArgs = [process.env.GSD_BIN_PATH!, ...extensionArgs, ...buildSubagentProcessArgs(agent, task, tmpPromptPath)];
+		const processArgs = [process.env.GSD_BIN_PATH!, ...extensionArgs, ...buildSubagentProcessArgs(agent, task, tmpPromptPath, modelOverride)];
 		// Normalize all paths to forward slashes before embedding in bash strings.
 		// On Windows, backslashes are interpreted as escape characters by bash,
 		// mangling paths like C:\Users\user into C:Useruser (#1436).
@@ -548,7 +553,7 @@ async function runSingleAgentInCmuxSplit(
 
 		const sent = await cmuxClient.sendSurface(cmuxSurfaceId, `bash -lc ${shellEscape(innerScript)}`);
 		if (!sent) {
-			return runSingleAgent(defaultCwd, agents, agentName, task, cwd, step, signal, onUpdate, makeDetails);
+			return runSingleAgent(defaultCwd, agents, agentName, task, cwd, step, signal, onUpdate, makeDetails, modelOverride);
 		}
 
 		const finished = await waitForFile(exitPath, signal);
@@ -595,12 +600,14 @@ const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	model: Type.Optional(Type.String({ description: "Model override for this task (e.g. 'claude-sonnet-4-6')" })),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	model: Type.Optional(Type.String({ description: "Model override for this step (e.g. 'claude-sonnet-4-6')" })),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -618,6 +625,7 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: false.", default: false }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	model: Type.Optional(Type.String({ description: "Model override for the subagent (e.g. 'claude-sonnet-4-6'). Takes precedence over the agent's frontmatter model." })),
 	isolated: Type.Optional(
 		Type.Boolean({
 			description:
@@ -662,11 +670,13 @@ export default function (pi: ExtensionAPI) {
 			"Use chain mode to pipeline: scout finds context, planner designs, worker implements.",
 		].join(" "),
 		promptGuidelines: [
-			"Use subagent to delegate self-contained tasks that benefit from an isolated context window.",
-			"Use scout agent first when you need codebase context before implementing.",
-			"Use chain mode for scout→planner→worker or worker→reviewer→worker pipelines.",
-			"Use parallel mode when tasks are independent and don't need each other's output.",
-			"Always check available agents with /subagent before choosing one.",
+			"Prefer subagent dispatch over inline work whenever a task is self-contained — recon, planning, review, refactor, test writing, security audit, doc writing. Each dispatch gets a fresh context window, so your main session stays focused on synthesis.",
+			"Before reading more than ~3 files to understand something, dispatch the scout agent and work from its compressed report instead.",
+			"Before any change touching ≥2 packages, the orchestration kernel, auto-mode, or a public API, dispatch the planner agent first. Plan first, then implement.",
+			"You MUST use parallel mode when ≥2 ready tasks are independent of each other's output. Do not serialize independent tasks manually — that wastes wall time and context.",
+			"Use chain mode for sequential pipelines where each step's output feeds the next: scout → planner → worker, or worker → reviewer → worker.",
+			"Before opening a PR or marking a slice complete, dispatch the reviewer agent (and security agent if the change touches auth, network, parsing, file IO, or shell exec).",
+			"Always check available agents with /subagent before choosing one — there are bundled specialists plus any project-scoped agents.",
 		],
 		parameters: SubagentParams,
 
@@ -709,6 +719,141 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// Dispatch telemetry — emit invoked once per dispatch and completed before each return.
+			// Fresh flowId per dispatch (subagent runs aren't currently plumbed with the parent
+			// auto-mode flowId; per-dispatch ids still let us measure frequency, batch size, mode).
+			const dispatchMode: "single" | "parallel" | "chain" = hasChain ? "chain" : hasTasks ? "parallel" : "single";
+			const dispatchAgents = hasChain
+				? params.chain!.map((s) => s.agent)
+				: hasTasks
+					? params.tasks!.map((t) => t.agent)
+					: params.agent
+						? [params.agent]
+						: [];
+			const dispatchTasks = hasChain
+				? params.chain!.map((s) => s.task)
+				: hasTasks
+					? params.tasks!.map((t) => t.task)
+					: params.task
+						? [params.task]
+						: [];
+			const dispatchId = crypto.randomUUID();
+			const dispatchStartMs = Date.now();
+			let finalResults: SingleResult[] = [];
+			let dispatchCompletedEmitted = false;
+
+			emitJournalEvent(ctx.cwd, {
+				ts: new Date().toISOString(),
+				flowId: dispatchId,
+				seq: 0,
+				eventType: "subagent-invoked",
+				data: {
+					dispatchId,
+					mode: dispatchMode,
+					agents: dispatchAgents,
+					batchSize: dispatchAgents.length,
+					unitType: getCurrentPhase() ?? null,
+					isolated: useIsolation,
+				},
+			});
+
+			const zeroUsage = (): UsageStats => ({
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: 0,
+				contextTokens: 0,
+				turns: 0,
+			});
+			const errorMessageFor = (err: unknown): string =>
+				err instanceof Error ? err.message : String(err || "subagent dispatch failed");
+			const makeFailureResult = (err: unknown, agent: string, task: string, step?: number): SingleResult => {
+				const message = errorMessageFor(err);
+				return {
+					agent,
+					agentSource: "unknown",
+					task,
+					exitCode: 1,
+					messages: [],
+					stderr: message,
+					usage: zeroUsage(),
+					stopReason: signal?.aborted ? "aborted" : "error",
+					errorMessage: message,
+					...(step !== undefined ? { step } : {}),
+				};
+			};
+			const synthesizeFailureResults = (err: unknown): SingleResult[] => {
+				if (finalResults.length > 0) {
+					let patchedRunning = false;
+					const patched = finalResults.map((result) => {
+						if (result.exitCode !== -1) return result;
+						patchedRunning = true;
+						const message = errorMessageFor(err);
+						return {
+							...result,
+							exitCode: 1,
+							stderr: result.stderr || message,
+							stopReason: signal?.aborted ? "aborted" : "error",
+							errorMessage: result.errorMessage || message,
+							usage: result.usage ?? zeroUsage(),
+						};
+					});
+					if (patchedRunning || patched.some((result) => result.exitCode !== 0)) return patched;
+
+					const nextIndex = finalResults.length < dispatchAgents.length ? finalResults.length : 0;
+					if (nextIndex > 0) {
+						return [
+							...finalResults,
+							makeFailureResult(
+								err,
+								dispatchAgents[nextIndex] ?? "unknown",
+								dispatchTasks[nextIndex] ?? "",
+								dispatchMode === "chain" ? nextIndex + 1 : undefined,
+							),
+						];
+					}
+				}
+
+				const agentsForFailure = dispatchAgents.length > 0 ? dispatchAgents : ["unknown"];
+				return agentsForFailure.map((agent, index) =>
+					makeFailureResult(
+						err,
+						agent,
+						dispatchTasks[index] ?? "",
+						dispatchMode === "chain" ? index + 1 : undefined,
+					),
+				);
+			};
+			const finishDispatch = (results: SingleResult[]): void => {
+				if (dispatchCompletedEmitted) return;
+				finalResults = results;
+				dispatchCompletedEmitted = true;
+				const successCount = results.filter((r) => r.exitCode === 0).length;
+				const failureCount = results.filter((r) => r.exitCode !== 0).length;
+				const totalCost = results.reduce((s, r) => s + (r.usage?.cost ?? 0), 0);
+				const totalInputTokens = results.reduce((s, r) => s + (r.usage?.input ?? 0), 0);
+				const totalOutputTokens = results.reduce((s, r) => s + (r.usage?.output ?? 0), 0);
+				emitJournalEvent(ctx.cwd, {
+					ts: new Date().toISOString(),
+					flowId: dispatchId,
+					seq: 1,
+					eventType: "subagent-completed",
+					data: {
+						dispatchId,
+						mode: dispatchMode,
+						agents: dispatchAgents,
+						successCount,
+						failureCount,
+						totalCost,
+						totalInputTokens,
+						totalOutputTokens,
+						wallTimeMs: Date.now() - dispatchStartMs,
+					},
+				});
+			};
+
+			try {
 			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
 				const requestedAgentNames = new Set<string>();
 				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
@@ -726,16 +871,19 @@ export default function (pi: ExtensionAPI) {
 						"Run project-local agents?",
 						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
 					);
-					if (!ok)
+					if (!ok) {
+						finishDispatch([]);
 						return {
 							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
 						};
+					}
 				}
 			}
 
 			if (params.chain && params.chain.length > 0) {
 				const results: SingleResult[] = [];
+				finalResults = results;
 				let previousOutput = "";
 
 				for (let i = 0; i < params.chain.length; i++) {
@@ -767,6 +915,7 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
+						step.model || params.model,
 					);
 					results.push(result);
 
@@ -775,6 +924,7 @@ export default function (pi: ExtensionAPI) {
 					if (isError) {
 						const errorMsg =
 							result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+						finishDispatch(results);
 						return {
 							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
 							details: makeDetails("chain")(results),
@@ -783,6 +933,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					previousOutput = getFinalOutput(result.messages);
 				}
+				finishDispatch(results);
 				return {
 					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
 					details: makeDetails("chain")(results),
@@ -790,7 +941,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
+				if (params.tasks.length > MAX_PARALLEL_TASKS) {
+					finishDispatch([]);
 					return {
 						content: [
 							{
@@ -800,6 +952,7 @@ export default function (pi: ExtensionAPI) {
 						],
 						details: makeDetails("parallel")([]),
 					};
+				}
 
 				// Track all results for streaming updates
 				const allResults: SingleResult[] = new Array(params.tasks.length);
@@ -816,6 +969,7 @@ export default function (pi: ExtensionAPI) {
 						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 					};
 				}
+				finalResults = allResults;
 
 				const emitParallelUpdate = () => {
 					if (onUpdate) {
@@ -839,6 +993,7 @@ export default function (pi: ExtensionAPI) {
 					: [];
 				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
 					const workerId = registerWorker(t.agent, t.task, index, batchSize, batchId);
+					const taskModel = t.model || params.model;
 					const runTask = () => cmuxSplitsEnabled
 						? runSingleAgentInCmuxSplit(
 							cmuxClient,
@@ -857,6 +1012,7 @@ export default function (pi: ExtensionAPI) {
 								}
 							},
 							makeDetails("parallel"),
+							taskModel,
 						)
 						: runSingleAgent(
 							ctx.cwd,
@@ -873,6 +1029,7 @@ export default function (pi: ExtensionAPI) {
 								}
 							},
 							makeDetails("parallel"),
+							taskModel,
 						);
 					let result = await runTask();
 
@@ -887,6 +1044,7 @@ export default function (pi: ExtensionAPI) {
 					emitParallelUpdate();
 					return result;
 				});
+				finalResults = results;
 
 				const successCount = results.filter((r) => r.exitCode === 0).length;
 				const summaries = results.map((r) => {
@@ -896,6 +1054,7 @@ export default function (pi: ExtensionAPI) {
 						: getFinalOutput(r.messages);
 					return `[${r.agent}] ${r.exitCode === 0 ? "completed" : `failed (exit ${r.exitCode})`}: ${output || "(no output)"}`;
 				});
+				finishDispatch(results);
 				return {
 					content: [
 						{
@@ -931,6 +1090,7 @@ export default function (pi: ExtensionAPI) {
 							signal,
 							onUpdate,
 							makeDetails("single"),
+							params.model,
 						)
 						: await runSingleAgent(
 							ctx.cwd,
@@ -942,7 +1102,9 @@ export default function (pi: ExtensionAPI) {
 							signal,
 							onUpdate,
 							makeDetails("single"),
+							params.model,
 						);
+					finalResults = [result];
 
 					// Capture and merge delta if isolated
 					if (isolation) {
@@ -956,6 +1118,7 @@ export default function (pi: ExtensionAPI) {
 					if (isError) {
 						const errorMsg =
 							result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+						finishDispatch([result]);
 						return {
 							content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
 							details: makeDetails("single")([result]),
@@ -967,6 +1130,7 @@ export default function (pi: ExtensionAPI) {
 					if (mergeResult && !mergeResult.success) {
 						outputText += `\n\n⚠ Patch merge failed: ${mergeResult.error || "unknown error"}`;
 					}
+					finishDispatch([result]);
 					return {
 						content: [{ type: "text", text: outputText }],
 						details: makeDetails("single")([result]),
@@ -978,11 +1142,18 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			finishDispatch([]);
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			return {
 				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
 				details: makeDetails("single")([]),
 			};
+			} catch (err) {
+				if (!dispatchCompletedEmitted) finalResults = synthesizeFailureResults(err);
+				throw err;
+			} finally {
+				finishDispatch(finalResults);
+			}
 		},
 
 		renderCall(args, theme) {

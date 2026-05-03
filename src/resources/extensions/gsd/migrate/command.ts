@@ -24,6 +24,7 @@ import {
 } from "./index.js";
 
 import type { MigrationPreview } from "./writer.js";
+import { homedir } from "node:os";
 
 /** Format preview stats for embedding in the review prompt. */
 function formatPreviewStats(preview: MigrationPreview): string {
@@ -85,9 +86,9 @@ export async function handleMigrate(
   // Default to cwd when no args given; expand ~ to HOME
   let rawPath = args.trim() || ".";
   if (rawPath.startsWith("~/")) {
-    rawPath = join(process.env.HOME ?? "~", rawPath.slice(2));
+    rawPath = join(homedir(), rawPath.slice(2));
   } else if (rawPath === "~") {
-    rawPath = process.env.HOME ?? "~";
+    rawPath = homedir();
   }
 
   let sourcePath = resolve(process.cwd(), rawPath);

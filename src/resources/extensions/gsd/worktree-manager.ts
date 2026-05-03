@@ -39,6 +39,11 @@ import {
   nativeWorktreeRemove,
 } from "./native-git-bridge.js";
 import { emitCanonicalRootRedirect } from "./worktree-telemetry.js";
+import {
+  isGsdWorktreePath,
+  normalizeWorktreePathForCompare,
+  resolveWorktreeProjectRoot,
+} from "./worktree-root.js";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -75,6 +80,20 @@ function normalizePathForComparison(path: string): string {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
+function normalizeBasePathForWorktreeOps(basePath: string): string {
+  const resolved = resolveWorktreeProjectRoot(basePath);
+  if (
+    isGsdWorktreePath(basePath) &&
+    normalizeWorktreePathForCompare(resolved) === normalizeWorktreePathForCompare(basePath)
+  ) {
+    throw new GSDError(
+      GSD_GIT_ERROR,
+      `Cannot resolve project root from worktree path: ${basePath}. Run the command from the project root or set GSD_PROJECT_ROOT.`,
+    );
+  }
+  return resolved;
+}
+
 // ─── resolveGitDir ─────────────────────────────────────────────────────────
 
 /**
@@ -106,7 +125,7 @@ export function resolveGitDir(basePath: string): string {
 }
 
 export function worktreesDir(basePath: string): string {
-  return join(basePath, ".gsd", "worktrees");
+  return join(resolveWorktreeProjectRoot(basePath), ".gsd", "worktrees");
 }
 
 export function worktreePath(basePath: string, name: string): string {
@@ -195,6 +214,8 @@ export function resolveCanonicalMilestoneRoot(
  * @param opts.branch — override the default `worktree/<name>` branch name
  */
 export function createWorktree(basePath: string, name: string, opts: { branch?: string; startPoint?: string; reuseExistingBranch?: boolean } = {}): WorktreeInfo {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   // Validate name: alphanumeric, hyphens, underscores only
   if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
     throw new GSDError(GSD_PARSE_ERROR, `Invalid worktree name "${name}". Use only letters, numbers, hyphens, and underscores.`);
@@ -297,6 +318,8 @@ export function createWorktree(basePath: string, name: string, opts: { branch?: 
  * Uses native worktree list and filters to those under .gsd/worktrees/.
  */
 export function listWorktrees(basePath: string): WorktreeInfo[] {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const baseVariants = [resolve(basePath)];
   if (existsSync(basePath)) {
     baseVariants.push(realpathSync(basePath));
@@ -459,6 +482,8 @@ export function removeWorktree(
   name: string,
   opts: { deleteBranch?: boolean; force?: boolean; branch?: string } = {},
 ): void {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   let wtPath = worktreePath(basePath, name);
   const branch = opts.branch ?? worktreeBranchName(name);
   const { deleteBranch = true, force = true } = opts;
@@ -714,6 +739,8 @@ function parseDiffNameStatus(entries: { status: string; path: string }[]): Workt
  * Returns a summary of added, modified, and removed GSD artifacts.
  */
 export function diffWorktreeGSD(basePath: string, name: string): WorktreeDiffSummary {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
@@ -728,8 +755,10 @@ export function diffWorktreeGSD(basePath: string, name: string): WorktreeDiffSum
  * on main when the merge is applied. If both branches have identical
  * content, this correctly returns an empty diff.
  */
-export function diffWorktreeAll(basePath: string, name: string): WorktreeDiffSummary {
-  const branch = worktreeBranchName(name);
+export function diffWorktreeAll(basePath: string, name: string, branchOverride?: string): WorktreeDiffSummary {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
+  const branch = branchOverride ?? worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
   const entries = nativeDiffNameStatus(basePath, mainBranch, branch);
@@ -741,8 +770,10 @@ export function diffWorktreeAll(basePath: string, name: string): WorktreeDiffSum
  * Get per-file line addition/deletion stats for what will change on main.
  * Uses direct diff (not merge-base) so the preview matches the actual merge outcome.
  */
-export function diffWorktreeNumstat(basePath: string, name: string): FileLineStat[] {
-  const branch = worktreeBranchName(name);
+export function diffWorktreeNumstat(basePath: string, name: string, branchOverride?: string): FileLineStat[] {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
+  const branch = branchOverride ?? worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
   const rawStats = nativeDiffNumstat(basePath, mainBranch, branch);
@@ -760,6 +791,8 @@ export function diffWorktreeNumstat(basePath: string, name: string): FileLineSta
  * Returns the raw unified diff for LLM consumption.
  */
 export function getWorktreeGSDDiff(basePath: string, name: string): string {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
@@ -771,6 +804,8 @@ export function getWorktreeGSDDiff(basePath: string, name: string): string {
  * Returns the raw unified diff for LLM consumption.
  */
 export function getWorktreeCodeDiff(basePath: string, name: string): string {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
@@ -781,6 +816,8 @@ export function getWorktreeCodeDiff(basePath: string, name: string): string {
  * Get commit log for the worktree branch since it diverged from main.
  */
 export function getWorktreeLog(basePath: string, name: string): string {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
   const branch = worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
 
@@ -794,8 +831,10 @@ export function getWorktreeLog(basePath: string, name: string): string {
  * Must be called from the main working tree (not the worktree itself).
  * Returns the merge commit message.
  */
-export function mergeWorktreeToMain(basePath: string, name: string, commitMessage: string): string {
-  const branch = worktreeBranchName(name);
+export function mergeWorktreeToMain(basePath: string, name: string, commitMessage: string, branchOverride?: string): string {
+  basePath = normalizeBasePathForWorktreeOps(basePath);
+
+  const branch = branchOverride ?? worktreeBranchName(name);
   const mainBranch = nativeDetectMainBranch(basePath);
   const current = nativeGetCurrentBranch(basePath);
 

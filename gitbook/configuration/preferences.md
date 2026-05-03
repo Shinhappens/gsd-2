@@ -38,6 +38,9 @@ models:
 # Token optimization
 token_profile: balanced
 
+# Project discovery
+planning_depth: deep
+
 # Budget
 budget_ceiling: 25.00
 budget_enforcement: pause
@@ -51,7 +54,7 @@ auto_supervisor:
 git:
   auto_push: true
   merge_strategy: squash
-  isolation: worktree
+  isolation: none
   collapse_cadence: milestone   # or "slice" — see Git & Worktrees docs
   # milestone_resquash applies only when collapse_cadence: "slice"
   # milestone_resquash: true    # collapse slice commits into one at milestone end
@@ -91,6 +94,21 @@ models:
 
 Coordinates model selection, phase skipping, and context compression. Values: `budget`, `balanced` (default), `quality`. See [Token Optimization](../features/token-optimization.md).
 
+### `planning_depth`
+
+Controls how much discovery runs before milestone-level planning.
+
+```yaml
+planning_depth: deep
+```
+
+| Value | Behavior |
+|-------|----------|
+| `light` | Default. Uses the normal milestone discussion flow. |
+| `deep` | Runs workflow preferences, `.gsd/PROJECT.md`, `.gsd/REQUIREMENTS.md`, a research decision, and optional project research before milestone planning. |
+
+Enable deep mode with `/gsd new-project --deep`, `/gsd new-milestone --deep`, or by adding the setting to `.gsd/PREFERENCES.md`. The research decision is recorded in `.gsd/runtime/research-decision.json`; choosing research writes `.gsd/research/STACK.md`, `FEATURES.md`, `ARCHITECTURE.md`, and `PITFALLS.md`.
+
 ### `budget_ceiling`
 
 Maximum USD to spend during auto mode:
@@ -120,6 +138,16 @@ auto_supervisor:
   hard_timeout_minutes: 30    # pause auto mode
 ```
 
+### `min_request_interval_ms`
+
+Minimum milliseconds between auto-mode LLM request dispatches. Use this to proactively slow auto-mode on rate-limited providers and reduce 429 errors. Set to `0` to disable.
+
+```yaml
+min_request_interval_ms: 1000   # wait at least 1 second between LLM requests
+```
+
+Default: `0` (disabled)
+
 ### `verification_commands`
 
 Shell commands that run after every task execution:
@@ -144,6 +172,17 @@ phases:
   reassess_after_slice: true
   require_slice_discussion: false
 ```
+
+### `reactive_execution`
+
+Automatic parallel task dispatch inside a slice. Reactive execution is enabled by default and only dispatches when task-plan IO annotations produce a non-ambiguous graph with enough ready, non-conflicting tasks.
+
+```yaml
+reactive_execution:
+  enabled: false    # opt out
+```
+
+When omitted, GSD uses the default-on threshold of three ready tasks. Set `enabled: true` explicitly to use the lower two-ready-task threshold. Optional fields: `max_parallel` (default `2`, range `1`-`8`), `isolation_mode: same-tree`, and `subagent_model`.
 
 ### `skill_discovery`
 
@@ -172,10 +211,12 @@ Git behavior. See [Git & Worktrees](git-settings.md).
 git:
   auto_push: false
   merge_strategy: squash
-  isolation: worktree
+  isolation: none
   commit_docs: true
   auto_pr: false
 ```
+
+Set `isolation: worktree` when you need milestone file isolation. Worktree mode requires a committed `HEAD`; in a zero-commit repo, GSD temporarily behaves as `none` until the first commit exists.
 
 ### `notifications`
 

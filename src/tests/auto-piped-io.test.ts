@@ -14,6 +14,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { shouldRedirectAutoToHeadless } from "../cli-auto-routing.js";
+
 // ─── Extracted detection logic (mirrors cli.ts) ───────────────────────────
 
 /**
@@ -29,20 +31,6 @@ const EXPLICIT_SUBCOMMANDS = new Set([
   "sessions",
   "web",
 ]);
-
-/**
- * Detect whether the current subcommand should be auto-redirected
- * to headless mode when stdout is not a TTY.
- *
- * Returns true when: the subcommand is "auto" AND stdout is piped.
- */
-function shouldRedirectAutoToHeadless(
-  subcommand: string | undefined,
-  stdoutIsTTY: boolean,
-): boolean {
-  if (stdoutIsTTY) return false;
-  return subcommand === "auto";
-}
 
 /**
  * Check whether interactive mode can be entered.
@@ -66,18 +54,22 @@ function isExplicitSubcommand(subcommand: string | undefined): boolean {
 // ─── shouldRedirectAutoToHeadless ─────────────────────────────────────────
 
 test("redirects 'auto' to headless when stdout is piped", () => {
-  assert.ok(shouldRedirectAutoToHeadless("auto", false));
+  assert.ok(shouldRedirectAutoToHeadless("auto", true, false));
 });
 
-test("does NOT redirect 'auto' when stdout is a TTY", () => {
-  assert.ok(!shouldRedirectAutoToHeadless("auto", true));
+test("redirects 'auto' to headless when stdin is piped", () => {
+  assert.ok(shouldRedirectAutoToHeadless("auto", false, true));
+});
+
+test("does NOT redirect 'auto' when stdin and stdout are TTY", () => {
+  assert.ok(!shouldRedirectAutoToHeadless("auto", true, true));
 });
 
 test("does NOT redirect non-auto subcommands when stdout is piped", () => {
-  assert.ok(!shouldRedirectAutoToHeadless("headless", false));
-  assert.ok(!shouldRedirectAutoToHeadless("config", false));
-  assert.ok(!shouldRedirectAutoToHeadless("update", false));
-  assert.ok(!shouldRedirectAutoToHeadless(undefined, false));
+  assert.ok(!shouldRedirectAutoToHeadless("headless", true, false));
+  assert.ok(!shouldRedirectAutoToHeadless("config", true, false));
+  assert.ok(!shouldRedirectAutoToHeadless("update", true, false));
+  assert.ok(!shouldRedirectAutoToHeadless(undefined, true, false));
 });
 
 // ─── canEnterInteractiveMode ──────────────────────────────────────────────
@@ -130,7 +122,7 @@ test("scenario: 'gsd auto 2>&1 | cat' — should redirect to headless", () => {
   assert.ok(!canEnterInteractiveMode(stdinIsTTY, stdoutIsTTY));
 
   // Auto should be redirected to headless
-  assert.ok(shouldRedirectAutoToHeadless(subcommand, stdoutIsTTY));
+  assert.ok(shouldRedirectAutoToHeadless(subcommand, stdinIsTTY, stdoutIsTTY));
 });
 
 test("scenario: 'gsd auto > /tmp/output.txt' — should redirect to headless", () => {
@@ -139,7 +131,7 @@ test("scenario: 'gsd auto > /tmp/output.txt' — should redirect to headless", (
   const stdoutIsTTY = false;
 
   assert.ok(!canEnterInteractiveMode(stdinIsTTY, stdoutIsTTY));
-  assert.ok(shouldRedirectAutoToHeadless(subcommand, stdoutIsTTY));
+  assert.ok(shouldRedirectAutoToHeadless(subcommand, stdinIsTTY, stdoutIsTTY));
 });
 
 test("scenario: 'gsd auto' in terminal — normal interactive mode", () => {
@@ -148,7 +140,7 @@ test("scenario: 'gsd auto' in terminal — normal interactive mode", () => {
   const stdoutIsTTY = true;
 
   assert.ok(canEnterInteractiveMode(stdinIsTTY, stdoutIsTTY));
-  assert.ok(!shouldRedirectAutoToHeadless(subcommand, stdoutIsTTY));
+  assert.ok(!shouldRedirectAutoToHeadless(subcommand, stdinIsTTY, stdoutIsTTY));
 });
 
 test("scenario: 'echo msg | gsd auto' — stdin piped, should redirect", () => {
@@ -156,10 +148,9 @@ test("scenario: 'echo msg | gsd auto' — stdin piped, should redirect", () => {
   const stdinIsTTY = false;
   const stdoutIsTTY = true; // stdout is TTY even though stdin is piped
 
-  // stdout is TTY, so auto redirect doesn't trigger...
-  assert.ok(!shouldRedirectAutoToHeadless(subcommand, stdoutIsTTY));
-  // ...but interactive mode is blocked because stdin is piped
+  // Interactive mode is blocked because stdin is piped, so auto redirects to headless.
   assert.ok(!canEnterInteractiveMode(stdinIsTTY, stdoutIsTTY));
+  assert.ok(shouldRedirectAutoToHeadless(subcommand, stdinIsTTY, stdoutIsTTY));
 });
 
 test("scenario: 'echo msg | gsd auto | cat' — both piped", () => {
@@ -168,5 +159,5 @@ test("scenario: 'echo msg | gsd auto | cat' — both piped", () => {
   const stdoutIsTTY = false;
 
   assert.ok(!canEnterInteractiveMode(stdinIsTTY, stdoutIsTTY));
-  assert.ok(shouldRedirectAutoToHeadless(subcommand, stdoutIsTTY));
+  assert.ok(shouldRedirectAutoToHeadless(subcommand, stdinIsTTY, stdoutIsTTY));
 });

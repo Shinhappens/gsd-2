@@ -306,13 +306,23 @@ If adaptive model routing is producing bad results, clear the routing history:
 rm .gsd/routing-history.json
 ```
 
-### Full state rebuild
+### Refresh rendered state
 
 ```
 /gsd doctor
 ```
 
-Doctor rebuilds `STATE.md` from plan and roadmap files on disk and fixes detected inconsistencies.
+Doctor checks the authoritative database, refreshes `STATE.md` from derived database state, and fixes detected projection or runtime-file inconsistencies.
+
+### Recover database hierarchy from markdown
+
+Use this only when the database is missing, damaged, or known to be stale but the rendered milestone, slice, and task markdown on disk is the best available source:
+
+```
+/gsd recover
+```
+
+`/gsd recover` clears and reconstructs the database hierarchy tables from markdown, then derives state again to verify the result. Normal runtime does not silently import markdown projections, and worktree markdown is not synced back as authoritative state.
 
 ## Getting Help
 
@@ -355,9 +365,9 @@ Doctor rebuilds `STATE.md` from plan and roadmap files on disk and fixes detecte
 
 **Symptoms:** `gsd_decision_save` (or its alias `gsd_save_decision`), `gsd_requirement_update` (or `gsd_update_requirement`), or `gsd_summary_save` (or `gsd_save_summary`) fail with this error.
 
-**Cause:** The SQLite database wasn't initialized. This happens in manual `/gsd` sessions (non-auto mode) on versions before v2.29.
+**Cause:** The SQLite database was not initialized or could not be opened. Runtime state derivation will not silently fall back to markdown projections.
 
-**Fix:** Updated in v2.29+ to auto-initialize the database on first tool call. Upgrade to the latest version.
+**Fix:** Upgrade to the latest version, then run a GSD command from the project root to initialize or open the database. Use `/gsd inspect` for database diagnostics. If the database was lost or corrupted and markdown artifacts are the only usable state, run `/gsd recover` after GSD has opened the database.
 
 ## Verification Issues
 

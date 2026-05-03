@@ -21,6 +21,8 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent
 import type { GitServiceImpl } from "../git-service.js";
 import type { CaptureEntry } from "../captures.js";
 import type { BudgetAlertLevel } from "../auto-budget.js";
+import { resolveWorktreeProjectRoot } from "../worktree-root.js";
+import type { MilestoneScope } from "../workspace.js";
 
 // ─── Exported Types ──────────────────────────────────────────────────────────
 
@@ -93,6 +95,8 @@ export class AutoSession {
   // ── Paths ────────────────────────────────────────────────────────────────
   basePath = "";
   originalBasePath = "";
+  // TODO(C8): remove basePath/originalBasePath once all readers use s.scope
+  scope: MilestoneScope | null = null;
   previousProjectRootEnv: string | null = null;
   hadProjectRootEnv = false;
   projectRootEnvCaptured = false;
@@ -162,6 +166,8 @@ export class AutoSession {
   /** Set when a GSD tool execution ends with isError due to malformed/truncated
    *  JSON arguments. Checked by postUnitPreVerification to break retry loops. */
   lastToolInvocationError: string | null = null;
+  /** Agent-end messages from the just-finished unit, consumed during finalize. */
+  lastUnitAgentEndMessages: unknown[] | null = null;
   /** Set when turn-level git action fails during closeout. */
   lastGitActionFailure: string | null = null;
   /** Last turn-level git action status captured during finalize. */
@@ -193,6 +199,8 @@ export class AutoSession {
   lastPromptCharCount: number | undefined;
   lastBaselineCharCount: number | undefined;
   pendingQuickTasks: CaptureEntry[] = [];
+  /** Timestamp of the last LLM request dispatch (ms since epoch). Used for proactive rate limiting. */
+  lastRequestTimestamp = 0;
 
   // ── Safety harness ───────────────────────────────────────────────────────
   /** SHA of the pre-unit git checkpoint ref. Cleared on success or rollback. */
@@ -224,12 +232,7 @@ export class AutoSession {
   }
 
   get lockBasePath(): string {
-    // Prefer originalBasePath (project root); fall back to basePath.
-    // Strip /.gsd/worktrees/ suffix if basePath is itself a worktree path
-    // to avoid reading/writing the lock inside the worktree (#3729).
-    const resolved = this.originalBasePath || this.basePath;
-    const markerIdx = resolved.indexOf("/.gsd/worktrees/");
-    return markerIdx !== -1 ? resolved.slice(0, markerIdx) : resolved;
+    return resolveWorktreeProjectRoot(this.basePath, this.originalBasePath);
   }
 
   reset(): void {
@@ -247,6 +250,7 @@ export class AutoSession {
     // Paths
     this.basePath = "";
     this.originalBasePath = "";
+    this.scope = null;
     this.previousProjectRootEnv = null;
     this.hadProjectRootEnv = false;
     this.projectRootEnvCaptured = false;
@@ -294,11 +298,13 @@ export class AutoSession {
     this.lastPromptCharCount = undefined;
     this.lastBaselineCharCount = undefined;
     this.pendingQuickTasks = [];
+    this.lastRequestTimestamp = 0;
     this.sidecarQueue = [];
     this.rewriteAttemptCount = 0;
     this.consecutiveCompleteBootstraps = 0;
     this.lastPreExecFailure = null;
     this.lastToolInvocationError = null;
+    this.lastUnitAgentEndMessages = null;
     this.lastGitActionFailure = null;
     this.lastGitActionStatus = null;
     this.isolationDegraded = false;

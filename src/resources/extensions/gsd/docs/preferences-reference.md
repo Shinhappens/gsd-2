@@ -87,7 +87,7 @@ Setting `prefer_skills: []` does **not** disable skill discovery — it just mea
   | `git.push_branches`    | `false`      | `true`       |
   | `git.pre_merge_check`  | `false`      | `true`       |
   | `git.merge_strategy`   | `"squash"`   | `"squash"`   |
-  | `git.isolation`        | `"worktree"` | `"worktree"` |
+  | `git.isolation`        | `"none"`     | `"none"`     |
   | `unique_milestone_ids` | `false`      | `true`       |
 
   Quick setup: `/gsd mode` (global) or `/gsd mode project` (project-level).
@@ -126,6 +126,8 @@ Setting `prefer_skills: []` does **not** disable skill discovery — it just mea
   - `idle_timeout_minutes`: minutes of inactivity before the supervisor intervenes (default: 10).
   - `hard_timeout_minutes`: minutes before the supervisor forces termination (default: 30).
 
+- `min_request_interval_ms`: number — minimum integer milliseconds between auto-mode LLM request dispatches. Non-integer values are rounded down (e.g., `1000.9 → 1000`). Use this to proactively slow auto-mode on rate-limited providers and reduce 429 errors. Set to `0` to disable. Default: `0` (disabled).
+
 - `git`: configures GSD's git behavior. All fields are optional — omit any to use defaults. Keys:
   - `auto_push`: boolean — automatically push commits to the remote after committing. Default: `false`.
   - `push_branches`: boolean — push the milestone branch to the remote after commits. Default: `false`.
@@ -135,7 +137,7 @@ Setting `prefer_skills: []` does **not** disable skill discovery — it just mea
   - `commit_type`: string — override the conventional commit type prefix. Must be one of: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`, `build`, `style`. Default: inferred from diff content.
   - `main_branch`: string — the primary branch name for new git repos (e.g., `"main"`, `"master"`, `"trunk"`). Also used by `getMainBranch()` as the preferred branch when auto-detection is ambiguous. Default: `"main"`.
   - `merge_strategy`: `"squash"` or `"merge"` — controls how worktree branches are merged back. `"squash"` combines all commits into one; `"merge"` preserves individual commits. Default: `"squash"`.
-  - `isolation`: `"worktree"`, `"branch"`, or `"none"` — controls auto-mode git isolation strategy. `"worktree"` creates a milestone worktree for isolated work; `"branch"` works directly in the project root but creates a milestone branch (useful for submodule-heavy repos); `"none"` works directly on the current branch with no worktree or milestone branch (ideal for step-mode with hot reloads). Default: `"worktree"`.
+  - `isolation`: `"none"`, `"worktree"`, or `"branch"` — controls auto-mode git isolation strategy. `"none"` works directly on the current branch with no worktree or milestone branch (default, ideal for step-mode with hot reloads); `"worktree"` creates a milestone worktree for isolated work; `"branch"` works directly in the project root but creates a milestone branch (useful for submodule-heavy repos). `worktree` requires a committed `HEAD`; in a zero-commit repo, GSD temporarily treats it as `none` until the first commit exists. Default: `"none"`.
   - `manage_gitignore`: boolean — when `false`, GSD will not touch `.gitignore` at all. Useful when your project has a strictly managed `.gitignore` and you don't want GSD adding entries. Default: `true`.
   - `worktree_post_create`: string — script to run after a worktree is created (both auto-mode and manual `/worktree`). Receives `SOURCE_DIR` and `WORKTREE_DIR` as environment variables. Can be absolute or relative to project root. Runs with 30-second timeout. Failure is non-fatal (logged as warning). Default: none.
   - `auto_pr`: boolean — automatically create a GitHub pull request after a milestone branch is merged. Requires `gh` CLI to be installed. Default: `false`.
@@ -157,11 +159,19 @@ Setting `prefer_skills: []` does **not** disable skill discovery — it just mea
 
 - `token_profile`: `"budget"`, `"balanced"`, `"quality"`, or `"burn-max"` — coordinates model selection, phase skipping, and context compression. `budget` skips research/reassessment and uses cheaper models; `balanced` (default) skips research/reassessment to reduce token burn; `quality` prefers higher-quality models; `burn-max` keeps full-context defaults, disables downgrade routing, and keeps phase skips off.
 
+- `planning_depth`: `"light"` or `"deep"` — controls project-level discovery before milestone planning. `"light"` is the default milestone discussion flow. `"deep"` runs workflow preferences, project discussion, requirements discussion, a research-decision gate, and optional project research before milestone planning. Enable it with `/gsd new-project --deep`, `/gsd new-milestone --deep`, or by setting `planning_depth: deep` in project-local `.gsd/PREFERENCES.md`. Global `~/.gsd/PREFERENCES.md` does not opt every fresh repo into deep mode. Deep mode writes `.gsd/PROJECT.md`, `.gsd/REQUIREMENTS.md`, `.gsd/runtime/research-decision.json`, and, when research is approved, `.gsd/research/STACK.md`, `FEATURES.md`, `ARCHITECTURE.md`, and `PITFALLS.md`.
+
 - `phases`: fine-grained control over which phases run. Usually set by `token_profile`, but can be overridden. Keys:
   - `skip_research`: boolean — skip milestone-level research. Default: `false`.
   - `reassess_after_slice`: boolean — run a dedicated roadmap-reassessment unit after each completed slice. Default: `false` (per ADR-003 §4). The plan-slice agent for the next slice performs JIT reassessment via a prompt preamble at zero additional token cost; a dedicated reassess session is opt-in. Set to `true` (e.g. via the `burn-max` profile) if you want the explicit session.
   - `skip_reassess`: boolean — force-disable roadmap reassessment even if `reassess_after_slice` is enabled. Default: `false`.
   - `skip_slice_research`: boolean — skip per-slice research. Default: `false`.
+
+- `reactive_execution`: controls automatic parallel task dispatch inside a slice. Reactive execution is enabled by default when omitted; set `enabled: false` to opt out. With default-on behavior, GSD only attempts a reactive batch when at least three ready tasks are available and the task-plan IO graph is non-ambiguous. If you set `enabled: true` explicitly, GSD uses the earlier opt-in threshold of two ready tasks. Keys:
+  - `enabled`: boolean — set `false` to force sequential task execution. Default: `true`.
+  - `max_parallel`: number — maximum tasks to dispatch in one batch, range `1`-`8`. Default: `2`.
+  - `isolation_mode`: `"same-tree"` — currently the only supported value.
+  - `subagent_model`: string — optional model override for reactive task subagents. Falls back to the `models.subagent` routing when omitted.
 
 - `remote_questions`: route interactive questions to Slack/Discord for headless auto-mode. Keys:
   - `channel`: `"slack"` or `"discord"` — channel type.
@@ -294,7 +304,7 @@ mode: solo
 ---
 ```
 
-Equivalent to setting `git.auto_push: true`, `git.push_branches: false`, `git.pre_merge_check: false`, `git.merge_strategy: squash`, `git.isolation: worktree`, `unique_milestone_ids: false`.
+Equivalent to setting `git.auto_push: true`, `git.push_branches: false`, `git.pre_merge_check: false`, `git.merge_strategy: squash`, `git.isolation: none`, `unique_milestone_ids: false`.
 
 **Team — unique IDs, push branches, pre-merge checks:**
 
@@ -305,7 +315,7 @@ mode: team
 ---
 ```
 
-Equivalent to setting `git.auto_push: false`, `git.push_branches: true`, `git.pre_merge_check: true`, `git.merge_strategy: squash`, `git.isolation: worktree`, `unique_milestone_ids: true`.
+Equivalent to setting `git.auto_push: false`, `git.push_branches: true`, `git.pre_merge_check: true`, `git.merge_strategy: squash`, `git.isolation: none`, `unique_milestone_ids: true`.
 
 **Mode with overrides — team mode but with auto-push:**
 

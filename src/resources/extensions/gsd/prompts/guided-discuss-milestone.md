@@ -1,3 +1,5 @@
+**Working directory:** `{{workingDirectory}}`. All file reads, writes, and shell commands MUST operate relative to this directory. Do NOT `cd` to any other directory.
+
 Discuss milestone {{milestoneId}} ("{{milestoneTitle}}"). Identify gray areas, ask the user about them, and write `{{milestoneId}}-CONTEXT.md` in the milestone directory with the decisions. Use the **Context** output template below. If a `GSD Skill Preferences` block is present in system context, use it to decide which skills to load and follow; do not override required artifact rules.
 
 **Structured questions available: {{structuredQuestionsAvailable}}**
@@ -9,6 +11,13 @@ Discuss milestone {{milestoneId}} ("{{milestoneTitle}}"). Identify gray areas, a
 ## Interview Protocol
 
 {{fastPathInstruction}}
+
+### Read project shape
+
+Before your first question round, read `.gsd/PROJECT.md` and look for `## Project Shape` → `**Complexity:**`. The verdict is either **`simple`** or **`complex`** (default to `complex` if PROJECT.md is missing the section, predates this convention, or the value is unclear). The verdict scales the rest of this stage:
+
+- **`simple`** — favor 1–2 plain-text question rounds. Skip the parallel-research investigation. Skip `ask_user_questions` unless presenting concrete alternatives.
+- **`complex`** — full investigation, 3–4-option structured questions, multi-round.
 
 ### Before your first question round
 
@@ -34,7 +43,7 @@ Ask **1–3 questions per round**. Keep each question focused on one of:
 
 **Never fabricate or simulate user input.** Never generate fake transcript markers like `[User]`, `[Human]`, or `User:`. Ask one question round, then wait for the user's actual response before continuing.
 
-**If `{{structuredQuestionsAvailable}}` is `true`:** use `ask_user_questions` for each round. 1–3 questions per call, each as a separate question object. Keep option labels short (3–5 words). Always include a freeform "Other / let me explain" option. When the user picks that option or writes a long freeform answer, switch to plain text follow-up for that thread before resuming structured questions. **IMPORTANT: Call `ask_user_questions` exactly once per turn. Never make multiple calls with the same or overlapping questions — wait for the user's response before asking the next round.**
+**If `{{structuredQuestionsAvailable}}` is `true`:** use `ask_user_questions` for each round. 1–3 questions per call, each as a separate question object. Keep option labels short (3–5 words). In **`complex`** mode, each multi-choice question MUST present **3 or 4 concrete, researched options** plus a final **"Other — let me discuss"** option; options must be grounded in the investigation above (codebase signals, library docs, prior `.gsd/` artifacts), not generic placeholders. In **`simple`** mode, 2 options is fine when alternatives are genuinely binary. Binary depth-check / wrap-up gates are exempt from the 3-or-4 rule. When the user picks "Other — let me discuss" or writes a long freeform answer, switch to plain text follow-up for that thread before resuming structured questions. **IMPORTANT: Call `ask_user_questions` exactly once per turn. Never make multiple calls with the same or overlapping questions — wait for the user's response before asking the next round.**
 
 **If `{{structuredQuestionsAvailable}}` is `false`:** ask questions in plain text. Keep each round to 1–3 focused questions. Wait for answers before asking the next round.
 

@@ -8,27 +8,29 @@ GSD supports three isolation modes, configured via the `git.isolation` preferenc
 
 | Mode | Working Directory | Branch | Best For |
 |------|-------------------|--------|----------|
-| `worktree` (default) | `.gsd/worktrees/<MID>/` | `milestone/<MID>` | Most projects — full file isolation between milestones |
+| `none` (default) | Project root | Current branch (no milestone branch) | Most projects — no isolation overhead |
+| `worktree` | `.gsd/worktrees/<MID>/` | `milestone/<MID>` | Projects that need full file isolation between milestones |
 | `branch` | Project root | `milestone/<MID>` | Submodule-heavy repos where worktrees don't work well |
-| `none` | Project root | Current branch (no milestone branch) | Hot-reload workflows where file isolation breaks dev tooling |
 
-### `worktree` Mode (Default)
+### `none` Mode (Default)
+
+Work happens directly on your current branch. No worktree, no milestone branch. GSD still commits sequentially with conventional commit messages, but there's no branch isolation.
+
+Use this for hot-reload workflows where file isolation breaks dev tooling (e.g., file watchers that only see the project root), or for small projects where branch overhead isn't worth it.
+
+### `worktree` Mode
 
 Each milestone gets its own git worktree at `.gsd/worktrees/<MID>/` on a `milestone/<MID>` branch. All execution happens inside the worktree. On completion, the worktree is squash-merged to main as one clean commit. The worktree and branch are then cleaned up.
 
 This provides full file isolation — changes in a milestone can't interfere with your main working copy.
+
+Worktree mode requires the repository to have at least one commit. If `git.isolation: worktree` is configured in a zero-commit repo with no committed `HEAD`, GSD temporarily runs as `none` so startup can continue. After the first commit exists, the same preference resolves to `worktree`.
 
 ### `branch` Mode
 
 Work happens in the project root on a `milestone/<MID>` branch. No worktree is created. On completion, the branch is merged to main (squash or regular merge, per `merge_strategy`).
 
 Use this when worktrees cause problems — submodule-heavy repos, repos with hardcoded paths, or environments where worktree symlinks don't behave.
-
-### `none` Mode
-
-Work happens directly on your current branch. No worktree, no milestone branch. GSD still commits sequentially with conventional commit messages, but there's no branch isolation.
-
-Use this for hot-reload workflows where file isolation breaks dev tooling (e.g., file watchers that only see the project root), or for small projects where branch overhead isn't worth it.
 
 ## Branching Model (Worktree Mode)
 
@@ -103,7 +105,7 @@ Auto mode creates and manages worktrees automatically:
 
 ### Manual
 
-Use the `/worktree` (or `/wt`) command for manual worktree management:
+Use the `/worktree` (or `/wt`) command for standalone manual worktree management:
 
 ```
 /worktree create
@@ -111,6 +113,17 @@ Use the `/worktree` (or `/wt`) command for manual worktree management:
 /worktree merge
 /worktree remove
 ```
+
+Inside an active GSD TUI session, use `/gsd worktree` (or `/gsd wt`) for worktree commands that report through the session UI:
+
+```
+/gsd worktree list
+/gsd worktree merge [name]
+/gsd worktree clean
+/gsd worktree remove <name> [--force]
+```
+
+`list` shows each worktree's branch, path, diff stats, commit count, and whether it is clean, unmerged, or has uncommitted changes. `merge` brings a worktree back into the detected main branch and removes it afterward; if the worktree has dirty files, GSD tries to auto-commit them before merging. `clean` removes only merged or empty worktrees and keeps anything with pending changes. `remove` refuses to discard unmerged or uncommitted work unless you pass `--force`.
 
 ## Workflow Modes
 
@@ -127,7 +140,7 @@ mode: team    # shared repos — unique IDs, push branches, pre-merge checks
 | `git.push_branches` | `false` | `true` |
 | `git.pre_merge_check` | `false` | `true` |
 | `git.merge_strategy` | `"squash"` | `"squash"` |
-| `git.isolation` | `"worktree"` | `"worktree"` |
+| `git.isolation` | `"none"` | `"none"` |
 | `git.commit_docs` | `true` | `true` |
 | `unique_milestone_ids` | `false` | `true` |
 
@@ -149,7 +162,7 @@ git:
   commit_type: feat           # override commit type prefix
   main_branch: main           # primary branch name
   commit_docs: true           # commit .gsd/ to git
-  isolation: worktree         # "worktree", "branch", or "none"
+  isolation: none             # "none" (default), "worktree", or "branch"
   auto_pr: false              # create PR on milestone completion
   pr_target_branch: develop   # PR target branch (default: main)
 ```

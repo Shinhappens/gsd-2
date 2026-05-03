@@ -1,3 +1,4 @@
+// GSD-2 — WorktreeResolver: encapsulates worktree path state and merge/exit lifecycle.
 /**
  * WorktreeResolver — encapsulates worktree path state and merge/exit lifecycle.
  *
@@ -23,13 +24,27 @@ import { emitJournalEvent } from "./journal.js";
 import { emitWorktreeCreated, emitWorktreeMerged } from "./worktree-telemetry.js";
 import { getCollapseCadence, getMilestoneResquash, resquashMilestoneOnMain } from "./slice-cadence.js";
 import { loadEffectiveGSDPreferences } from "./preferences.js";
+import { resolveWorktreeProjectRoot, normalizeWorktreePathForCompare } from "./worktree-root.js";
+
+// ─── Path Comparison Helper ────────────────────────────────────────────────
+/**
+ * Compare two paths for physical identity, tolerating trailing slashes,
+ * symlink differences, and case variations on case-insensitive volumes.
+ *
+ * Used in place of string `===` / `!==` wherever one operand may be
+ * realpath-normalised (e.g. from the workspace registry) and the other
+ * may not be (e.g. a raw caller-supplied basePath).
+ */
+function isSamePath(a: string, b: string): boolean {
+  return normalizeWorktreePathForCompare(a) === normalizeWorktreePathForCompare(b);
+}
 
 // ─── Dependency Interface ──────────────────────────────────────────────────
 
 export interface WorktreeResolverDeps {
   isInAutoWorktree: (basePath: string) => boolean;
   shouldUseWorktreeIsolation: () => boolean;
-  getIsolationMode: () => "worktree" | "branch" | "none";
+  getIsolationMode: (basePath?: string) => "worktree" | "branch" | "none";
   mergeMilestoneToMain: (
     basePath: string,
     milestoneId: string,
@@ -85,30 +100,19 @@ export interface NotifyCtx {
 // ─── Path Helpers ──────────────────────────────────────────────────────────
 
 /**
- * Worktree marker segment — present in any path produced by worktreePath().
- * Used to strip the worktree suffix and recover the project root (#3729).
- */
-const WORKTREE_MARKER = "/.gsd/worktrees/";
-
-/**
  * Resolve the project root from session path state.
  *
  * Prefers `originalBasePath` (always the project root when set), but falls
  * back to `basePath` when `originalBasePath` is falsy (e.g. fresh AutoSession
  * with default empty string). If `basePath` itself is inside a worktree
- * directory (contains `/.gsd/worktrees/`), strip that suffix to recover the
- * actual project root — preventing double-nested worktree paths (#3729).
+ * directory (including symlink-resolved ~/.gsd/projects/<hash>/worktrees
+ * paths), recover the actual project root to prevent double nesting (#3729).
  */
 export function resolveProjectRoot(
   originalBasePath: string,
   basePath: string,
 ): string {
-  let resolved = originalBasePath || basePath;
-  const markerIdx = resolved.indexOf(WORKTREE_MARKER);
-  if (markerIdx !== -1) {
-    resolved = resolved.slice(0, markerIdx);
-  }
-  return resolved;
+  return resolveWorktreeProjectRoot(basePath, originalBasePath);
 }
 
 // ─── WorktreeResolver ──────────────────────────────────────────────────────
@@ -195,7 +199,11 @@ export class WorktreeResolver {
       return;
     }
 
-    const mode = this.deps.getIsolationMode();
+    // Resolve the project root for worktree operations via shared helper.
+    // Handles the case where originalBasePath is falsy and basePath is itself
+    // a worktree path — prevents double-nested worktree paths (#3729).
+    const basePath = resolveProjectRoot(this.s.originalBasePath, this.s.basePath);
+    const mode = this.deps.getIsolationMode(basePath);
 
     if (mode === "none") {
       debugLog("WorktreeResolver", {
@@ -214,10 +222,6 @@ export class WorktreeResolver {
       return;
     }
 
-    // Resolve the project root for worktree operations via shared helper.
-    // Handles the case where originalBasePath is falsy and basePath is itself
-    // a worktree path — prevents double-nested worktree paths (#3729).
-    const basePath = resolveProjectRoot(this.s.originalBasePath, this.s.basePath);
     debugLog("WorktreeResolver", {
       action: "enterMilestone",
       milestoneId,
@@ -414,6 +418,30 @@ export class WorktreeResolver {
   mergeAndExit(milestoneId: string, ctx: NotifyCtx): void {
     this.validateMilestoneId(milestoneId);
 
+    // Anchor cwd at the project root before any merge work. Some merge code
+    // paths (mergeMilestoneToMain, slice-cadence) chdir explicitly; others
+    // (branch-mode, isolation-degraded skip, missing-original-base skip)
+    // do not. If the worktree dir is later torn down while cwd still points
+    // into it, every subsequent process.cwd() throws ENOENT — and after
+    // de73fb43d that surfaces as a session-failed cancel and (in headless
+    // mode) terminates the whole gsd process. Best-effort: silent on
+    // failure so existing test fixtures that use synthetic paths still pass.
+    if (this.s.originalBasePath) {
+      try {
+        // process.cwd() can throw ENOENT when cwd was removed, so attempt
+        // recovery directly.
+        process.chdir(this.s.originalBasePath);
+      } catch (err) {
+        debugLog("WorktreeResolver", {
+          action: "mergeAndExit",
+          phase: "pre-merge-chdir-failed",
+          milestoneId,
+          originalBasePath: this.s.originalBasePath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     // #4764 — telemetry: record start timestamp so we can emit merge duration.
     const mergeStartedAt = new Date().toISOString();
     const mergeStartMs = Date.now();
@@ -433,7 +461,7 @@ export class WorktreeResolver {
       return;
     }
 
-    const mode = this.deps.getIsolationMode();
+    const mode = this.deps.getIsolationMode(this.s.originalBasePath || this.s.basePath);
     debugLog("WorktreeResolver", {
       action: "mergeAndExit",
       milestoneId,
@@ -575,7 +603,7 @@ export class WorktreeResolver {
         milestoneId,
         "ROADMAP",
       );
-      if (!roadmapPath && this.s.basePath !== originalBase) {
+      if (!roadmapPath && !isSamePath(this.s.basePath, originalBase)) {
         roadmapPath = this.deps.resolveMilestoneFile(
           this.s.basePath,
           milestoneId,

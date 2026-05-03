@@ -12,7 +12,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
+import { gsdHome } from "./gsd-home.js";
 
 import { extractTrace, type ExecutionTrace } from "./session-forensics.js";
 import { nativeParseJsonlTail } from "./native-parser-bridge.js";
@@ -36,6 +36,7 @@ import { loadEffectiveGSDPreferences, loadGlobalGSDPreferences, getGlobalGSDPref
 import { showNextAction } from "../shared/tui.js";
 import { ensurePreferencesFile, serializePreferencesToFrontmatter } from "./commands-prefs-wizard.js";
 import { summarizeWorktreeTelemetry, percentile, type WorktreeTelemetrySummary } from "./worktree-telemetry.js";
+import { homedir } from "node:os";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -244,8 +245,7 @@ export async function handleForensics(
   // when import.meta.url resolves to the npm-global install path (Windows).
   let gsdSourceDir = dirname(fileURLToPath(import.meta.url));
   if (!existsSync(join(gsdSourceDir, "prompts"))) {
-    const gsdHome = process.env.GSD_HOME || join(homedir(), ".gsd");
-    const fallback = join(gsdHome, "agent", "extensions", "gsd");
+    const fallback = join(gsdHome(), "agent", "extensions", "gsd");
     if (existsSync(join(fallback, "prompts"))) gsdSourceDir = fallback;
   }
 
@@ -1299,10 +1299,21 @@ function formatReportForPrompt(report: ForensicReport): string {
 function redactForGitHub(text: string, basePath: string): string {
   let result = text;
 
+  // Build regex that matches both / and \ separator variants (Windows)
+  // Normalize to / first, escape for regex, then replace each / with [/\\]
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pathRe = (p: string) =>
+    new RegExp(esc(p.replace(/\\/g, "/")).replace(/\//g, "[/\\\\]"), "gi");
+
   // Replace absolute paths
-  result = result.replaceAll(basePath, ".");
-  const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
-  if (home) result = result.replaceAll(home, "~");
+  result = result.replace(pathRe(basePath), ".");
+  // Redact GSD_HOME first (when it's outside ~), then OS home.
+  // Order matters: longer path must be replaced before the shorter prefix.
+  const gsdHomePath = gsdHome();
+  if (!gsdHomePath.startsWith(homedir())) {
+    result = result.replace(pathRe(gsdHomePath), "~/.gsd");
+  }
+  result = result.replace(pathRe(homedir()), "~");
 
   // Strip API key patterns
   result = result.replace(/sk-[a-zA-Z0-9]{20,}/g, "sk-***");

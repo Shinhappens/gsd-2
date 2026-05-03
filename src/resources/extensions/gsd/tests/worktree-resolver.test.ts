@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, mkdirSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   WorktreeResolver,
   type WorktreeResolverDeps,
@@ -269,6 +272,24 @@ test("enterMilestone is no-op when isolation mode is none", () => {
   assert.equal(findCalls(deps.calls, "createAutoWorktree").length, 0);
   assert.equal(findCalls(deps.calls, "enterAutoWorktree").length, 0);
   assert.equal(findCalls(deps.calls, "enterBranchModeForMilestone").length, 0);
+});
+
+test("enterMilestone passes project root to isolation mode guard", () => {
+  const s = makeSession({ basePath: "/project", originalBasePath: "/project" });
+  let checkedBasePath: string | undefined;
+  const deps = makeDeps({
+    getIsolationMode: (basePath?: string) => {
+      checkedBasePath = basePath;
+      return "none";
+    },
+  });
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.enterMilestone("M001", ctx);
+
+  assert.equal(checkedBasePath, "/project");
+  assert.equal(findCalls(deps.calls, "createAutoWorktree").length, 0);
 });
 
 test("enterMilestone does NOT update basePath on creation failure", () => {
@@ -1141,4 +1162,86 @@ test("mergeAndExit propagates non-MergeConflictError to caller (#4380)", () => {
     (err: unknown) => err === permissionError,
     "non-MergeConflictError must propagate to the caller, not be swallowed",
   );
+});
+
+// ─── Regression: mergeAndExit anchors cwd at project root before merge work ─
+// (de73fb43d headless `gsd auto` exits-on-task regression)
+//
+// Background: the auto loop runs tasks inside the milestone worktree
+// (process.cwd() === worktreePath). When the milestone completes, the
+// worktree dir is torn down. If cwd was still inside it at that moment,
+// every subsequent process.cwd() throws ENOENT — and after de73fb43d
+// auto/run-unit.ts:50 turns that ENOENT into a session-failed cancel,
+// which in headless mode bubbles up to a "Auto-mode stopped" notify
+// and process.exit(0). mergeAndExit must therefore guarantee cwd is
+// anchored at the project root regardless of which merge path runs.
+
+test("mergeAndExit chdirs to project root before merge work (regression: headless gsd auto exit)", () => {
+  // Set up real dirs so process.chdir actually succeeds. realpathSync
+  // canonicalizes the macOS /var → /private/var symlink so equality holds.
+  const projectRoot = realpathSync(mkdtempSync(join(tmpdir(), "gsd-resolver-cwd-")));
+  const worktreePath = join(projectRoot, ".gsd/worktrees/M001");
+  mkdirSync(worktreePath, { recursive: true });
+  const previousCwd = process.cwd();
+
+  try {
+    process.chdir(worktreePath);
+    assert.equal(process.cwd(), worktreePath, "precondition: cwd is in worktree");
+
+    const s = makeSession({
+      basePath: worktreePath,
+      originalBasePath: projectRoot,
+    });
+    const deps = makeDeps({
+      isInAutoWorktree: () => true,
+      getIsolationMode: () => "worktree",
+    });
+    const ctx = makeNotifyCtx();
+    const resolver = new WorktreeResolver(s, deps);
+
+    resolver.mergeAndExit("M001", ctx);
+
+    assert.equal(
+      process.cwd(),
+      projectRoot,
+      "mergeAndExit must leave cwd at the project root, not the (about-to-be-removed) worktree",
+    );
+  } finally {
+    try { process.chdir(previousCwd); } catch { /* best-effort */ }
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("mergeAndExit anchors cwd even on isolation-degraded skip path", () => {
+  // The skip paths (isolation-degraded, mode-none, missing-original-base)
+  // bypass the per-mode merge helpers entirely. They must still leave cwd
+  // at the project root so a subsequent worktree teardown elsewhere does
+  // not strand cwd in a deleted dir.
+  const projectRoot = realpathSync(mkdtempSync(join(tmpdir(), "gsd-resolver-cwd-degraded-")));
+  const worktreePath = join(projectRoot, ".gsd/worktrees/M001");
+  mkdirSync(worktreePath, { recursive: true });
+  const previousCwd = process.cwd();
+
+  try {
+    process.chdir(worktreePath);
+    const s = makeSession({
+      basePath: worktreePath,
+      originalBasePath: projectRoot,
+    });
+    s.isolationDegraded = true;
+    const deps = makeDeps({ getIsolationMode: () => "worktree" });
+    const ctx = makeNotifyCtx();
+    const resolver = new WorktreeResolver(s, deps);
+
+    resolver.mergeAndExit("M001", ctx);
+
+    assert.equal(
+      process.cwd(),
+      projectRoot,
+      "isolation-degraded skip must still anchor cwd at project root",
+    );
+  } finally {
+    try { process.chdir(previousCwd); } catch { /* best-effort */ }
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
 });

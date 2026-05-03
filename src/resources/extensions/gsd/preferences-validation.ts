@@ -275,6 +275,15 @@ export function validatePreferences(preferences: GSDPreferences): {
     }
   }
 
+  // ─── Planning Depth (deep planning mode) ─────────────────────────
+  if (preferences.planning_depth !== undefined) {
+    if (preferences.planning_depth === "light" || preferences.planning_depth === "deep") {
+      validated.planning_depth = preferences.planning_depth;
+    } else {
+      errors.push(`planning_depth must be "light" or "deep"`);
+    }
+  }
+
   // ─── Search Provider ─────────────────────────────────────────────
   if (preferences.search_provider !== undefined) {
     const validSearchProviders = new Set(["brave", "tavily", "ollama", "native", "auto"]);
@@ -1119,6 +1128,20 @@ export function validatePreferences(preferences: GSDPreferences): {
       validated.show_token_cost = preferences.show_token_cost;
     } else {
       errors.push("show_token_cost must be a boolean");
+    }
+  }
+
+  // ─── Auto-Mode Request Interval ───────────────────────────────────
+  if (preferences.min_request_interval_ms !== undefined) {
+    if (
+      typeof preferences.min_request_interval_ms === "number" &&
+      Number.isFinite(preferences.min_request_interval_ms) &&
+      preferences.min_request_interval_ms >= 0 &&
+      preferences.min_request_interval_ms <= 2_147_483_647
+    ) {
+      validated.min_request_interval_ms = Math.floor(preferences.min_request_interval_ms);
+    } else {
+      errors.push("min_request_interval_ms must be a non-negative number <= 2147483647");
     }
   }
 

@@ -1,20 +1,22 @@
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   resolveAgentEnd,
   resolveAgentEndCancelled,
-  runUnit,
-  autoLoop,
-  detectStuck,
   _resetPendingResolve,
   _hasPendingResolveForTest,
   _setActiveSession,
   isSessionSwitchInFlight,
-  type UnitResult,
-  type AgentEndEvent,
-  type LoopDeps,
-} from "../auto-loop.js";
+} from "../auto/resolve.js";
+import { runUnit } from "../auto/run-unit.js";
+import { autoLoop } from "../auto/loop.js";
+import { detectStuck } from "../auto/detect-stuck.js";
+import type { UnitResult, AgentEndEvent } from "../auto/types.js";
+import type { LoopDeps } from "../auto/loop-deps.js";
 import { ModelPolicyDispatchBlockedError } from "../auto-model-selection.js";
 import type { SessionLockStatus } from "../session-lock.js";
 
@@ -24,6 +26,24 @@ function makeEvent(
   messages: unknown[] = [{ role: "assistant" }],
 ): AgentEndEvent {
   return { messages };
+}
+
+async function drainMicrotasks(turns = 20): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    await Promise.resolve();
+  }
+}
+
+async function waitForMicrotasks(
+  condition: () => boolean,
+  label: string,
+  turns = 500,
+): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    if (condition()) return;
+    await Promise.resolve();
+  }
+  assert.fail(`Timed out waiting for ${label}`);
 }
 
 /**
@@ -42,6 +62,7 @@ function makeMockSession(opts?: {
   const session = {
     active: true,
     verbose: false,
+    basePath: process.cwd(),
     cmdCtx: {
       newSession: (options?: { abortSignal?: AbortSignal }) => {
         opts?.onNewSessionStart?.(session);
@@ -534,27 +555,6 @@ test("late-resolving newSession() after timeout receives aborted signal so tool 
   }
 });
 
-// ─── Structural assertions ───────────────────────────────────────────────────
-
-test("auto-loop.ts exports autoLoop, runUnit, resolveAgentEnd", async () => {
-  const mod = await import("../auto-loop.js");
-  assert.equal(
-    typeof mod.autoLoop,
-    "function",
-    "autoLoop should be exported as a function",
-  );
-  assert.equal(
-    typeof mod.runUnit,
-    "function",
-    "runUnit should be exported as a function",
-  );
-  assert.equal(
-    typeof mod.resolveAgentEnd,
-    "function",
-    "resolveAgentEnd should be exported as a function",
-  );
-});
-
 // NOTE: the "while keyword", "one-shot null-before-resolve", and
 // "selectAndApplyModel before updateProgressWidget" source-grep tests
 // previously here were deleted as tautological (readFileSync + substring
@@ -607,7 +607,11 @@ function makeMockDeps(
         blockers: [],
       } as any;
     },
-    loadEffectiveGSDPreferences: () => ({ preferences: {} }),
+    loadEffectiveGSDPreferences: () => ({
+      // These loop-mechanics tests mock executing state without plan-v2 artifacts.
+      // Plan-v2 default-on coverage lives in uok-plan-v2-wiring.test.ts.
+      preferences: { uok: { plan_v2: { enabled: false } } },
+    }),
     preDispatchHealthGate: async () => ({ proceed: true, fixesApplied: [] }),
     syncProjectRootToWorktree: () => {},
     checkResourcesStale: () => null,
@@ -716,7 +720,7 @@ function makeLoopSession(overrides?: Partial<Record<string, unknown>>) {
     verbose: false,
     stepMode: false,
     paused: false,
-    basePath: "/tmp/project",
+    basePath: mkdtempSync(join(tmpdir(), "gsd-auto-loop-")),
     originalBasePath: "",
     currentMilestoneId: "M001",
     currentUnit: null,
@@ -736,6 +740,7 @@ function makeLoopSession(overrides?: Partial<Record<string, unknown>>) {
     unitRecoveryCount: new Map<string, number>(),
     verificationRetryCount: new Map<string, number>(),
     gitService: null,
+    lastRequestTimestamp: 0,
     autoStartTime: Date.now(),
     cmdCtx: {
       newSession: () => Promise.resolve({ cancelled: false }),
@@ -2156,6 +2161,87 @@ test("autoLoop rejects execute-task with 0 tool calls as hallucinated (#1833)", 
   );
 });
 
+test("autoLoop pauses user-driven deep question instead of flagging 0 tool calls", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+  const pi = makeMockPi();
+
+  const notifications: string[] = [];
+  ctx.ui.notify = (msg: string) => { notifications.push(msg); };
+
+  const s = makeLoopSession();
+  const mockLedger = {
+    version: 1,
+    projectStartedAt: Date.now(),
+    units: [] as any[],
+  };
+
+  const deps = makeMockDeps({
+    deriveState: async () => {
+      deps.callLog.push("deriveState");
+      return {
+        phase: "executing",
+        activeMilestone: { id: "M001", title: "Bootstrap", status: "active" },
+        activeSlice: null,
+        activeTask: null,
+        registry: [{ id: "M001", status: "active" }],
+        blockers: [],
+      } as any;
+    },
+    resolveDispatch: async () => {
+      deps.callLog.push("resolveDispatch");
+      return {
+        action: "dispatch" as const,
+        unitType: "discuss-project",
+        unitId: "PROJECT",
+        prompt: "ask what to build",
+      };
+    },
+    closeoutUnit: async () => {
+      mockLedger.units.push({
+        type: "discuss-project",
+        id: "PROJECT",
+        startedAt: s.currentUnit?.startedAt ?? Date.now(),
+        toolCalls: 0,
+        assistantMessages: 1,
+        tokens: { input: 100, output: 20, total: 120, cacheRead: 0, cacheWrite: 0 },
+        cost: 0.01,
+      });
+    },
+    getLedger: () => mockLedger,
+    postUnitPreVerification: async () => {
+      deps.callLog.push("postUnitPreVerification");
+      return "dispatched" as const;
+    },
+  });
+
+  const loopPromise = autoLoop(ctx, pi, s, deps);
+
+  await new Promise((r) => setTimeout(r, 50));
+  resolveAgentEnd(makeEvent([
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "What do you want to build?" },
+      ],
+    },
+  ]));
+
+  await loopPromise;
+
+  assert.ok(
+    deps.callLog.includes("postUnitPreVerification"),
+    "questioning units should reach post-unit verification so the pause path can run",
+  );
+  assert.ok(
+    !notifications.some((n) => n.includes("context exhaustion")),
+    "questioning units should not show the context-exhaustion warning",
+  );
+});
+
 test("autoLoop rejects complete-slice with 0 tool calls as context-exhausted (#2653)", async () => {
   _resetPendingResolve();
 
@@ -2359,6 +2445,164 @@ test("autoLoop warns but proceeds for greenfield project (no project files) (#18
     greenfieldWarning,
     "should warn about greenfield project (no project files)",
   );
+});
+
+// ── Proactive rate limiting (#2996) ──────────────────────────────────────────
+
+test("autoLoop enforces min_request_interval_ms delay between LLM dispatches (#2996)", async () => {
+  _resetPendingResolve();
+  mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
+
+  try {
+    const ctx = makeMockCtx();
+    ctx.ui.setStatus = () => {};
+    ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+    const pi = makeMockPi();
+    const originalSendMessage = pi.sendMessage;
+    const dispatchTimestamps: number[] = [];
+    pi.sendMessage = (...args: unknown[]) => {
+      dispatchTimestamps.push(Date.now());
+      return originalSendMessage(...args);
+    };
+
+    let iterCount = 0;
+
+    const s = makeLoopSession();
+
+    const deps = makeMockDeps({
+      loadEffectiveGSDPreferences: () => ({
+        preferences: {
+          min_request_interval_ms: 300,
+          uok: { plan_v2: { enabled: false } },
+        },
+      }),
+      deriveState: async () => {
+        iterCount++;
+        deps.callLog.push("deriveState");
+        return {
+          phase: "executing",
+          activeMilestone: { id: "M001", title: "Test", status: "active" },
+          activeSlice: { id: "S01", title: "Slice" },
+          activeTask: { id: "T01" },
+          registry: [{ id: "M001", status: "active" }],
+          blockers: [],
+        } as any;
+      },
+      postUnitPostVerification: async () => {
+        deps.callLog.push("postUnitPostVerification");
+        if (iterCount >= 2) {
+          s.active = false;
+        }
+        return "continue" as const;
+      },
+    });
+
+    const loopPromise = autoLoop(ctx, pi, s, deps);
+
+    await waitForMicrotasks(() => dispatchTimestamps.length === 1, "first dispatch");
+    resolveAgentEnd(makeEvent());
+    await waitForMicrotasks(
+      () => deps.callLog.filter((entry) => entry === "resolveDispatch").length >= 2,
+      "second dispatch planning",
+    );
+
+    await drainMicrotasks(100);
+    mock.timers.tick(299);
+    await drainMicrotasks(100);
+    assert.equal(dispatchTimestamps.length, 1, "second dispatch should wait for the configured interval");
+
+    mock.timers.tick(1);
+    await waitForMicrotasks(() => dispatchTimestamps.length === 2, "second dispatch");
+    resolveAgentEnd(makeEvent());
+
+    await loopPromise;
+
+    assert.ok(iterCount >= 2, `expected at least 2 iterations, got ${iterCount}`);
+    assert.ok(dispatchTimestamps.length >= 2, `expected at least 2 dispatches, got ${dispatchTimestamps.length}`);
+
+    assert.equal(
+      (s as any).lastRequestTimestamp,
+      dispatchTimestamps[1],
+      "lastRequestTimestamp should record the actual dispatch time",
+    );
+
+    const gap = dispatchTimestamps[1]! - dispatchTimestamps[0]!;
+    assert.equal(
+      gap,
+      300,
+      `gap between dispatches should match min_request_interval_ms=300 (got ${gap}ms)`,
+    );
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("autoLoop skips rate-limit delay when min_request_interval_ms is 0 (default)", async () => {
+  _resetPendingResolve();
+  mock.timers.enable({ apis: ["Date", "setTimeout"], now: 2_000 });
+
+  try {
+    const ctx = makeMockCtx();
+    ctx.ui.setStatus = () => {};
+    ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+    const pi = makeMockPi();
+    const originalSendMessage = pi.sendMessage;
+    const dispatchTimestamps: number[] = [];
+    pi.sendMessage = (...args: unknown[]) => {
+      dispatchTimestamps.push(Date.now());
+      return originalSendMessage(...args);
+    };
+
+    let iterCount = 0;
+
+    const s = makeLoopSession();
+
+    const deps = makeMockDeps({
+      loadEffectiveGSDPreferences: () => ({
+        preferences: { uok: { plan_v2: { enabled: false } } },
+      }),
+      deriveState: async () => {
+        iterCount++;
+        deps.callLog.push("deriveState");
+        return {
+          phase: "executing",
+          activeMilestone: { id: "M001", title: "Test", status: "active" },
+          activeSlice: { id: "S01", title: "Slice" },
+          activeTask: { id: "T01" },
+          registry: [{ id: "M001", status: "active" }],
+          blockers: [],
+        } as any;
+      },
+      postUnitPostVerification: async () => {
+        deps.callLog.push("postUnitPostVerification");
+        if (iterCount >= 3) {
+          s.active = false;
+        }
+        return "continue" as const;
+      },
+    });
+
+    const loopPromise = autoLoop(ctx, pi, s, deps);
+
+    for (let i = 1; i <= 3; i++) {
+      await waitForMicrotasks(() => dispatchTimestamps.length === i, `dispatch ${i}`);
+      resolveAgentEnd(makeEvent());
+    }
+
+    await loopPromise;
+
+    assert.ok(iterCount >= 3, `expected at least 3 iterations, got ${iterCount}`);
+    assert.ok(dispatchTimestamps.length >= 3, `expected at least 3 dispatches, got ${dispatchTimestamps.length}`);
+
+    const gap = dispatchTimestamps[2]! - dispatchTimestamps[1]!;
+    assert.equal(
+      gap,
+      0,
+      `gap should be 0ms under mocked time without rate limiting (got ${gap}ms)`,
+    );
+  } finally {
+    mock.timers.reset();
+  }
 });
 
 // ─── #4850: pre-send model-policy block is non-retryable ────────────────────

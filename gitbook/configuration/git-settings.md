@@ -8,23 +8,25 @@ GSD supports three isolation modes, configured via `git.isolation` in preference
 
 | Mode | Working Directory | Branch | Best For |
 |------|-------------------|--------|----------|
-| `worktree` (default) | `.gsd/worktrees/<MID>/` | `milestone/<MID>` | Most projects — full isolation |
+| `none` (default) | Project root | Current branch | Most projects — no isolation overhead |
+| `worktree` | `.gsd/worktrees/<MID>/` | `milestone/<MID>` | Projects that need full isolation |
 | `branch` | Project root | `milestone/<MID>` | Submodule-heavy repos |
-| `none` | Project root | Current branch | Hot-reload workflows |
 
-### Worktree Mode (Default)
+### None Mode (Default)
+
+Work happens directly on your current branch. No worktree, no milestone branch. GSD still commits with conventional commit messages. Use this when file isolation breaks dev tooling (file watchers, hot-reload, etc.).
+
+### Worktree Mode
 
 Each milestone gets its own git worktree and branch. All execution happens inside the worktree. On completion, everything is squash-merged to main as one clean commit. The worktree and branch are then cleaned up.
 
 Changes in a milestone can't interfere with your main working copy.
 
+Worktree mode requires the repository to have at least one commit. If `git.isolation: worktree` is configured in a zero-commit repo with no committed `HEAD`, GSD temporarily runs as `none` until the first commit exists.
+
 ### Branch Mode
 
 Work happens in the project root on a `milestone/<MID>` branch. No worktree directory is created. Useful when worktrees cause problems with submodules or hardcoded paths.
-
-### None Mode
-
-Work happens directly on your current branch. No worktree, no milestone branch. GSD still commits with conventional commit messages. Use this when file isolation breaks dev tooling (file watchers, hot-reload, etc.).
 
 ## Branching Model
 
@@ -68,7 +70,7 @@ git:
   commit_type: feat           # override conventional commit prefix
   main_branch: main           # primary branch name
   merge_strategy: squash      # "squash" or "merge"
-  isolation: worktree         # "worktree", "branch", or "none"
+  isolation: none             # "none" (default), "worktree", or "branch"
   commit_docs: true           # commit .gsd/ artifacts to git
   manage_gitignore: true      # let GSD manage .gitignore
   auto_pr: false              # create PR on milestone completion
@@ -173,7 +175,7 @@ GSD-Task: M001/S01/T01
 
 ## Manual Worktree Management
 
-Use `/worktree` (or `/wt`) for manual worktree operations:
+Use `/worktree` (or `/wt`) for standalone manual worktree operations:
 
 ```
 /worktree create
@@ -181,6 +183,17 @@ Use `/worktree` (or `/wt`) for manual worktree operations:
 /worktree merge
 /worktree remove
 ```
+
+Inside an active GSD TUI session, use `/gsd worktree` (or `/gsd wt`) for worktree commands that report through the session UI:
+
+```
+/gsd worktree list
+/gsd worktree merge [name]
+/gsd worktree clean
+/gsd worktree remove <name> [--force]
+```
+
+`list` shows each worktree's branch, path, diff stats, commit count, and whether it is clean, unmerged, or has uncommitted changes. `merge` brings a worktree back into the detected main branch and removes it afterward; if the worktree has dirty files, GSD tries to auto-commit them before merging. `clean` removes only merged or empty worktrees and keeps anything with pending changes. `remove` refuses to discard unmerged or uncommitted work unless you pass `--force`.
 
 ## Self-Healing
 

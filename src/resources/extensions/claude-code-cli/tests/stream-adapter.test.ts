@@ -787,7 +787,7 @@ describe("stream-adapter — session persistence (#2859)", () => {
 		assert.equal("thinking" in options, false, "non-adaptive models must not receive a thinking field");
 	});
 
-	test("buildSdkOptions includes workflow MCP server config when env is set", () => {
+	test("buildSdkOptions prefers workflow MCP question tools over native AskUserQuestion", () => {
 		const restore = setWorkflowMcpEnv({
 			GSD_WORKFLOW_MCP_COMMAND: "node",
 			GSD_WORKFLOW_MCP_NAME: "gsd-workflow",
@@ -807,7 +807,7 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			assert.equal(srv.env.GSD_CLI_PATH, "/tmp/gsd");
 			assert.equal(srv.env.GSD_PERSIST_WRITE_GATE_STATE, "1");
 			assert.equal(srv.env.GSD_WORKFLOW_PROJECT_ROOT, "/tmp/project");
-			assert.deepEqual(options.disallowedTools, []);
+			assert.deepEqual(options.disallowedTools, ["AskUserQuestion"]);
 			assert.deepEqual(options.allowedTools, [
 				"Read",
 				"Write",
@@ -818,7 +818,6 @@ describe("stream-adapter — session persistence (#2859)", () => {
 				"Agent",
 				"WebFetch",
 				"WebSearch",
-				"AskUserQuestion",
 				"mcp__gsd-workflow__*",
 			]);
 		} finally {
@@ -826,7 +825,7 @@ describe("stream-adapter — session persistence (#2859)", () => {
 		}
 	});
 
-	test("buildSdkOptions auto-approves every tool for custom workflow MCP server names", () => {
+	test("buildSdkOptions prefers custom workflow MCP question tools over native AskUserQuestion", () => {
 		const restore = setWorkflowMcpEnv({
 			GSD_WORKFLOW_MCP_COMMAND: "node",
 			GSD_WORKFLOW_MCP_NAME: "custom-workflow",
@@ -839,7 +838,7 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			const options = buildSdkOptions("claude-sonnet-4-20250514", "test");
 			const mcpServers = options.mcpServers as Record<string, any>;
 			assert.ok(mcpServers?.["custom-workflow"], "expected custom workflow server config");
-			assert.deepEqual(options.disallowedTools, []);
+			assert.deepEqual(options.disallowedTools, ["AskUserQuestion"]);
 			assert.deepEqual(options.allowedTools, [
 				"Read",
 				"Write",
@@ -850,7 +849,6 @@ describe("stream-adapter — session persistence (#2859)", () => {
 				"Agent",
 				"WebFetch",
 				"WebSearch",
-				"AskUserQuestion",
 				"mcp__custom-workflow__*",
 			]);
 		} finally {
@@ -882,7 +880,7 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			const mcpServers = (options as any).mcpServers;
 			if (mcpServers) {
 				assert.ok(mcpServers["gsd-workflow"], "if present, must be gsd-workflow");
-				assert.deepEqual((options as any).disallowedTools, []);
+				assert.deepEqual((options as any).disallowedTools, ["AskUserQuestion"]);
 			} else {
 				assert.deepEqual((options as any).disallowedTools, []);
 			}
@@ -923,7 +921,7 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			assert.equal(srv.env.GSD_CLI_PATH, "/tmp/gsd");
 			assert.equal(srv.env.GSD_PERSIST_WRITE_GATE_STATE, "1");
 			assert.equal(srv.env.GSD_WORKFLOW_PROJECT_ROOT, resolvedRepoDir);
-			assert.deepEqual(options.disallowedTools, []);
+			assert.deepEqual(options.disallowedTools, ["AskUserQuestion"]);
 		} finally {
 			process.chdir(originalCwd);
 			rmSync(repoDir, { recursive: true, force: true });
@@ -1609,17 +1607,40 @@ describe("stream-adapter — canUseTool handler", () => {
 		assert.equal(notified.length, 0);
 	});
 
-	test("Always Allow for non-Bash without suggestions omits updatedPermissions", async () => {
+	test("Always Allow for non-Bash without suggestions builds tool-name-only fallback rule", async () => {
 		const notified: string[] = [];
 		const ui = { select: async (_p: string, opts: string[]) => opts.find((o) => o.startsWith("Always Allow"))!, notify: (msg: string) => notified.push(msg) };
 
 		const handler = createClaudeCodeCanUseToolHandler(ui as any);
-		const result = await handler!("Write", { file_path: "/tmp/test.txt" }, makeOptions());
+		const result = await handler!("AskUserQuestion", { questions: [{ question: "?", header: "h", multiSelect: false, options: [] }] }, makeOptions());
 
 		assert.equal(result.behavior, "allow");
-		assert.equal((result as any).updatedPermissions, undefined);
-		// No suggestions → no notification
-		assert.equal(notified.length, 0);
+		assert.deepEqual((result as any).updatedPermissions, [{
+			type: "addRules",
+			rules: [{ toolName: "AskUserQuestion" }],
+			behavior: "allow",
+			destination: "localSettings",
+		}]);
+		assert.equal(notified.length, 1);
+		assert.match(notified[0], /AskUserQuestion/);
+	});
+
+	test("Always Allow for non-Bash with empty suggestions array builds tool-name-only fallback rule", async () => {
+		const notified: string[] = [];
+		const ui = { select: async (_p: string, opts: string[]) => opts.find((o) => o.startsWith("Always Allow"))!, notify: (msg: string) => notified.push(msg) };
+
+		const handler = createClaudeCodeCanUseToolHandler(ui as any);
+		const result = await handler!("AskUserQuestion", { questions: [{ question: "?", header: "h", multiSelect: false, options: [] }] }, makeOptions({ suggestions: [] }));
+
+		assert.equal(result.behavior, "allow");
+		assert.deepEqual((result as any).updatedPermissions, [{
+			type: "addRules",
+			rules: [{ toolName: "AskUserQuestion" }],
+			behavior: "allow",
+			destination: "localSettings",
+		}]);
+		assert.equal(notified.length, 1);
+		assert.match(notified[0], /AskUserQuestion/);
 	});
 
 	test("prompt includes command text for Bash tools", async () => {

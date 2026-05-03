@@ -9,6 +9,7 @@
 
 import type { ExtensionContext } from "@gsd/pi-coding-agent";
 import { parseUnitId } from "./unit-id.js";
+import { MILESTONE_ID_RE } from "./milestone-ids.js";
 import { appendEvent } from "./workflow-events.js";
 import { atomicWriteSync } from "./atomic-write.js";
 import { clearParseCache } from "./files.js";
@@ -54,6 +55,8 @@ import {
   diagnoseExpectedArtifact,
 } from "./auto-artifact-paths.js";
 import { classifyMilestoneSummaryContent } from "./milestone-summary-classifier.js";
+import { validateArtifact } from "./schemas/validate.js";
+import { getProjectResearchStatus } from "./project-research-policy.js";
 
 // Re-export so existing consumers of auto-recovery.ts keep working.
 export { resolveExpectedArtifactPath, diagnoseExpectedArtifact };
@@ -63,6 +66,46 @@ export {
 } from "./milestone-summary-classifier.js";
 
 // ─── Artifact Resolution & Verification ───────────────────────────────────────
+
+function hasCapturedWorkflowPrefs(base: string): boolean {
+  const prefsPath = resolveExpectedArtifactPath("workflow-preferences", "WORKFLOW-PREFS", base);
+  if (!prefsPath || !existsSync(prefsPath)) return false;
+  const content = readFileSync(prefsPath, "utf-8");
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  return !!match && /^workflow_prefs_captured:\s*true\s*$/m.test(match[1]);
+}
+
+function hasValidResearchDecision(base: string): boolean {
+  const decisionPath = resolveExpectedArtifactPath("research-decision", "RESEARCH-DECISION", base);
+  if (!decisionPath || !existsSync(decisionPath)) return false;
+  try {
+    const cfg = JSON.parse(readFileSync(decisionPath, "utf-8")) as Record<string, unknown>;
+    return cfg.decision === "research" || cfg.decision === "skip";
+  } catch {
+    return false;
+  }
+}
+
+function hasCompleteProjectResearch(base: string): boolean {
+  return getProjectResearchStatus(base).complete;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function hasCheckedTaskCompletionOnDisk(base: string, mid: string, sid: string, tid: string): boolean {
+  const tasksDir = resolveTasksDir(base, mid, sid);
+  if (!tasksDir) return false;
+  if (!existsSync(join(tasksDir, `${tid}-SUMMARY.md`))) return false;
+
+  const planAbs = resolveSliceFile(base, mid, sid, "PLAN");
+  if (!planAbs || !existsSync(planAbs)) return false;
+
+  const planContent = readFileSync(planAbs, "utf-8");
+  const cbRe = new RegExp(`^\\s*-\\s+\\[[xX]\\]\\s+\\*\\*${escapeRegExp(tid)}:`, "m");
+  return cbRe.test(planContent);
+}
 
 /**
  * Check whether a milestone produced implementation artifacts (non-`.gsd/`
@@ -214,12 +257,39 @@ function getChangedFilesFromMilestoneTaggedCommits(
   basePath: string,
   milestoneId: string,
 ): { ok: boolean; matched: boolean; files: string[] } {
+  // Primary: path-scoped log against .gsd/milestones/<id>. Fast and unbounded
+  // by depth when .gsd/ is tracked in git.
+  const scoped = scanGsdTaggedCommits(basePath, milestoneId, [
+    "log", "--format=%H%x1f%B%x1e", "HEAD", "--", `.gsd/milestones/${milestoneId}`,
+  ]);
+  if (!scoped.ok) return scoped;
+  if (scoped.matched) return scoped;
+
+  // Fallback (#5033): when .gsd/ is gitignored / external / untracked, the
+  // path-scoped scan matches no commits even though GSD-tagged commits
+  // referencing the milestone exist on the integration branch. Re-scan all
+  // of HEAD's history and rely on commitMatchesMilestone to bind by
+  // explicit milestone mention in the message body.
+  //
+  // Intentionally unbounded — symmetric with the primary scan, and avoids
+  // reintroducing the rolling-depth failure class removed in #4699 where
+  // milestone evidence aged out behind unrelated activity.
+  return scanGsdTaggedCommits(basePath, milestoneId, [
+    "log", "--format=%H%x1f%B%x1e", "HEAD",
+  ]);
+}
+
+function scanGsdTaggedCommits(
+  basePath: string,
+  milestoneId: string,
+  gitArgs: readonly string[],
+): { ok: boolean; matched: boolean; files: string[] } {
   try {
-    const logOutput = execFileSync(
-      "git",
-      ["log", "--format=%H%x1f%B%x1e", "HEAD", "--", `.gsd/milestones/${milestoneId}`],
-      { cwd: basePath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
-    );
+    const logOutput = execFileSync("git", [...gitArgs], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    });
     const records = logOutput
       .split("\x1e")
       .map((record) => record.trim())
@@ -270,13 +340,23 @@ function commitMatchesMilestone(message: string, milestoneId: string, files: rea
   if (commitTrailerStartsWithMilestone(message, milestoneId)) return true;
 
   // Meaningful execute-task commits currently store task scope as Sxx/Tyy
-  // rather than Mxx/Sxx/Tyy. Bind those commits back to the milestone only
-  // when the commit also touched this milestone's artifacts.
+  // rather than Mxx/Sxx/Tyy. Bind those commits back to the milestone when
+  // either the commit touched this milestone's artifacts, or — for projects
+  // where .gsd/ is gitignored/external (#5033) — the message explicitly
+  // names the milestone.
   if (/^GSD-Task:\s*S[^/\s]+\/T\S+/m.test(message)) {
-    return files.some((file) => isMilestoneArtifactPath(file, milestoneId));
+    if (files.some((file) => isMilestoneArtifactPath(file, milestoneId))) return true;
+    if (commitMessageMentionsMilestone(message, milestoneId)) return true;
   }
 
   return false;
+}
+
+function commitMessageMentionsMilestone(message: string, milestoneId: string): boolean {
+  if (!MILESTONE_ID_RE.test(milestoneId)) return false;
+
+  const escapedMilestone = milestoneId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`\\b${escapedMilestone}\\b`).test(message);
 }
 
 function commitTrailerStartsWithMilestone(message: string, milestoneId: string): boolean {
@@ -324,6 +404,28 @@ export function verifyExpectedArtifact(
     if (!existsSync(overridesPath)) return true;
     const content = readFileSync(overridesPath, "utf-8");
     return !content.includes("**Scope:** active");
+  }
+
+  if (unitType === "workflow-preferences") {
+    return hasCapturedWorkflowPrefs(base);
+  }
+
+  if (unitType === "discuss-project") {
+    const projectPath = resolveExpectedArtifactPath(unitType, unitId, base);
+    return !!projectPath && existsSync(projectPath) && validateArtifact(projectPath, "project").ok;
+  }
+
+  if (unitType === "discuss-requirements") {
+    const requirementsPath = resolveExpectedArtifactPath(unitType, unitId, base);
+    return !!requirementsPath && existsSync(requirementsPath) && validateArtifact(requirementsPath, "requirements").ok;
+  }
+
+  if (unitType === "research-decision") {
+    return hasValidResearchDecision(base);
+  }
+
+  if (unitType === "research-project") {
+    return hasCompleteProjectResearch(base);
   }
 
   // Reactive-execute: verify that each dispatched task's summary exists.
@@ -489,28 +591,23 @@ export function verifyExpectedArtifact(
   }
 
   // execute-task: DB status is authoritative. Fall back to checked-checkbox
-  // detection when the DB is unavailable (unmigrated projects).
+  // detection when the DB is unavailable (unmigrated projects), or when the
+  // disk artifacts already reflect completion but the DB replay is one beat
+  // behind the completion write.
   if (unitType === "execute-task") {
     const { milestone: mid, slice: sid, task: tid } = parseUnitId(unitId);
     if (mid && sid && tid) {
       const dbTask = getTask(mid, sid, tid);
       if (dbTask) {
-        // DB available — trust it
-        if (dbTask.status !== "complete" && dbTask.status !== "done") return false;
+        if (dbTask.status !== "complete" && dbTask.status !== "done" && !hasCheckedTaskCompletionOnDisk(base, mid, sid, tid)) {
+          return false;
+        }
       } else if (!isDbAvailable()) {
         // LEGACY: Pre-migration fallback for projects without DB.
         // Require a CHECKED checkbox — a bare heading or unchecked checkbox
         // does not prove gsd_complete_task ran. Summary file on disk alone
         // is not sufficient evidence (could be a rogue write) (#3607).
-        const planAbs = resolveSliceFile(base, mid, sid, "PLAN");
-        if (planAbs && existsSync(planAbs)) {
-          const planContent = readFileSync(planAbs, "utf-8");
-          const escapedTid = tid.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-          const cbRe = new RegExp(`^- \\[[xX]\\] \\*\\*${escapedTid}:`, "m");
-          if (!cbRe.test(planContent)) return false;
-        } else {
-          return false; // no plan file → cannot verify
-        }
+        if (!hasCheckedTaskCompletionOnDisk(base, mid, sid, tid)) return false;
       } else {
         // DB available but task row not found — completion tool never ran (#3607)
         return false;
@@ -629,6 +726,9 @@ export function writeBlockerPlaceholder(
   if (!absPath) return null;
   const dir = dirname(absPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const recoveryLine = unitType === "research-project"
+    ? "This placeholder was written by auto-mode so the project research gate can stop fail-closed."
+    : "This placeholder was written by auto-mode so the pipeline can advance.";
   const content = [
     `# BLOCKER — auto-mode recovery failed`,
     ``,
@@ -636,7 +736,7 @@ export function writeBlockerPlaceholder(
     ``,
     `**Reason**: ${reason}`,
     ``,
-    `This placeholder was written by auto-mode so the pipeline can advance.`,
+    recoveryLine,
     `Review and replace this file before relying on downstream artifacts.`,
   ].join("\n");
   writeFileSync(absPath, content, "utf-8");

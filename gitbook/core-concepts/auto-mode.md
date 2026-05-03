@@ -8,7 +8,7 @@ Auto mode is GSD's autonomous execution engine. Run `/gsd auto`, walk away, come
 /gsd auto
 ```
 
-GSD reads `.gsd/STATE.md`, determines the next unit of work, creates a fresh AI session with all relevant context, and lets the AI execute. When it finishes, GSD reads disk state again and dispatches the next unit. This continues until the milestone is complete.
+GSD derives the next unit of work from the authoritative SQLite database at the project root, creates a fresh AI session with all relevant context, and lets the AI execute. When it finishes, GSD persists the result to the database, refreshes markdown projections such as `STATE.md`, and dispatches the next unit. This continues until the milestone is complete.
 
 ## The Execution Loop
 
@@ -26,6 +26,36 @@ Plan → Execute (per task) → Complete → Reassess Roadmap → Next Slice
 - **Reassess** — checks if the roadmap still makes sense after what was learned
 - **Validate** — after all slices, verifies success criteria were actually met
 
+## State Authority
+
+The GSD database is the runtime source of truth for milestones, slices, tasks, requirements, decisions, summaries, and completion status. Markdown files in `.gsd/` are rendered projections for review, prompts, and git-friendly history; editing a projection does not override the database unless a GSD command imports or saves the change.
+
+In worktree mode, the project-root database and project-root `.gsd/` state remain authoritative. Worktree markdown projections are diagnostics, not state to sync back. Runtime state derivation does not silently rebuild from markdown when the database is unavailable. The legacy markdown fallback is only enabled with `GSD_ALLOW_MARKDOWN_DERIVE_FALLBACK=1` for tests and explicit recovery work.
+
+## Deep Planning Mode
+
+Enable project-level deep planning with `/gsd new-project --deep`, `/gsd new-milestone --deep`, or this project preference:
+
+```yaml
+planning_depth: deep
+```
+
+Deep mode runs one-time discovery gates before normal milestone planning:
+
+```text
+Workflow Preferences -> Project Context -> Requirements -> Research Decision -> Optional Project Research -> Milestone Context/Roadmap
+```
+
+| Artifact | Stage | Purpose |
+|----------|-------|---------|
+| `.gsd/PREFERENCES.md` | `--deep` / `workflow-preferences` | Holds `planning_depth: deep` and captured workflow settings |
+| `.gsd/PROJECT.md` | `discuss-project` | Project vision, users, anti-goals, constraints, milestone sequence |
+| `.gsd/REQUIREMENTS.md` | `discuss-requirements` | Capability contract with Active, Validated, Deferred, and Out of Scope requirements |
+| `.gsd/runtime/research-decision.json` | `research-decision` | Records whether to run project research or skip it |
+| `.gsd/research/STACK.md`, `FEATURES.md`, `ARCHITECTURE.md`, `PITFALLS.md` | `research-project` | Optional four-way project research when the decision is `research` |
+
+The research-decision unit only records the choice. If the decision is `research`, the next gate fans out four project research passes. Those outputs inform planning and requirement review; they do not silently create binding requirements.
+
 ## Controlling Auto Mode
 
 ### Pause
@@ -38,7 +68,7 @@ Press **Escape**. The conversation is preserved. You can interact with the agent
 /gsd auto
 ```
 
-Auto mode reads disk state and picks up where it left off.
+Auto mode derives the latest database state and picks up where it left off.
 
 ### Stop
 
@@ -70,9 +100,20 @@ Every task gets a clean AI context window. No accumulated garbage, no quality de
 
 ## Runtime Tool Policy
 
-Every auto-mode unit declares a `ToolsPolicy` in its `UnitContextManifest`, and GSD enforces it before tool calls run. Execution units use `all` mode and can edit project files, run shell commands, and dispatch subagents. Planning and discussion units use `planning` mode: read tools are allowed, writes are limited to `.gsd/`, bash must be read-only, and subagent dispatch is blocked. Documentation units use `docs` mode, which also allows writes to the manifest's documentation globs such as `docs/**`, top-level `README*.md`, `CHANGELOG.md`, and top-level `*.md`.
+Every auto-mode unit declares a `ToolsPolicy` in its `UnitContextManifest`, and GSD enforces it before tool calls run. Execution units use `all` mode and can edit project files, run shell commands, and dispatch subagents. Most planning and discussion units use `planning` mode: read tools are allowed, writes are limited to `.gsd/`, bash must be read-only, and subagent dispatch is blocked. Selected planning and closeout units use `planning-dispatch` mode, which keeps the same source-write and bash restrictions but allows `subagent` dispatch for isolated recon, planning, or review work. Documentation units use `docs` mode, which also allows writes to the manifest's documentation globs such as `docs/**`, top-level `README*.md`, `CHANGELOG.md`, and top-level `*.md`.
 
-Policy violations return a hard block, so unsafe writes, unsafe bash, and subagent dispatch are stopped at runtime rather than handled as model instructions.
+Policy violations return a hard block, so unsafe writes, unsafe bash, and subagent dispatch from non-dispatch planning units are stopped at runtime rather than handled as model instructions. In `planning-dispatch` units, prompts steer the parent agent toward read-only specialists such as `scout`, `planner`, `researcher`, `reviewer`, `security`, or `tester`; implementation-tier agents still belong in `execute-task`.
+
+## Reactive Task Execution
+
+Reactive task execution is enabled by default. During task execution, GSD derives a dependency graph from task-plan IO annotations. With default settings, it only attempts a reactive batch when at least three ready tasks are available and the graph is non-ambiguous. Non-conflicting tasks are dispatched in parallel via subagents; dependent tasks wait for their predecessors.
+
+```yaml
+reactive_execution:
+  enabled: false    # opt out; omit this block to keep default-on behavior
+```
+
+Set `reactive_execution.enabled: true` explicitly to use the earlier opt-in threshold of two ready tasks. Optional tuning includes `max_parallel` (default `2`, range `1`-`8`), `isolation_mode: same-tree`, and `subagent_model`.
 
 ## Git Isolation
 
@@ -80,11 +121,11 @@ GSD isolates milestone work using one of three modes:
 
 | Mode | How It Works | Best For |
 |------|-------------|----------|
-| `worktree` (default) | Each milestone gets its own directory and branch | Most projects |
+| `none` (default) | Work happens directly on your current branch | Most projects |
+| `worktree` | Each milestone gets its own directory and branch | Projects that need file isolation |
 | `branch` | Work happens in the project root on a milestone branch | Submodule-heavy repos |
-| `none` | Work happens directly on your current branch | Hot-reload workflows |
 
-In worktree mode, all commits are squash-merged to main as one clean commit when the milestone completes. See [Git & Worktrees](../configuration/git-settings.md).
+In worktree mode, all commits are squash-merged to main as one clean commit when the milestone completes. Worktree mode requires at least one commit; zero-commit repos temporarily run as `none` until `HEAD` exists. See [Git & Worktrees](../configuration/git-settings.md).
 
 ## Crash Recovery
 

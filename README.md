@@ -310,7 +310,9 @@ This is what makes GSD different. Run it, walk away, come back to built software
 /gsd auto
 ```
 
-Auto mode is a state machine driven by files on disk. It reads `.gsd/STATE.md`, determines the next unit of work, creates a fresh agent session, injects a focused prompt with all relevant context pre-inlined, and lets the LLM execute. When the LLM finishes, auto mode reads disk state again and dispatches the next unit.
+Auto mode is a state machine driven by the GSD database at the project root. It derives the next unit of work from authoritative SQLite state, creates a fresh agent session, injects a focused prompt with all relevant context pre-inlined, and lets the LLM execute. When the LLM finishes, auto mode persists the result to the database, refreshes markdown projections such as `STATE.md`, and dispatches the next unit.
+
+The database is authoritative for milestones, slices, tasks, requirements, decisions, summaries, and completion status. Markdown under `.gsd/` is a rendered projection for review, prompts, and git-friendly history; it is not a runtime fallback unless you explicitly run a recovery/import command. In worktree mode, project-root DB state remains authoritative and worktree markdown projections are not synced back as state.
 
 **What happens under the hood:**
 
@@ -318,7 +320,7 @@ Auto mode is a state machine driven by files on disk. It reads `.gsd/STATE.md`, 
 
 2. **Context pre-loading** — The dispatch prompt includes inlined task plans, slice plans, prior task summaries, dependency summaries, roadmap excerpts, and decisions register. The LLM starts with everything it needs instead of spending tool calls reading files.
 
-3. **Git isolation** — When `git.isolation` is set to `worktree` or `branch`, each milestone runs on its own `milestone/<MID>` branch (in a worktree or in-place). All slice work commits sequentially — no branch switching, no merge conflicts. When the milestone completes, it's squash-merged to main as one clean commit. The default is `none` (work on the current branch), configurable via preferences.
+3. **Git isolation** — When `git.isolation` is set to `worktree` or `branch`, each milestone runs on its own `milestone/<MID>` branch (in a worktree or in-place). All slice work commits sequentially — no branch switching, no merge conflicts. When the milestone completes, it's squash-merged to main as one clean commit. The default is `none` (work on the current branch), configurable via preferences. If `worktree` is configured in a repo with no committed `HEAD`, GSD temporarily behaves as `none` until the first commit exists because git worktrees need a committed start point.
 
 4. **Crash recovery** — A lock file tracks the current unit. If the session dies, the next `/gsd auto` reads the surviving session file, synthesizes a recovery briefing from every tool call that made it to disk, and resumes with full context. Parallel orchestrator state is persisted to disk with PID liveness detection, so multi-worker sessions survive crashes too. In headless mode, crashes trigger automatic restart with exponential backoff (default 3 attempts).
 
@@ -450,6 +452,7 @@ On first run, GSD launches a branded setup wizard that walks you through LLM pro
 | `/gsd`                  | Step mode — executes one unit at a time, pauses between each                  |
 | `/gsd next`             | Explicit step mode (same as bare `/gsd`)                                      |
 | `/gsd auto`             | Autonomous mode — researches, plans, executes, commits, repeats               |
+| `/gsd new-project [--deep]` | Bootstrap a project with staged project-level discovery                  |
 | `/gsd quick`            | Execute a quick task with GSD guarantees, skip planning overhead              |
 | `/gsd stop`             | Stop auto mode gracefully                                                     |
 | `/gsd steer`            | Hard-steer plan documents during execution                                    |
@@ -471,6 +474,7 @@ On first run, GSD launches a branded setup wizard that walks you through LLM pro
 | `/gsd logs`             | Browse activity, debug, and metrics logs                                      |
 | `/gsd export --html`    | Generate HTML report for current or completed milestone                       |
 | `/worktree` (`/wt`)     | Git worktree lifecycle — create, switch, merge, remove                        |
+| `/gsd worktree` (`/gsd wt`) | TUI worktree management — list, merge, clean, remove with safety checks   |
 | `/voice`                | Toggle real-time speech-to-text (macOS, Linux)                                |
 | `/exit`                 | Graceful shutdown — saves session state before exiting                        |
 | `/kill`                 | Kill GSD process immediately                                                  |
@@ -497,11 +501,15 @@ Every dispatch is carefully constructed. The LLM never wastes tool calls on orie
 
 | Artifact           | Purpose                                                         |
 | ------------------ | --------------------------------------------------------------- |
+| `gsd.db`           | Authoritative runtime state for hierarchy and completion        |
 | `PROJECT.md`       | Living doc — what the project is right now                      |
+| `REQUIREMENTS.md`  | Project-level capability contract and out-of-scope list         |
 | `DECISIONS.md`     | Append-only register of architectural decisions                 |
 | `KNOWLEDGE.md`     | Cross-session rules, patterns, and lessons learned              |
 | `RUNTIME.md`       | Runtime context — API endpoints, env vars, services (v2.39)     |
-| `STATE.md`         | Quick-glance dashboard — always read first                      |
+| `runtime/research-decision.json` | Deep-mode marker for project research vs skip       |
+| `research/*.md`    | Optional deep-mode project research: stack, features, architecture, pitfalls |
+| `STATE.md`         | Quick-glance dashboard rendered from the database                |
 | `M001-ROADMAP.md`  | Milestone plan with slice checkboxes, risk levels, dependencies |
 | `M001-CONTEXT.md`  | User decisions from the discuss phase                           |
 | `M001-RESEARCH.md` | Codebase and ecosystem research                                 |
@@ -597,6 +605,7 @@ auto_report: true
 | Setting                           | What it controls                                                                                      |
 | --------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `models.*`                        | Per-phase model selection — string for a single model, or `{model, fallbacks}` for automatic failover |
+| `planning_depth`                  | `light` / `deep` — opt into staged project discovery before milestone planning                         |
 | `skill_discovery`                 | `auto` / `suggest` / `off` — how GSD finds and applies skills                                         |
 | `auto_supervisor.*`               | Timeout thresholds for auto mode supervision                                                          |
 | `budget_ceiling`                  | USD ceiling — auto mode pauses when reached                                                           |
@@ -605,7 +614,7 @@ auto_report: true
 | `skill_rules`                     | Situational rules for skill routing                                                                   |
 | `skill_staleness_days`            | Skills unused for N days get deprioritized (default: 60, 0 = disabled)                                |
 | `unique_milestone_ids`            | Uses unique milestone names to avoid clashes when working in teams of people                          |
-| `git.isolation`                   | `none` (default), `worktree`, or `branch` — enable worktree or branch isolation for milestone work    |
+| `git.isolation`                   | `none` (default), `worktree`, or `branch` — enable worktree or branch isolation for milestone work. `worktree` requires a committed `HEAD`; zero-commit repos temporarily run as `none`    |
 | `git.manage_gitignore`            | Set `false` to prevent GSD from modifying `.gitignore`                                                |
 | `verification_commands`           | Array of shell commands to run after task execution (e.g., `["npm run lint", "npm run test"]`)        |
 | `verification_auto_fix`           | Auto-retry on verification failures (default: true)                                                   |
@@ -702,7 +711,7 @@ The best practice for working in teams is to ensure unique milestone names acros
 .gsd/completed-units*.json
 # State manifest — workflow state for recovery
 .gsd/state-manifest.json
-# Derived state cache — regenerated from plan/roadmap files on disk
+# Derived state projection — regenerated from the authoritative database
 .gsd/STATE.md
 # Per-developer token/cost accumulator
 .gsd/metrics.json
@@ -714,7 +723,7 @@ The best practice for working in teams is to ensure unique milestone names acros
 .gsd/worktrees/
 # Parallel orchestration IPC and worker status
 .gsd/parallel/
-# SQLite database and WAL sidecars — checkpoint state, forensics data
+# SQLite database and WAL sidecars — authoritative runtime state, local only
 .gsd/gsd.db*
 # Daily-rotated event journal — structured event log for forensics
 .gsd/journal/
@@ -779,7 +788,7 @@ gsd (CLI binary)
 - **`pkg/` shim directory** — `PI_PACKAGE_DIR` points here (not project root) to avoid Pi's theme resolution collision with our `src/` directory. Contains only `piConfig` and theme assets.
 - **Two-file loader pattern** — `loader.ts` sets all env vars with zero SDK imports, then dynamic-imports `cli.ts` which does static SDK imports. This ensures `PI_PACKAGE_DIR` is set before any SDK code evaluates.
 - **Always-overwrite sync** — `npm update -g` takes effect immediately. Bundled extensions and agents are synced to `~/.gsd/agent/` on every launch, not just first run.
-- **State lives on disk** — `.gsd/` is the source of truth. Auto mode reads it, writes it, and advances based on what it finds. No in-memory state survives across sessions.
+- **DB-authoritative state** — the project-root GSD database is the runtime source of truth. `.gsd/` markdown files are rendered projections for review, prompt context, and git history. No in-memory state survives across sessions.
 
 ---
 

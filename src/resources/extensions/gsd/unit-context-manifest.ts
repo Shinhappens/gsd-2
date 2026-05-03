@@ -111,6 +111,12 @@ export type PreferencesPolicy = "none" | "active-only" | "full";
  *                    Task subagent dispatch denied. Catches the bug class
  *                    where a discuss-milestone turn modifies user source
  *                    files (forensics: ~/Github/test-apps/b23, #4934).
+ *   - "planning-dispatch"
+ *                  — Same read + .gsd/** write + safe-Bash surface as
+ *                    "planning", but permits controlled subagent dispatch
+ *                    only to the agents listed in the ToolsPolicy
+ *                    `allowedSubagents` field. See write-gate.ts for the
+ *                    runtime agent-class enforcement details.
  *   - "docs"       — Read tools always; writes restricted to .gsd/** AND
  *                    the explicit `allowedPathGlobs` set; Bash safe-allowlist;
  *                    no subagents. Reserved for rewrite-docs, which legitimately
@@ -125,6 +131,7 @@ export type ToolsPolicy =
   | { readonly mode: "all" }
   | { readonly mode: "read-only" }
   | { readonly mode: "planning" }
+  | { readonly mode: "planning-dispatch"; readonly allowedSubagents: readonly string[] }
   | { readonly mode: "docs"; readonly allowedPathGlobs: readonly string[] };
 
 // ─── Computed-artifact registry (#4924 v2 contract) ───────────────────────
@@ -268,6 +275,18 @@ const COMMON_BUDGET_SMALL = 250_000;    // ~65K tokens
 
 const TOOLS_ALL: ToolsPolicy = { mode: "all" };
 const TOOLS_PLANNING: ToolsPolicy = { mode: "planning" };
+// Like TOOLS_PLANNING but permits dispatch to read-only recon/planning
+// specialists. Runtime-enforced by write-gate.ts before the subagent tool runs.
+const TOOLS_PLANNING_DISPATCH_RECON: ToolsPolicy = {
+  mode: "planning-dispatch",
+  allowedSubagents: ["scout", "planner"],
+};
+// Like TOOLS_PLANNING_DISPATCH_RECON, but for closeout units that fan out
+// verification work to review-tier specialists.
+const TOOLS_PLANNING_DISPATCH_REVIEW: ToolsPolicy = {
+  mode: "planning-dispatch",
+  allowedSubagents: ["reviewer", "security", "tester"],
+};
 const TOOLS_DOCS: ToolsPolicy = {
   mode: "docs",
   // Globs are resolved relative to project basePath. The set is intentionally
@@ -306,6 +325,12 @@ export const KNOWN_UNIT_TYPES = [
   "run-uat",
   "gate-evaluate",
   "rewrite-docs",
+  // Deep planning mode (project-level) units
+  "workflow-preferences",
+  "discuss-project",
+  "discuss-requirements",
+  "research-decision",
+  "research-project",
 ] as const;
 
 export type UnitType = typeof KNOWN_UNIT_TYPES[number];
@@ -362,7 +387,11 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     memory: "prompt-relevant",
     codebaseMap: false,
     preferences: "active-only",
-    tools: TOOLS_PLANNING,
+    // planning-dispatch: validation is a verification-fan-out unit. It reads
+    // the milestone surface and dispatches reviewer/security/tester subagents
+    // to report findings without touching user source. Mirrors
+    // complete-milestone's policy. Write isolation to .gsd/ is preserved.
+    tools: TOOLS_PLANNING_DISPATCH_REVIEW,
     artifacts: {
       inline: ["roadmap", "slice-summary", "slice-uat", "requirements", "decisions", "templates"],
       excerpt: [],
@@ -376,7 +405,11 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     memory: "prompt-relevant",
     codebaseMap: false,
     preferences: "active-only",
-    tools: TOOLS_PLANNING,
+    // planning-dispatch: completion is a high-leverage place to fan out to
+    // reviewer / security / tester subagents. They read the diff and report
+    // findings; they do not write user source. Write isolation to .gsd/ is
+    // preserved.
+    tools: TOOLS_PLANNING_DISPATCH_REVIEW,
     artifacts: {
       // #4780 landed slice-summary as excerpt for this unit; phase 2 of
       // the architecture will read this manifest as the source of truth
@@ -409,7 +442,10 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     memory: "prompt-relevant",
     codebaseMap: true,
     preferences: "active-only",
-    tools: TOOLS_PLANNING,
+    // planning-dispatch: allows subagent dispatch so the planner can fan out
+    // to scout for codebase recon and to planner/decompose-style specialists
+    // for sub-decomposition. Write-isolation to .gsd/ is preserved.
+    tools: TOOLS_PLANNING_DISPATCH_RECON,
     artifacts: {
       inline: ["roadmap", "slice-research", "dependency-summaries", "requirements", "decisions", "templates"],
       excerpt: [],
@@ -423,7 +459,10 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     memory: "prompt-relevant",
     codebaseMap: true,
     preferences: "active-only",
-    tools: TOOLS_PLANNING,
+    // See plan-slice — same rationale: dispatch to scout/planner-style
+    // specialists during refinement is materially better than re-doing recon
+    // inline.
+    tools: TOOLS_PLANNING_DISPATCH_RECON,
     artifacts: {
       inline: ["slice-plan", "slice-research", "dependency-summaries", "templates"],
       excerpt: [],
@@ -451,7 +490,10 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     memory: "prompt-relevant",
     codebaseMap: false,
     preferences: "active-only",
-    tools: TOOLS_PLANNING,
+    // See complete-milestone — same rationale: dispatch to reviewer / security /
+    // tester subagents to fan out review work without bloating this unit's
+    // context.
+    tools: TOOLS_PLANNING_DISPATCH_REVIEW,
     artifacts: {
       // Phase 3 migration (#4782): matches today's actual
       // buildCompleteSlicePrompt inlining order. Overrides prepend +
@@ -553,6 +595,92 @@ export const UNIT_MANIFESTS: Record<UnitType, UnitContextManifest> = {
     tools: TOOLS_DOCS,
     artifacts: {
       inline: ["project", "requirements", "decisions", "templates"],
+      excerpt: [],
+      onDemand: [],
+    },
+    maxSystemPromptChars: COMMON_BUDGET_MEDIUM,
+  },
+
+  // ─── Deep planning mode (project-level) units ────────────────────────
+  // workflow-preferences: default-writing stage that records
+  // commit_policy / branch_model in PREFERENCES.md, defaults
+  // uat_dispatch/executor_class, and records the research decision. No project artifacts needed.
+  "workflow-preferences": {
+    skills: { mode: "none" },
+    knowledge: "none",
+    memory: "none",
+    codebaseMap: false,
+    preferences: "none",
+    tools: TOOLS_PLANNING,
+    artifacts: {
+      inline: [],
+      excerpt: [],
+      onDemand: [],
+    },
+    maxSystemPromptChars: COMMON_BUDGET_SMALL,
+  },
+  // discuss-project: PROJECT.md interview (deep mode only). Project-scoped
+  // discussion runs before any milestone exists, so milestone artifacts are
+  // not loaded. Keeps templates available for PROJECT.md scaffolding.
+  "discuss-project": {
+    skills: { mode: "all" },
+    knowledge: "scoped",
+    memory: "prompt-relevant",
+    codebaseMap: true,
+    preferences: "active-only",
+    tools: TOOLS_PLANNING,
+    artifacts: {
+      inline: ["templates"],
+      excerpt: [],
+      onDemand: [],
+    },
+    maxSystemPromptChars: COMMON_BUDGET_MEDIUM,
+  },
+  // discuss-requirements: REQUIREMENTS.md interview. PROJECT.md is the
+  // primary context input; templates carry the requirements format.
+  "discuss-requirements": {
+    skills: { mode: "all" },
+    knowledge: "scoped",
+    memory: "prompt-relevant",
+    codebaseMap: true,
+    preferences: "active-only",
+    tools: TOOLS_PLANNING,
+    artifacts: {
+      inline: ["project", "templates"],
+      excerpt: [],
+      onDemand: [],
+    },
+    maxSystemPromptChars: COMMON_BUDGET_MEDIUM,
+  },
+  // research-decision: lightweight one-question yes/no unit. Writes a
+  // marker JSON; no project artifacts needed.
+  "research-decision": {
+    skills: { mode: "none" },
+    knowledge: "none",
+    memory: "none",
+    codebaseMap: false,
+    preferences: "none",
+    tools: TOOLS_PLANNING,
+    artifacts: {
+      inline: [],
+      excerpt: [],
+      onDemand: [],
+    },
+    maxSystemPromptChars: COMMON_BUDGET_SMALL,
+  },
+  // research-project: orchestrator that fans out 4 parallel scout subagents
+  // for project research (stack, features, architecture, pitfalls). Needs the
+  // planning-dispatch policy to dispatch them. PROJECT.md + REQUIREMENTS.md
+  // give the orchestrator the framing context.
+  "research-project": {
+    skills: { mode: "all" },
+    knowledge: "scoped",
+    memory: "prompt-relevant",
+    codebaseMap: true,
+    preferences: "active-only",
+    tools: { mode: "planning-dispatch", allowedSubagents: ["scout"] },
+    artifacts: {
+      inline: ["project", "requirements", "templates"],
       excerpt: [],
       onDemand: [],
     },
