@@ -45,5 +45,11 @@ export async function handleGSDCommand(
 
   if (handled) return;
 
+  if (trimmed.includes(" ")) {
+    const { handleDo } = await import("../commands-do.js");
+    await handleDo(trimmed, ctx, pi);
+    return;
+  }
+
   ctx.ui.notify(`Unknown: /gsd ${trimmed}. Run /gsd help for available commands.`, "warning");
 }

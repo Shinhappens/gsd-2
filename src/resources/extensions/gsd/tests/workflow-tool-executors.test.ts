@@ -11,7 +11,9 @@ import {
   _getAdapter,
   insertGateRow,
   upsertRequirement,
+  getAllMilestones,
 } from "../gsd-db.ts";
+import { deriveState, invalidateStateCache } from "../state.ts";
 import { markApprovalGateVerified, markDepthVerified, clearDiscussionFlowState, loadWriteGateSnapshot, setPendingGate } from "../bootstrap/write-gate.ts";
 import {
   executeCompleteMilestone,
@@ -163,6 +165,9 @@ test("executeMilestoneStatus returns milestone metadata and slice counts", async
     assert.equal(parsed.sliceCount, 1);
     assert.equal(parsed.slices[0].id, "S01");
     assert.equal(parsed.slices[0].taskCounts.pending, 1);
+    assert.equal(result.details.status, "active");
+    assert.equal(result.details.title, "Milestone One");
+    assert.deepEqual(result.details.slices, parsed.slices);
   } finally {
     closeDatabase();
     cleanup(base);
@@ -383,6 +388,38 @@ test("executeCompleteMilestone sanitizes raw params and writes milestone summary
     const summaryPath = String(result.details.summaryPath);
     assert.ok(existsSync(summaryPath), "milestone summary should be written to disk");
     assert.match(readFileSync(summaryPath, "utf-8"), /shared executor path/);
+  } finally {
+    closeDatabase();
+    cleanup(base);
+  }
+});
+
+test("executeCompleteMilestone returns success for already-complete milestones without overwriting the existing summary", async () => {
+  const base = makeTmpBase();
+  try {
+    openTestDb(base);
+    seedMilestone("M003", "Milestone Three", "complete");
+    seedSlice("M003", "S03", "complete");
+    writeRoadmap(base, "M003", ["S03"]);
+    const milestoneDir = join(base, ".gsd", "milestones", "M003");
+    mkdirSync(milestoneDir, { recursive: true });
+    const summaryPath = join(milestoneDir, "M003-SUMMARY.md");
+    writeFileSync(summaryPath, "# Existing Summary\n");
+
+    const result = await inProjectDir(base, () => executeCompleteMilestone({
+      milestoneId: "M003",
+      title: "Milestone Three",
+      oneLiner: "Completed milestone",
+      narrative: "Everything shipped.",
+      verificationPassed: true,
+    }, base));
+
+    assert.equal(result.isError, undefined);
+    assert.equal(result.details.operation, "complete_milestone");
+    assert.equal(result.details.alreadyComplete, true);
+    assert.match(result.content[0].text, /already complete/);
+    assert.doesNotMatch(result.content[0].text, /Summary written to/);
+    assert.equal(readFileSync(summaryPath, "utf-8"), "# Existing Summary\n");
   } finally {
     closeDatabase();
     cleanup(base);
@@ -690,7 +727,18 @@ test("executeSummarySave supports root-level deep planning artifacts", async () 
 
     const project = await inProjectDir(base, () => executeSummarySave({
       artifact_type: "PROJECT",
-      content: "# Project\n\n## What This Is\n\nA root project artifact.",
+      content: [
+        "# Project",
+        "",
+        "## What This Is",
+        "",
+        "A root project artifact.",
+        "",
+        "## Milestone Sequence",
+        "",
+        "- [ ] M001: Foundation - Establish the first runnable slice.",
+        "",
+      ].join("\n"),
     }, base));
     assert.equal(project.isError, undefined);
     assert.equal(project.details.path, "PROJECT.md");
@@ -737,6 +785,109 @@ test("executeSummarySave supports root-level deep planning artifacts", async () 
   }
 });
 
+test("executeSummarySave registers PROJECT milestone sequence for the next run", async () => {
+  const base = makeTmpBase();
+  try {
+    openTestDb(base);
+
+    const result = await inProjectDir(base, () => executeSummarySave({
+      artifact_type: "PROJECT",
+      content: [
+        "# Project",
+        "",
+        "## What This Is",
+        "",
+        "Deep project setup output.",
+        "",
+        "## Project Shape",
+        "",
+        "**Complexity:** complex",
+        "**Why:** It spans multiple delivery steps.",
+        "",
+        "## Capability Contract",
+        "",
+        "See .gsd/REQUIREMENTS.md.",
+        "",
+        "## Milestone Sequence",
+        "",
+        "- [ ] M001: Foundation - Establish the first runnable slice.",
+        "- [ ] M002: Polish - Follow-up experience work.",
+        "",
+      ].join("\n"),
+    }, base));
+
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(result.details.registeredMilestones, ["M001", "M002"]);
+
+    const milestones = getAllMilestones();
+    assert.deepEqual(
+      milestones.map((m) => [m.id, m.title, m.status]),
+      [
+        ["M001", "Foundation", "queued"],
+        ["M002", "Polish", "queued"],
+      ],
+    );
+
+    invalidateStateCache();
+    const state = await deriveState(base);
+    assert.equal(state.activeMilestone?.id, "M001");
+    assert.equal(state.phase, "pre-planning");
+    assert.equal(state.registry[0]?.status, "active");
+    assert.equal(state.registry[1]?.status, "pending");
+  } finally {
+    closeDatabase();
+    cleanup(base);
+  }
+});
+
+test("executeSummarySave hard-fails when milestone registration throws so silent No-Active-Milestone is impossible", async () => {
+  const base = makeTmpBase();
+  try {
+    openTestDb(base);
+    const db = _getAdapter();
+    assert.ok(db, "DB should be open");
+    const originalPrepare = db.prepare.bind(db);
+    (db as any).prepare = (sql: string) => {
+      if (sql.includes("INSERT OR IGNORE INTO milestones")) {
+        throw new Error("simulated milestone registration failure");
+      }
+      return originalPrepare(sql);
+    };
+
+    const result = await inProjectDir(base, () => executeSummarySave({
+      artifact_type: "PROJECT",
+      content: [
+        "# Project",
+        "",
+        "## What This Is",
+        "",
+        "Deep project setup output.",
+        "",
+        "## Milestone Sequence",
+        "",
+        "- [ ] M001: Foundation - Establish the first runnable slice.",
+        "",
+      ].join("\n"),
+    }, base));
+
+    // The artifact is persisted before registration runs, but registration must
+    // surface as isError so the LLM retries (INSERT OR IGNORE makes it idempotent)
+    // instead of announcing "ready" while the DB has zero milestone rows.
+    assert.equal(result.isError, true);
+    assert.equal(result.details.path, "PROJECT.md");
+    assert.equal(result.details.error, "milestone_registration_threw");
+    assert.match(String(result.details.registration_error), /simulated milestone registration failure/);
+    assert.match(result.content[0].text, /milestone registration failed/);
+    assert.match(result.content[0].text, /idempotent/);
+    assert.ok(existsSync(join(base, ".gsd", "PROJECT.md")));
+    const artifact = originalPrepare("SELECT path FROM artifacts WHERE path = ?").get("PROJECT.md");
+    assert.equal(artifact?.path, "PROJECT.md");
+  } finally {
+    closeDatabase();
+    cleanup(base);
+  }
+});
+
 test("executeSummarySave blocks final root artifacts while approval gate is pending", async () => {
   const base = makeTmpBase();
   try {
@@ -772,9 +923,22 @@ test("executeSummarySave requires verified root approval in deep mode", async ()
     writeFileSync(join(base, ".gsd", "PREFERENCES.md"), "---\nplanning_depth: deep\n---\n");
     openTestDb(base);
 
+    const projectFixture = [
+      "# Project",
+      "",
+      "## What This Is",
+      "",
+      "A root project artifact.",
+      "",
+      "## Milestone Sequence",
+      "",
+      "- [ ] M001: Foundation - Establish the first runnable slice.",
+      "",
+    ].join("\n");
+
     const blocked = await inProjectDir(base, () => executeSummarySave({
       artifact_type: "PROJECT",
-      content: "# Project\n\n## What This Is\n\nA root project artifact.",
+      content: projectFixture,
     }, base));
 
     assert.equal(blocked.isError, true);
@@ -786,7 +950,7 @@ test("executeSummarySave requires verified root approval in deep mode", async ()
 
     const unblocked = await inProjectDir(base, () => executeSummarySave({
       artifact_type: "PROJECT",
-      content: "# Project\n\n## What This Is\n\nA root project artifact.",
+      content: projectFixture,
     }, base));
 
     assert.equal(unblocked.isError, undefined);

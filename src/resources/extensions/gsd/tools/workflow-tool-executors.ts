@@ -3,6 +3,7 @@ import { sanitizeCompleteMilestoneParams } from "../bootstrap/sanitize-complete-
 import { loadWriteGateSnapshot, shouldBlockContextArtifactSaveInSnapshot, shouldBlockRootArtifactSaveInSnapshot } from "../bootstrap/write-gate.js";
 import {
   getActiveRequirements,
+  insertMilestone,
   getMilestone,
   getSliceStatusSummary,
   getSliceTaskCounts,
@@ -31,6 +32,7 @@ import { handleValidateMilestone } from "./validate-milestone.js";
 import { logError, logWarning } from "../workflow-logger.js";
 import { invalidateStateCache } from "../state.js";
 import { loadEffectiveGSDPreferences } from "../preferences.js";
+import { parseProject } from "../schemas/parsers.js";
 
 export const SUPPORTED_SUMMARY_ARTIFACT_TYPES = [
   "SUMMARY",
@@ -69,6 +71,20 @@ export interface SummarySaveParams {
   task_id?: string;
   artifact_type: string;
   content: string;
+}
+
+function registerProjectMilestoneSequence(content: string): string[] {
+  const parsed = parseProject(content);
+  const registered: string[] = [];
+  for (const milestone of parsed.milestones) {
+    insertMilestone({
+      id: milestone.id,
+      title: milestone.title,
+      status: milestone.done ? "complete" : "queued",
+    });
+    registered.push(milestone.id);
+  }
+  return registered;
 }
 
 export async function executeSummarySave(
@@ -173,6 +189,67 @@ export async function executeSummarySave(
       basePath,
     );
 
+    let registeredMilestones: string[] = [];
+    if (params.artifact_type === "PROJECT") {
+      try {
+        registeredMilestones = registerProjectMilestoneSequence(contentToSave);
+        if (registeredMilestones.length > 0) invalidateStateCache();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logError("tool", `gsd_summary_save: PROJECT artifact persisted but milestone registration threw: ${msg}`, {
+          tool: "gsd_summary_save",
+          error: String(err),
+          stack: err instanceof Error ? err.stack ?? "" : "",
+        });
+        // PROJECT.md was persisted by saveArtifactToDb above; the artifacts row
+        // changed even though no milestones registered. Invalidate so subsequent
+        // /gsd reads see the persisted artifact instead of the pre-save cache.
+        invalidateStateCache();
+        return {
+          content: [{
+            type: "text",
+            text:
+              `Error: PROJECT.md was saved to ${relativePath} but milestone registration failed: ${msg}. ` +
+              `The DB has no milestone rows for this project, so /gsd will report "No Active Milestone". ` +
+              `Re-call gsd_summary_save(PROJECT) once the underlying error is resolved — INSERT OR IGNORE makes registration idempotent.`,
+          }],
+          details: {
+            operation: "save_summary",
+            path: relativePath,
+            artifact_type: params.artifact_type,
+            error: "milestone_registration_threw",
+            registration_error: msg,
+          },
+          isError: true,
+        };
+      }
+      if (registeredMilestones.length === 0) {
+        logError("tool", `gsd_summary_save: PROJECT.md saved to ${relativePath} but parsed zero milestones — registration produced no DB rows`, {
+          tool: "gsd_summary_save",
+        });
+        // PROJECT.md was persisted; invalidate so subsequent reads see the new
+        // artifacts row even though no milestones registered.
+        invalidateStateCache();
+        return {
+          content: [{
+            type: "text",
+            text:
+              `Error: PROJECT.md was saved to ${relativePath} but contains zero parseable milestone lines, ` +
+              `so no milestones were registered in the DB. /gsd will report "No Active Milestone". ` +
+              `Rewrite PROJECT.md so the "Milestone Sequence" section uses canonical lines: ` +
+              `\`- [ ] M001: <Title> — <One-liner>\` (em-dash, double-dash \`--\`, or single-dash \`-\` separator), then re-call gsd_summary_save(PROJECT).`,
+          }],
+          details: {
+            operation: "save_summary",
+            path: relativePath,
+            artifact_type: params.artifact_type,
+            error: "milestone_registration_empty_parse",
+          },
+          isError: true,
+        };
+      }
+    }
+
     if (params.artifact_type === "CONTEXT" && !params.task_id) {
       try {
         const draftFile = params.slice_id
@@ -186,7 +263,13 @@ export async function executeSummarySave(
 
     return {
       content: [{ type: "text", text: `Saved ${params.artifact_type} artifact to ${relativePath}` }],
-      details: { operation: "save_summary", path: relativePath, artifact_type: params.artifact_type, content_source: contentSource },
+      details: {
+        operation: "save_summary",
+        path: relativePath,
+        artifact_type: params.artifact_type,
+        content_source: contentSource,
+        ...(registeredMilestones.length > 0 ? { registeredMilestones } : {}),
+      },
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -394,12 +477,17 @@ export async function executeCompleteMilestone(
       isError: true,
       };
     }
+    const message = result.alreadyComplete
+      ? `Milestone ${result.milestoneId} is already complete. Summary available at ${result.summaryPath}`
+      : `Completed milestone ${result.milestoneId}. Summary written to ${result.summaryPath}`;
     return {
-      content: [{ type: "text", text: `Completed milestone ${result.milestoneId}. Summary written to ${result.summaryPath}` }],
+      content: [{ type: "text", text: message }],
       details: {
         operation: "complete_milestone",
         milestoneId: result.milestoneId,
         summaryPath: result.summaryPath,
+        ...(result.alreadyComplete ? { alreadyComplete: true } : {}),
+        ...(result.stale ? { stale: true } : {}),
       },
     };
   } catch (err) {
@@ -725,7 +813,7 @@ export async function executeMilestoneStatus(
 
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        details: { operation: "milestone_status", milestoneId: milestone.id, sliceCount: slices.length },
+        details: { operation: "milestone_status", ...result },
       };
     });
   } catch (err) {

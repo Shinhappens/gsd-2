@@ -1,3 +1,4 @@
+// GSD-2 Interactive Tool Execution Rendering
 import {
 	Box,
 	Container,
@@ -6,6 +7,7 @@ import {
 	type ImageDimensions,
 	imageFallback,
 	Spacer,
+	style,
 	Text,
 	type TUI,
 	truncateToWidth,
@@ -103,34 +105,179 @@ function renderToolFrame(
 	const outerWidth = Math.max(20, width);
 	const contentWidth = Math.max(1, outerWidth - 2); // "│ " + content
 
-	const borderColor = opts.tone === "error" ? "error" : "toolTitle";
-	const topColor = opts.tone === "error" ? "error" : "toolTitle";
-	const labelColor = opts.tone === "error" ? "error" : "toolTitle";
-	const statusColor = opts.tone === "error" ? "error" : opts.tone === "pending" ? "warning" : "success";
-	const border = (s: string) => theme.fg(borderColor, s);
-
-	const leftStyled = theme.fg(labelColor, theme.bold(`• ${opts.label}`));
+	const borderColor = opts.tone === "error" ? "toolError" : opts.tone === "pending" ? "toolRunning" : "toolSuccess";
+	const topColor = borderColor;
+	const labelColor = opts.tone === "error" ? "toolError" : opts.tone === "pending" ? "toolRunning" : "toolSuccess";
+	const statusColor = opts.tone === "error" ? "toolError" : opts.tone === "pending" ? "toolRunning" : "toolSuccess";
+	const leftStyled = theme.fg(labelColor, theme.bold(opts.label));
 	const rightStyled = theme.fg(statusColor, opts.status);
-	const gap = Math.max(1, outerWidth - visibleWidth(leftStyled) - visibleWidth(rightStyled));
+	const titleWidth = Math.max(1, outerWidth - 4);
+	const gap = Math.max(1, titleWidth - visibleWidth(leftStyled) - visibleWidth(rightStyled));
 	const headerRow = `${leftStyled}${" ".repeat(gap)}${rightStyled}`;
-	const headerPad = Math.max(0, outerWidth - visibleWidth(headerRow));
+	const headerPad = Math.max(0, titleWidth - visibleWidth(headerRow));
 
 	const sourceLines = trimOuterBlankLines(contentLines);
 	const bodyLines = (sourceLines.length > 0 ? sourceLines : [""]).map((line) => {
 		const clipped = truncateToWidth(line, contentWidth, "");
-		return border("│ ") + clipped;
+		return clipped;
 	});
 
-	return [
-		theme.fg(topColor, "─".repeat(outerWidth)),
-		headerRow + " ".repeat(headerPad),
-		...bodyLines,
-	];
+	return style()
+		.border("rounded")
+		.borderColor((line) => theme.fg(line.startsWith("─") ? topColor : borderColor, line))
+		.title(headerRow + " ".repeat(headerPad))
+		.render(bodyLines, outerWidth);
+}
+
+function renderCollapsedToolRow(
+	label: string,
+	status: string,
+	width: number,
+	tone: Extract<ToolFrameTone, "success">,
+): string[] {
+	const outerWidth = Math.max(20, width);
+	const contentWidth = Math.max(1, outerWidth - 2);
+	const statusColor = tone === "success" ? "toolSuccess" : "toolMuted";
+	const labelStyled = theme.fg(statusColor, label);
+	const statusStyled = theme.fg(statusColor, status);
+	const labelWidth = Math.max(1, contentWidth - visibleWidth(statusStyled) - 1);
+	const clippedLabel = truncateToWidth(labelStyled, labelWidth, "");
+	const gap = Math.max(1, contentWidth - visibleWidth(clippedLabel) - visibleWidth(statusStyled));
+	const line = `${clippedLabel}${" ".repeat(gap)}${statusStyled}`;
+	return style()
+		.border("minimal")
+		.borderColor((text) => theme.fg(statusColor, text))
+		.render([line], outerWidth);
 }
 
 const COMPACT_ARG_VALUE_LIMIT = 60;
 const GENERIC_OUTPUT_PREVIEW_LINES = 10;
 const GENERIC_ARGS_JSON_PREVIEW_LINES = 10;
+
+export type ToolExecutionPhase = {
+	label: string;
+	count: number;
+	durationMs: number;
+	targets?: string[];
+	actionLabel?: string;
+};
+
+type ToolTargetMetadata = {
+	kind?: string;
+	action?: string;
+	inputPath?: string;
+	resolvedPath?: string;
+	pattern?: string;
+	glob?: string;
+	line?: number;
+	range?: {
+		start?: number;
+		end?: number;
+	};
+};
+
+function formatElapsed(ms: number): string {
+	if (ms < 1000) return `${ms}ms`;
+	return `${Math.max(1, Math.round(ms / 1000))}s`;
+}
+
+function formatCommandPreview(command: string): string {
+	return truncateToWidth(command.replace(/\s+/g, " ").trim(), 64, "");
+}
+
+function appendLineOrRange(displayPath: string | undefined, target: ToolTargetMetadata): string | undefined {
+	if (!displayPath) return undefined;
+	if (typeof target.line === "number" && Number.isFinite(target.line)) {
+		return `${displayPath}:${target.line}`;
+	}
+	const start = target.range?.start;
+	if (typeof start === "number" && Number.isFinite(start)) {
+		const end = target.range?.end;
+		const suffix =
+			typeof end === "number" && Number.isFinite(end) && end !== start
+				? `${start}-${end}`
+				: `${start}`;
+		return `${displayPath}:${suffix}`;
+	}
+	return displayPath;
+}
+
+function formatToolTarget(target: ToolTargetMetadata): string | undefined {
+	const path = target.resolvedPath || target.inputPath;
+	const displayPath = path ? shortenPath(path) : undefined;
+	if (target.kind === "search") {
+		const searchTarget = displayPath ?? target.inputPath ?? ".";
+		const label = target.pattern ? `${target.pattern} in ${searchTarget}` : searchTarget;
+		return target.glob ? `${label} (${target.glob})` : label;
+	}
+	return appendLineOrRange(displayPath, target);
+}
+
+function formatArgsPathTarget(path: string | null, args: Record<string, unknown>): string | undefined {
+	if (!path) return undefined;
+	const start = typeof args.offset === "number" ? args.offset : undefined;
+	const limit = typeof args.limit === "number" ? args.limit : undefined;
+	const range =
+		start !== undefined || limit !== undefined
+			? {
+					start: start ?? 1,
+					end: limit !== undefined ? (start ?? 1) + Math.max(0, limit - 1) : undefined,
+				}
+			: undefined;
+	return appendLineOrRange(shortenPath(path), { range });
+}
+
+function stripLineSuffix(target: string): string {
+	return target.replace(/:\d+(?:-\d+)?$/, "");
+}
+
+function uniqueTargets(targets: string[] | undefined): string[] {
+	const seen = new Set<string>();
+	const unique: string[] = [];
+	for (const target of targets ?? []) {
+		if (!target || seen.has(target)) continue;
+		seen.add(target);
+		unique.push(target);
+	}
+	return unique;
+}
+
+function summarizePhaseLabel(phase: ToolExecutionPhase): string {
+	const phaseTargets = uniqueTargets(phase.targets);
+	const baseTargets = uniqueTargets(phaseTargets.map(stripLineSuffix));
+	if (phase.label === "File changes" && baseTargets.length > 0) {
+		const fileWord = baseTargets.length === 1 ? "file" : "files";
+		const actionWord =
+			phase.actionLabel === "write"
+				? phase.count === 1
+					? "write"
+					: "writes"
+				: phase.actionLabel === undefined
+					? phase.count === 1
+						? "action"
+						: "actions"
+					: phase.count === 1
+						? "edit"
+						: "edits";
+		return `${phase.label} · ${baseTargets.length} ${fileWord}, ${phase.count} ${actionWord}`;
+	}
+	if (phase.label === "Context reads" && baseTargets.length > 0) {
+		const fileWord = baseTargets.length === 1 ? "file" : "files";
+		return `${phase.label} · ${baseTargets.length} ${fileWord}`;
+	}
+	if (phase.label === "Setup / shell" && phaseTargets.length > 0) {
+		return `${phase.label} · ${phase.count} ${phase.count === 1 ? "command" : "commands"}`;
+	}
+	return `${phase.label} ${phase.count} ${phase.count === 1 ? "action" : "actions"}`;
+}
+
+function summarizePhaseTargets(phase: ToolExecutionPhase, width: number): string | undefined {
+	const phaseTargets = uniqueTargets(phase.targets);
+	if (phaseTargets.length === 0) return undefined;
+	const shown = phaseTargets.slice(0, 3);
+	const suffix = phaseTargets.length > shown.length ? ` +${phaseTargets.length - shown.length} more` : "";
+	return truncateToWidth(shown.join(" · ") + suffix, width, "");
+}
 
 /**
  * Format tool args for the generic-renderer fallback. Produces a one-line
@@ -200,6 +347,8 @@ export class ToolExecutionComponent extends Container {
 	private toolDefinition?: ToolDefinition;
 	private ui: TUI;
 	private cwd: string;
+	private readonly startedAt = Date.now();
+	private endedAt: number | undefined;
 	private result?: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 		isError: boolean;
@@ -434,6 +583,9 @@ export class ToolExecutionComponent extends Container {
 	): void {
 		this.result = result;
 		this.isPartial = isPartial;
+		if (!isPartial) {
+			this.endedAt = this.endedAt ?? Date.now();
+		}
 		if (this.normalizedToolName === "write" && !isPartial) {
 			const rawPath = str(this.args?.file_path ?? this.args?.path);
 			const fileContent = str(this.args?.content);
@@ -456,6 +608,7 @@ export class ToolExecutionComponent extends Container {
 	markHistoricalNoResult(): void {
 		if (this.result) return; // real result already set, nothing to do
 		this.isPartial = false;
+		this.endedAt = this.endedAt ?? Date.now();
 		this.result = {
 			content: [],
 			isError: false,
@@ -468,6 +621,7 @@ export class ToolExecutionComponent extends Container {
 	 */
 	completeWithError(message?: string): void {
 		this.isPartial = false;
+		this.endedAt = this.endedAt ?? Date.now();
 		if (this.result) {
 			let content = this.result.content;
 			if (message) {
@@ -538,20 +692,109 @@ export class ToolExecutionComponent extends Container {
 		}
 		const frameWidth = Math.max(20, width);
 		const contentWidth = Math.max(1, frameWidth - 4);
-		const lines = super.render(contentWidth);
 		const frameTone: ToolFrameTone =
 			this.result?.isError ? "error" : this.isPartial || !this.result ? "pending" : "success";
-		const frameStatus = this.isPartial || !this.result ? "Running" : this.result.isError ? "Error" : "Done";
+		const elapsed = formatElapsed((this.endedAt ?? Date.now()) - this.startedAt);
+		const frameStatus = `${this.isPartial || !this.result ? "running" : this.result.isError ? "failed" : "success"} · ${elapsed}`;
 		const parsed = parseMcpToolName(this.toolName);
 		const frameLabel = parsed
-			? `Tool ${parsed.server}·${parsed.tool}`
-			: `Tool ${prettifyToolName(this.toolName, this.toolDefinition?.label) || "unknown"}`;
+			? `${parsed.server}·${parsed.tool}`
+			: prettifyToolName(this.toolName, this.toolDefinition?.label) || "unknown";
+		if (this.shouldRenderCompactSuccess()) {
+			return ["", ...renderCollapsedToolRow(this.getCompactSummary(frameLabel), frameStatus, frameWidth, "success")];
+		}
+		const lines = super.render(contentWidth);
 		const framed = renderToolFrame(lines, frameWidth, {
 			label: frameLabel,
 			status: frameStatus,
 			tone: frameTone,
 		});
 		return framed.length > 0 ? ["", ...framed] : framed;
+	}
+
+	private shouldRenderCompactSuccess(): boolean {
+		if (this.expanded || this.isPartial || !this.result || this.result.isError) return false;
+		const hasImages = this.result.content?.some((block) => block.type === "image") ?? false;
+		return !hasImages;
+	}
+
+	getRollupPhase(): ToolExecutionPhase | null {
+		if (!this.shouldRenderCompactSuccess()) return null;
+		const label = this.getPhaseLabel();
+		const endedAt = this.endedAt ?? Date.now();
+		const target = this.getCompactTarget();
+		return {
+			label,
+			count: 1,
+			durationMs: Math.max(0, endedAt - this.startedAt),
+			targets: target ? [target] : undefined,
+			actionLabel: this.getCompactAction(),
+		};
+	}
+
+	private getPhaseLabel(): string {
+		const name = this.normalizedToolName;
+		const displayName = prettifyToolName(this.toolName, this.toolDefinition?.label);
+
+		if (name === "bash") return "Setup / shell";
+		if (name === "read" || name === "ls" || name === "find" || name === "grep") return "Context reads";
+		if (name === "write" || name === "edit") return "File changes";
+		if (name === "web_search" || displayName === "ToolSearch") return "Discovery";
+		if (displayName === "Memory Query" || displayName === "Memory Capture" || displayName === "Gsd Graph") {
+			return "Memory lookups";
+		}
+		if (displayName === "Update Requirement" || displayName === "Save Requirement") return "Requirement writes";
+		if (displayName.startsWith("Complete ")) return "Finalization";
+		return "Other tool actions";
+	}
+
+	private getCompactSummary(frameLabel: string): string {
+		if (this.normalizedToolName === "bash") {
+			const command = str(this.args?.command);
+			return command ? `bash ${formatCommandPreview(command)}` : frameLabel;
+		}
+		const target = this.getCompactTarget();
+		return target ? `${this.getCompactAction()} ${target}` : frameLabel;
+	}
+
+	private getCompactAction(): string {
+		const target = this.getTargetMetadata();
+		if (target?.action) return target.action === "list" ? "ls" : target.action;
+		return this.normalizedToolName;
+	}
+
+	private getTargetMetadata(): ToolTargetMetadata | undefined {
+		const target = this.result?.details?.target;
+		return target && typeof target === "object" ? target : undefined;
+	}
+
+	private getCompactTarget(): string | undefined {
+		const metadata = this.getTargetMetadata();
+		const metadataTarget = metadata ? formatToolTarget(metadata) : undefined;
+		if (metadataTarget) return metadataTarget;
+
+		const path = str(this.args?.file_path ?? this.args?.path);
+		if (path === null) return undefined;
+		if (this.normalizedToolName === "read" || this.normalizedToolName === "hashline_read") {
+			return formatArgsPathTarget(path, this.args);
+		}
+		if (this.normalizedToolName === "write" || this.normalizedToolName === "edit") {
+			return path ? shortenPath(path) : undefined;
+		}
+		if (this.normalizedToolName === "ls") {
+			return shortenPath(path || ".");
+		}
+		if (this.normalizedToolName === "find") {
+			const pattern = str(this.args?.pattern);
+			return pattern ? `${pattern} in ${shortenPath(path || ".")}` : shortenPath(path || ".");
+		}
+		if (this.normalizedToolName === "grep") {
+			const pattern = str(this.args?.pattern);
+			const glob = str(this.args?.glob);
+			const label = pattern ? `${pattern} in ${shortenPath(path || ".")}` : shortenPath(path || ".");
+			return glob ? `${label} (${glob})` : label;
+		}
+		return undefined;
 	}
 
 	private updateDisplay(): void {
@@ -619,8 +862,13 @@ export class ToolExecutionComponent extends Container {
 			// Render result component if we have a result
 			if (this.result && this.toolDefinition.renderResult) {
 				try {
+					const rendererResult = {
+						content: this.result.content as any,
+						details: this.result.details,
+						isError: this.result.isError,
+					};
 					const resultComponent = this.toolDefinition.renderResult(
-						{ content: this.result.content as any, details: this.result.details },
+						rendererResult,
 						{ expanded: this.expanded, isPartial: this.isPartial },
 						theme,
 					);
@@ -776,6 +1024,10 @@ export class ToolExecutionComponent extends Container {
 			// Truncation warnings
 			const truncation = this.result.details?.truncation;
 			const fullOutputPath = this.result.details?.fullOutputPath;
+			const cwd = this.result.details?.cwd;
+			if (this.expanded && typeof cwd === "string" && cwd.length > 0) {
+				this.contentBox.addChild(new Text(`\n${theme.fg("muted", `cwd ${shortenPath(cwd)}`)}`, 0, 0));
+			}
 			if (truncation?.truncated || fullOutputPath) {
 				const warnings: string[] = [];
 				if (fullOutputPath) {
@@ -1194,5 +1446,32 @@ export class ToolExecutionComponent extends Container {
 		}
 
 		return text;
+	}
+}
+
+export class ToolPhaseSummaryComponent extends Container {
+	constructor(private readonly phases: ToolExecutionPhase[]) {
+		super();
+	}
+
+	getPhases(): ToolExecutionPhase[] {
+		return this.phases.map((phase) => ({ ...phase, targets: phase.targets ? [...phase.targets] : undefined }));
+	}
+
+	override render(width: number): string[] {
+		const frameWidth = Math.max(20, width);
+		const rows = this.phases.flatMap((phase) => {
+			const left = summarizePhaseLabel(phase);
+			const right = `success · ${formatElapsed(phase.durationMs)}`;
+			const contentWidth = Math.max(1, frameWidth - 2);
+			const leftWidth = Math.max(1, contentWidth - visibleWidth(right) - 1);
+			const leftText = truncateToWidth(left, leftWidth, "");
+			const gap = Math.max(1, contentWidth - visibleWidth(leftText) - visibleWidth(right));
+			const summaryRow = `${theme.fg("toolSuccess", leftText)}${" ".repeat(gap)}${theme.fg("toolSuccess", right)}`;
+			const targetRow = summarizePhaseTargets(phase, contentWidth);
+			return targetRow ? [summaryRow, theme.fg("muted", targetRow)] : [summaryRow];
+		});
+
+		return ["", ...style().border("minimal").borderColor((text) => theme.fg("toolSuccess", text)).render(rows, frameWidth)];
 	}
 }

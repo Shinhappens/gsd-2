@@ -1,3 +1,5 @@
+// Project/App: GSD-2
+// File Purpose: Auto-mode post-unit git, verification, projection, and hook processing.
 /**
  * Post-unit processing for auto-loop — auto-commit, doctor run,
  * state rebuild, projection checks, DB tool closeout, hooks, triage, and
@@ -41,9 +43,10 @@ import {
   diagnoseExpectedArtifact,
 } from "./auto-recovery.js";
 import { regenerateIfMissing } from "./workflow-projections.js";
-import { syncStateToProjectRoot } from "./auto-worktree.js";
+import { WorktreeStateProjection } from "./worktree-state-projection.js";
+import { createWorkspace, scopeMilestone } from "./workspace.js";
 import { normalizeWorktreePathForCompare } from "./worktree-root.js";
-import { isDbAvailable, getTask, getSlice, getMilestone, updateTaskStatus, _getAdapter } from "./gsd-db.js";
+import { isDbAvailable, getTask, getSlice, getMilestone, updateTaskStatus, _getAdapter, getVerificationEvidence } from "./gsd-db.js";
 import { renderPlanCheckboxes } from "./markdown-renderer.js";
 import { consumeSignal } from "./session-status-io.js";
 import {
@@ -87,6 +90,9 @@ function isSamePathLocal(a: string, b: string): boolean {
   return normalizeWorktreePathForCompare(a) === normalizeWorktreePathForCompare(b);
 }
 
+/** Stateless WorktreeStateProjection — methods are pure functions of MilestoneScope. */
+const _worktreeProjection = new WorktreeStateProjection();
+
 /** Maximum verification retry attempts before escalating to blocker placeholder (#2653). */
 const MAX_VERIFICATION_RETRIES = 3;
 /** Keep failure toasts short while still showing concrete examples. */
@@ -102,6 +108,67 @@ function formatPreExecutionCheckDetail(check: PreExecutionCheckJSON): string {
 
 const COMPLETE_MILESTONE_DB_SETTLE_MS = 1500;
 const COMPLETE_MILESTONE_DB_SETTLE_POLL_MS = 100;
+
+function stripKnownIdPrefix(value: string | undefined | null, id: string): string | undefined {
+  const raw = String(value ?? "").trim();
+  if (!raw) return undefined;
+  const lower = raw.toLowerCase();
+  const idLower = id.toLowerCase();
+  if (lower.startsWith(`${idLower}:`)) return raw.slice(id.length + 1).trim() || undefined;
+  return raw;
+}
+
+async function buildTaskCommitContextForUnit(
+  basePath: string,
+  unitId: string,
+): Promise<TaskCommitContext | undefined> {
+  const { milestone: mid, slice: sid, task: tid } = parseUnitId(unitId);
+  if (!mid || !sid || !tid) return undefined;
+
+  const milestone = isDbAvailable() ? getMilestone(mid) : null;
+  const slice = isDbAvailable() ? getSlice(mid, sid) : null;
+  const task = isDbAvailable() ? getTask(mid, sid, tid) : null;
+  let summary: ReturnType<typeof parseSummary> | null = null;
+
+  const summaryPath = resolveTaskFile(basePath, mid, sid, tid, "SUMMARY");
+  if (summaryPath) {
+    try {
+      const summaryContent = await loadFile(summaryPath);
+      if (summaryContent) summary = parseSummary(summaryContent);
+    } catch (e) {
+      debugLog("postUnit", { phase: "task-summary-parse", error: String(e) });
+    }
+  }
+
+  if (!summary && !task) return undefined;
+
+  let ghIssueNumber: number | undefined;
+  try {
+    const { getTaskIssueNumberForCommit } = await import("../github-sync/sync.js");
+    ghIssueNumber = getTaskIssueNumberForCommit(basePath, mid, sid, tid) ?? undefined;
+  } catch (err) {
+    logWarning("engine", `GitHub issue lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  return {
+    taskId: `${sid}/${tid}`,
+    taskDisplayId: tid,
+    taskTitle:
+      stripKnownIdPrefix(summary?.title, tid) ??
+      stripKnownIdPrefix(task?.title, tid) ??
+      tid,
+    milestoneId: mid,
+    milestoneTitle: stripKnownIdPrefix(milestone?.title, mid),
+    sliceId: sid,
+    sliceTitle: stripKnownIdPrefix(slice?.title, sid),
+    oneLiner: summary?.oneLiner || task?.one_liner || undefined,
+    keyFiles:
+      summary?.frontmatter.key_files?.filter(f => !f.includes("{{")) ??
+      task?.key_files ??
+      undefined,
+    issueNumber: ghIssueNumber,
+  };
+}
 
 async function waitForMilestoneDbClose(mid: string): Promise<boolean> {
   const deadline = Date.now() + COMPLETE_MILESTONE_DB_SETTLE_MS;
@@ -134,6 +201,26 @@ function enqueueSidecar(
   if (notification) ctx.ui.notify(notification, "info");
   return "continue";
 }
+
+export function _shouldDispatchTriageForTest(
+  state: Pick<AutoSession, "stepMode" | "currentUnit">,
+): boolean {
+  return !state.stepMode &&
+    !!state.currentUnit &&
+    !state.currentUnit.type.startsWith("hook/") &&
+    state.currentUnit.type !== "triage-captures" &&
+    state.currentUnit.type !== "quick-task";
+}
+
+export function _shouldDispatchQuickTaskForTest(
+  state: Pick<AutoSession, "stepMode" | "currentUnit" | "pendingQuickTasks">,
+): boolean {
+  return !state.stepMode &&
+    state.pendingQuickTasks.length > 0 &&
+    !!state.currentUnit &&
+    state.currentUnit.type !== "quick-task";
+}
+
 /** Unit types that only touch `.gsd/` internal state files (no code changes).
  *  Auto-commit is skipped for these — their state files are picked up by the
  *  next actual task commit via `smartStage()`. */
@@ -276,7 +363,7 @@ export function detectRogueFileWrites(
  * in auto-verification.ts. Exceeding this limit pauses auto-mode instead of
  * looping indefinitely (#2007).
  */
-const MAX_ARTIFACT_VERIFICATION_RETRIES = 3;
+export const MAX_ARTIFACT_VERIFICATION_RETRIES = 3;
 
 export const STEP_COMPLETE_FALLBACK_MESSAGE =
   "Step complete. Run /clear, then /gsd to continue (or /gsd auto to run continuously).";
@@ -357,35 +444,7 @@ export async function autoCommitUnit(
     let taskContext: TaskCommitContext | undefined;
 
     if (unitType === "execute-task") {
-      const { milestone: mid, slice: sid, task: tid } = parseUnitId(unitId);
-      if (mid && sid && tid) {
-        const summaryPath = resolveTaskFile(basePath, mid, sid, tid, "SUMMARY");
-        if (summaryPath) {
-          try {
-            const summaryContent = await loadFile(summaryPath);
-            if (summaryContent) {
-              const summary = parseSummary(summaryContent);
-              let ghIssueNumber: number | undefined;
-              try {
-                const { getTaskIssueNumberForCommit } = await import("../github-sync/sync.js");
-                ghIssueNumber = getTaskIssueNumberForCommit(basePath, mid, sid, tid) ?? undefined;
-              } catch (err) {
-                logWarning("engine", `GitHub issue lookup failed: ${err instanceof Error ? err.message : String(err)}`);
-              }
-
-              taskContext = {
-                taskId: `${sid}/${tid}`,
-                taskTitle: summary.title?.replace(/^T\d+:\s*/, "") || tid,
-                oneLiner: summary.oneLiner || undefined,
-                keyFiles: summary.frontmatter.key_files?.filter(f => !f.includes("{{")) || undefined,
-                issueNumber: ghIssueNumber,
-              };
-            }
-          } catch (e) {
-            debugLog("postUnit", { phase: "task-summary-parse", error: String(e) });
-          }
-        }
-      }
+      taskContext = await buildTaskCommitContextForUnit(basePath, unitId);
     }
 
     _resetHasChangesCache();
@@ -457,37 +516,7 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
       let taskContext: TaskCommitContext | undefined;
 
       if (turnAction === "commit" && s.currentUnit.type === "execute-task") {
-        const { milestone: mid, slice: sid, task: tid } = parseUnitId(s.currentUnit.id);
-        if (mid && sid && tid) {
-          const summaryPath = resolveTaskFile(s.basePath, mid, sid, tid, "SUMMARY");
-          if (summaryPath) {
-            try {
-              const summaryContent = await loadFile(summaryPath);
-              if (summaryContent) {
-                const summary = parseSummary(summaryContent);
-                // Look up GitHub issue number for commit linking
-                let ghIssueNumber: number | undefined;
-                try {
-                  const { getTaskIssueNumberForCommit } = await import("../github-sync/sync.js");
-                  ghIssueNumber = getTaskIssueNumberForCommit(s.basePath, mid, sid, tid) ?? undefined;
-                } catch (err) {
-                  // GitHub sync not available — skip
-                  logWarning("engine", `GitHub issue lookup failed: ${err instanceof Error ? err.message : String(err)}`);
-                }
-
-                taskContext = {
-                  taskId: `${sid}/${tid}`,
-                  taskTitle: summary.title?.replace(/^T\d+:\s*/, "") || tid,
-                  oneLiner: summary.oneLiner || undefined,
-                  keyFiles: summary.frontmatter.key_files?.filter(f => !f.includes("{{")) || undefined,
-                  issueNumber: ghIssueNumber,
-                };
-              }
-            } catch (e) {
-              debugLog("postUnit", { phase: "task-summary-parse", error: String(e) });
-            }
-          }
-        }
+        taskContext = await buildTaskCommitContextForUnit(s.basePath, s.currentUnit.id);
       }
 
       // Invalidate the nativeHasChanges cache before auto-commit (#1853).
@@ -626,7 +655,18 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
     // Sync worktree state back to project root (skipped for lightweight sidecars)
     if (!opts?.skipWorktreeSync && s.originalBasePath && !isSamePathLocal(s.originalBasePath, s.basePath)) {
       await runSafely("postUnit", "worktree-sync", () => {
-        syncStateToProjectRoot(s.basePath, s.originalBasePath!, s.currentMilestoneId);
+        let scope = s.scope;
+        if (!scope && s.currentMilestoneId) {
+          try {
+            scope = scopeMilestone(createWorkspace(s.basePath), s.currentMilestoneId);
+          } catch {
+            // Non-fatal: scope construction can fail on synthetic test paths;
+            // skipping the projection mirrors the prior path-string variant's
+            // early-return behaviour for missing milestone/path inputs.
+            scope = null;
+          }
+        }
+        if (scope) _worktreeProjection.projectWorktreeToRoot(scope);
       });
     }
 
@@ -768,14 +808,16 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
     if (s.currentUnit.type === "triage-captures") {
       try {
         const { executeTriageResolutions } = await import("./triage-resolution.js");
-        const state = await deriveState(s.basePath);
+        const state = await deriveState(s.canonicalProjectRoot);
         const mid = state.activeMilestone?.id ?? "";
         const sid = state.activeSlice?.id ?? "";
 
         // executeTriageResolutions handles defer milestone creation even
         // without an active milestone/slice (the "all milestones complete"
         // scenario from #1562). inject/replan/quick-task still require mid+sid.
-        const triageResult = executeTriageResolutions(s.basePath, mid, sid);
+        // Phase C: write to canonical project root. copyPlanningArtifacts
+        // has been deleted, so triage writes land where readers consult.
+        const triageResult = executeTriageResolutions(s.canonicalProjectRoot, mid, sid);
 
         if (triageResult.injected > 0) {
           ctx.ui.notify(
@@ -850,22 +892,22 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
         }
 
         // Evidence cross-reference (execute-task only)
-        // Verification evidence is passed via the complete-task tool call and
-        // stored in the SUMMARY.md on disk — not available as structured data
-        // in the DB. The evidence collector tracks actual bash tool calls, so
-        // we can still detect units that claimed success but ran no commands.
+        // Only compare against concrete command evidence persisted by the task
+        // completion tool. A prose Verify field can be satisfied later by the
+        // host verification gate, so it is not enough to accuse the unit.
         if (safetyConfig.evidence_cross_reference && s.currentUnit.type === "execute-task") {
           try {
             const actual = getEvidence();
             const bashCalls = actual.filter(e => e.kind === "bash");
-            // If the task is marked complete but zero bash commands were run,
-            // it's suspicious — the LLM may have fabricated results.
             if (sMid && sSid && sTid && isDbAvailable()) {
               const taskRow = getTask(sMid, sSid, sTid);
-              if (taskRow?.status === "complete" && taskRow.verify && bashCalls.length === 0) {
-                logWarning("safety", "task marked complete with verification commands but no bash calls were executed");
+              const claimedCommands = getVerificationEvidence(sMid, sSid, sTid)
+                .map((row) => row.command)
+                .filter((command): command is string => typeof command === "string" && command.trim().length > 0);
+              if (taskRow?.status === "complete" && claimedCommands.length > 0 && bashCalls.length === 0) {
+                logWarning("safety", "task claimed verification command evidence but no execution tool calls were recorded");
                 ctx.ui.notify(
-                  `Safety: task ${sTid} has verification commands but no bash calls were recorded`,
+                  `Safety: task ${sTid} claimed command evidence but no execution tool calls were recorded`,
                   "warning",
                 );
               }
@@ -940,10 +982,14 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
         try {
           const { milestone: mid, slice: sid } = parseUnitId(s.currentUnit.id);
           if (mid && sid) {
-            const regenerated = await regenerateIfMissing(s.basePath, mid, sid, "PLAN");
+            // Phase C: write to the canonical project root (#5236 scope)
+            // so non-symlinked worktrees no longer maintain a separate
+            // local .gsd/ projection. copyPlanningArtifacts has been
+            // deleted; reads + writes converge at projectRoot.
+            const regenerated = await regenerateIfMissing(s.canonicalProjectRoot, mid, sid, "PLAN");
             if (regenerated) {
               // Re-check after regeneration
-              triggerArtifactVerified = verifyExpectedArtifact(s.currentUnit.type, s.currentUnit.id, s.basePath);
+              triggerArtifactVerified = verifyExpectedArtifact(s.currentUnit.type, s.currentUnit.id, s.canonicalProjectRoot);
               if (triggerArtifactVerified) {
                 invalidateAllCaches();
               }
@@ -1178,7 +1224,7 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
           if (mid && sid && tid) {
             try {
               updateTaskStatus(mid, sid, tid, "pending");
-              await renderPlanCheckboxes(s.basePath, mid, sid);
+              await renderPlanCheckboxes(s.canonicalProjectRoot, mid, sid);
             } catch (dbErr) {
               // DB unavailable — fail explicitly rather than silently reverting to markdown mutation.
               // Use 'gsd recover' to rebuild DB state from disk if needed.
@@ -1188,7 +1234,8 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
 
           // 2. Delete SUMMARY.md for the task
           if (mid && sid && tid) {
-            const tasksDir = resolveTasksDir(s.basePath, mid, sid);
+            // Phase C: read+delete via canonical project root.
+            const tasksDir = resolveTasksDir(s.canonicalProjectRoot, mid, sid);
             if (tasksDir) {
               const summaryFile = join(tasksDir, buildTaskFileName(tid, "SUMMARY"));
               if (existsSync(summaryFile)) {
@@ -1199,7 +1246,7 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
 
           // 3. Delete the retry_on artifact (e.g. NEEDS-REWORK.md)
           if (trigger.retryArtifact) {
-            const retryArtifactPath = resolveHookArtifactPath(s.basePath, trigger.unitId, trigger.retryArtifact);
+            const retryArtifactPath = resolveHookArtifactPath(s.canonicalProjectRoot, trigger.unitId, trigger.retryArtifact);
             if (existsSync(retryArtifactPath)) {
               unlinkSync(retryArtifactPath);
             }
@@ -1313,8 +1360,12 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
 
         const strictMode = prefs?.enhanced_verification_strict === true;
 
-        // Run pre-execution checks
-        const result: PreExecutionResult = await runPreExecutionChecks(tasks, s.basePath);
+        // Run pre-execution checks against s.basePath — the actual checkout
+        // where prior-slice files were created.  In worktree isolation,
+        // s.canonicalProjectRoot is the project root and lacks files that a
+        // prior slice wrote to the worktree but hasn't merged to main yet.
+        const preExecutionBasePath = s.basePath;
+        const result: PreExecutionResult = await runPreExecutionChecks(tasks, preExecutionBasePath);
 
         // Log summary to stderr in existing verification output format
         const emoji = result.status === "pass" ? "✅" : result.status === "warn" ? "⚠️" : "❌";
@@ -1331,12 +1382,12 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
         }
 
         // Write evidence JSON to slice artifacts directory
-        const slicePath = resolveSlicePath(s.basePath, mid, sid);
+        const slicePath = resolveSlicePath(preExecutionBasePath, mid, sid);
         const evidenceFileName = `${sid}-PRE-EXEC-VERIFY.json`;
         let evidencePath = join(".gsd", "milestones", mid, "slices", sid, evidenceFileName);
         if (slicePath) {
           writePreExecutionEvidence(result, slicePath, mid, sid);
-          evidencePath = relative(s.basePath, join(slicePath, evidenceFileName)) || evidenceFileName;
+          evidencePath = relative(preExecutionBasePath, join(slicePath, evidenceFileName)) || evidenceFileName;
         }
 
         if (uokFlags.gates) {
@@ -1391,6 +1442,9 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
             ),
             verdictExcerpt: `status=${result.status}; ${blockingCount} blocking issue${blockingCount === 1 ? "" : "s"} detected`,
           };
+          // Track consecutive pre-exec failures per slice for loop detection.
+          const retryKey = currentUnit.id;
+          s.preExecRetryCount.set(retryKey, (s.preExecRetryCount.get(retryKey) ?? 0) + 1);
           preExecPauseNeeded = true;
         } else if (result.status === "warn") {
           ctx.ui.notify(
@@ -1407,8 +1461,16 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
               ),
               verdictExcerpt: `status=${result.status} (strict mode); ${warnChecks.length} warning${warnChecks.length === 1 ? "" : "s"} treated as blocking`,
             };
+            const retryKey = currentUnit.id;
+            s.preExecRetryCount.set(retryKey, (s.preExecRetryCount.get(retryKey) ?? 0) + 1);
             preExecPauseNeeded = true;
           }
+        }
+
+        // Reset the retry counter when checks pass — a successful re-plan
+        // should not carry over a stale failure count into future slices.
+        if (result.status === "pass") {
+          s.preExecRetryCount.delete(currentUnit.id);
         }
 
         debugLog("postUnitPostVerification", {
@@ -1466,27 +1528,22 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
   }
 
   // ── Triage check ──
-  if (
-    !s.stepMode &&
-    s.currentUnit &&
-    !s.currentUnit.type.startsWith("hook/") &&
-    s.currentUnit.type !== "triage-captures" &&
-    s.currentUnit.type !== "quick-task"
-  ) {
+  if (_shouldDispatchTriageForTest(s)) {
     try {
       if (hasPendingCaptures(s.basePath)) {
         const pending = loadPendingCaptures(s.basePath);
         if (pending.length > 0) {
-          const state = await deriveState(s.basePath);
+          const readRoot = s.canonicalProjectRoot;
+          const state = await deriveState(readRoot);
           const mid = state.activeMilestone?.id;
           const sid = state.activeSlice?.id;
 
           if (mid && sid) {
             let currentPlan = "";
             let roadmapContext = "";
-            const planFile = resolveSliceFile(s.basePath, mid, sid, "PLAN");
+            const planFile = resolveSliceFile(readRoot, mid, sid, "PLAN");
             if (planFile) currentPlan = (await loadFile(planFile)) ?? "";
-            const roadmapFile = resolveMilestoneFile(s.basePath, mid, "ROADMAP");
+            const roadmapFile = resolveMilestoneFile(readRoot, mid, "ROADMAP");
             if (roadmapFile) roadmapContext = (await loadFile(roadmapFile)) ?? "";
 
             const capturesList = pending.map(c =>
@@ -1519,12 +1576,7 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
   }
 
   // ── Quick-task dispatch ──
-  if (
-    !s.stepMode &&
-    s.pendingQuickTasks.length > 0 &&
-    s.currentUnit &&
-    s.currentUnit.type !== "quick-task"
-  ) {
+  if (_shouldDispatchQuickTaskForTest(s)) {
     try {
       const capture = s.pendingQuickTasks.shift()!;
       const { buildQuickTaskPrompt } = await import("./triage-resolution.js");
@@ -1554,7 +1606,7 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
   // exits the loop, leaving the user with no hint to /clear and /gsd again.
   if (s.stepMode) {
     try {
-      const nextState = await deriveState(s.basePath);
+      const nextState = await deriveState(s.canonicalProjectRoot);
       ctx.ui.notify(buildStepCompleteMessage(nextState), "info");
     } catch (e) {
       debugLog("postUnit", { phase: "step-wizard-notify", error: String(e) });

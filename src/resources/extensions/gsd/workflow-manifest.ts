@@ -1,29 +1,20 @@
+// Project/App: GSD-2
+// File Purpose: State manifest snapshot and restore orchestration for GSD workflow data.
+
 import {
   _getAdapter,
   readTransaction,
   restoreManifest,
-  type MilestoneRow,
-  type SliceRow,
-  type TaskRow,
 } from "./gsd-db.js";
+import type { MilestoneRow } from "./db-milestone-artifact-rows.js";
+import type { SliceRow, TaskRow } from "./db-task-slice-rows.js";
+import type { VerificationEvidenceRow } from "./db-verification-evidence-rows.js";
 import type { Decision } from "./types.js";
 import { atomicWriteSync } from "./atomic-write.js";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 // ─── Manifest Types ──────────────────────────────────────────────────────
-
-export interface VerificationEvidenceRow {
-  id: number;
-  task_id: string;
-  slice_id: string;
-  milestone_id: string;
-  command: string;
-  exit_code: number | null;
-  verdict: string;
-  duration_ms: number | null;
-  created_at: string;
-}
 
 export interface StateManifest {
   version: 1;

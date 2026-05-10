@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { _withDetachedAutoKeepaliveForTest } from "../auto.ts";
+import { _scheduleAutoStartAfterIdleForTest } from "../guided-flow.ts";
+
 const gsdDir = resolve(import.meta.dirname, "..");
 
 function readGsdFile(relativePath: string): string {
@@ -94,6 +97,23 @@ test("auto bootstrap validates blocked directories before touching .gsd migratio
   );
 });
 
+test("fresh start registers the auto worker before bootstrap enters worktree flow (#5405)", () => {
+  const autoSrc = readGsdFile("auto.ts");
+  const startAutoIdx = autoSrc.indexOf("export async function startAuto(");
+  const startAutoBody = autoSrc.slice(startAutoIdx);
+
+  const preBootstrapRegisterIdx = startAutoBody.indexOf("registerAutoWorkerForSession(s, base);");
+  const bootstrapCallIdx = startAutoBody.indexOf("const ready = await bootstrapAutoSession(");
+
+  assert.ok(startAutoIdx > -1, "startAuto should exist");
+  assert.ok(preBootstrapRegisterIdx > -1, "startAuto should register worker before bootstrap");
+  assert.ok(bootstrapCallIdx > -1, "startAuto should call bootstrapAutoSession");
+  assert.ok(
+    preBootstrapRegisterIdx < bootstrapCallIdx,
+    "worker registration must happen before bootstrap so enterMilestone can claim milestone leases on first entry",
+  );
+});
+
 test("startAutoDetached reports failures asynchronously (#3733)", () => {
   const autoSrc = readGsdFile("auto.ts");
 
@@ -102,13 +122,55 @@ test("startAutoDetached reports failures asynchronously (#3733)", () => {
     "auto.ts should export startAutoDetached",
   );
   assert.ok(
-    autoSrc.includes("void startAuto(ctx, pi, base, verboseMode, options).catch"),
-    "startAutoDetached should launch startAuto without awaiting it",
+    autoSrc.includes("void withDetachedAutoKeepalive(startAuto(ctx, pi, base, verboseMode, options)).catch"),
+    "startAutoDetached should launch startAuto without awaiting it and keep the process alive",
   );
   assert.ok(
     autoSrc.includes("ctx.ui.notify(`Auto-start failed: ${message}`, \"error\")"),
     "startAutoDetached should surface async startup failures to the user",
   );
+});
+
+test("detached auto-start keeps a ref'ed handle until the run settles", async () => {
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  let intervalCreated = false;
+  let intervalCleared = false;
+  let createdHandle: NodeJS.Timeout | undefined;
+  let resolveRun!: () => void;
+  const run = new Promise<void>((resolve) => {
+    resolveRun = resolve;
+  });
+
+  globalThis.setInterval = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+    intervalCreated = true;
+    assert.equal(timeout, 30_000);
+    void handler;
+    void args;
+    createdHandle = originalSetInterval(() => {}, 1_000_000);
+    assert.equal(createdHandle.hasRef(), true, "detached auto keepalive must be ref'ed");
+    return createdHandle;
+  }) as unknown as typeof setInterval;
+
+  globalThis.clearInterval = ((handle?: NodeJS.Timeout | number | string) => {
+    if (handle === createdHandle) intervalCleared = true;
+    return originalClearInterval(handle);
+  }) as unknown as typeof clearInterval;
+
+  try {
+    const heldRun = _withDetachedAutoKeepaliveForTest(run);
+    assert.equal(intervalCreated, true, "keepalive interval should start immediately");
+    assert.equal(intervalCleared, false, "keepalive should remain active while auto-mode is running");
+
+    resolveRun();
+    await heldRun;
+
+    assert.equal(intervalCleared, true, "keepalive interval should clear when auto-mode settles");
+  } finally {
+    if (createdHandle) originalClearInterval(createdHandle);
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+  }
 });
 
 test("detached auto-start preserves milestone lock across pause/stop cleanup (#3733)", () => {
@@ -140,4 +202,41 @@ test("detached auto-start preserves milestone lock across pause/stop cleanup (#3
     sessionSrc.includes("sessionMilestoneLock: string | null = null;"),
     "AutoSession should track the detached milestone lock explicitly",
   );
+});
+
+test("discussion auto-start waits for the current command context to become idle", async () => {
+  let releaseIdle!: () => void;
+  const idle = new Promise<void>((resolveIdle) => {
+    releaseIdle = resolveIdle;
+  });
+  const launches: unknown[][] = [];
+  const ctx = {
+    waitForIdle: () => idle,
+    ui: {
+      notify: () => {},
+    },
+  } as any;
+
+  _scheduleAutoStartAfterIdleForTest(
+    ctx,
+    {} as any,
+    "/tmp/gsd-auto-start-idle-test",
+    false,
+    { step: true },
+    (...args: unknown[]) => {
+      launches.push(args);
+    },
+  );
+
+  await Promise.resolve();
+  assert.equal(launches.length, 0, "auto-start must not launch before waitForIdle resolves");
+
+  releaseIdle();
+  await Promise.resolve();
+  assert.equal(launches.length, 0, "auto-start should defer launch to the next timer turn");
+
+  await new Promise((resolveTimer) => setTimeout(resolveTimer, 0));
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0][2], "/tmp/gsd-auto-start-idle-test");
+  assert.deepEqual(launches[0][4], { step: true });
 });

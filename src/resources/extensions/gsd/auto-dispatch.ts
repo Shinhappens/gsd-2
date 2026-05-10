@@ -14,7 +14,7 @@ import type { GSDPreferences } from "./preferences.js";
 import type { UatType } from "./files.js";
 import type { MinimalModelRegistry } from "./context-budget.js";
 import { loadFile, extractUatType, loadActiveOverrides } from "./files.js";
-import { isDbAvailable, getMilestoneSlices, getPendingGates, markAllGatesOmitted, getMilestone } from "./gsd-db.js";
+import { isDbAvailable, getMilestoneSlices, getPendingGates, markAllGatesOmitted, getMilestone, insertAssessment, transaction } from "./gsd-db.js";
 import { isClosedStatus } from "./status-guards.js";
 import { extractVerdict, isAcceptableUatVerdict } from "./verdict-parser.js";
 
@@ -78,6 +78,8 @@ import {
   type DeepProjectSetupStage,
 } from "./deep-project-setup-policy.js";
 import { annotateBackgroundable } from "./delegation-policy.js";
+import { invalidateAllCaches } from "./cache.js";
+import { insertMilestoneValidationGates } from "./milestone-validation-gates.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -207,6 +209,23 @@ export function getDeepStageGate(prefs: GSDPreferences | undefined, basePath: st
 export function hasPendingDeepStage(prefs: GSDPreferences | undefined, basePath: string): boolean {
   const gate = getDeepStageGate(prefs, basePath);
   return gate.status === "pending" || gate.status === "blocked";
+}
+
+export function shouldRunDeepProjectSetup(
+  state: Pick<GSDState, "phase">,
+  prefs: GSDPreferences | undefined,
+  basePath: string,
+  options: { hasSurvivorBranch?: boolean } = {},
+): boolean {
+  if (options.hasSurvivorBranch === true) return false;
+  if (
+    state.phase !== "pre-planning" &&
+    state.phase !== "needs-discussion" &&
+    state.phase !== "planning"
+  ) {
+    return false;
+  }
+  return hasPendingDeepStage(prefs, basePath);
 }
 
 function missingSliceStop(mid: string, phase: string): DispatchAction {
@@ -690,6 +709,7 @@ export const DISPATCH_RULES: DispatchRule[] = [
       const contextFile = resolveMilestoneFile(basePath, mid, "CONTEXT");
       const hasContext = !!(contextFile && (await loadFile(contextFile)));
       if (hasContext) return null; // fall through to next rule
+      if (prefs?.planning_depth === "deep") return null;
       // H6 fix (#4973): keep the non-deep auto-mode bypass, but do not
       // pre-verify deep planning's user-facing milestone approval gate.
       if (shouldBypassMilestoneDepthGateInAuto(prefs)) {
@@ -918,6 +938,22 @@ export const DISPATCH_RULES: DispatchRule[] = [
       const unitId = `${mid}/${sid}`;
       let priorPreExecFailure: { blockingFindings: string[]; verdictExcerpt: string } | undefined;
       if (session?.lastPreExecFailure?.unitId === unitId) {
+        // Circuit breaker: stop re-dispatching after 2 failed retries. The
+        // planner has had multiple attempts with injected failure context and
+        // still cannot produce a valid plan — human review is required.
+        const MAX_PRE_EXEC_RETRIES = 2;
+        const retryCount = session.preExecRetryCount?.get(unitId) ?? 0;
+        if (retryCount >= MAX_PRE_EXEC_RETRIES) {
+          const findings = session.lastPreExecFailure.blockingFindings.join("; ");
+          session.lastPreExecFailure = null;
+          session.preExecRetryCount?.delete(unitId);
+          return {
+            action: "stop",
+            reason: `Pre-execution checks failed ${retryCount} times for ${unitId} — manual intervention required. Blocking findings: ${findings}. Fix the plan manually, then run /gsd auto to resume.`,
+            level: "error",
+            matchedRule: "planning → plan-slice",
+          };
+        }
         priorPreExecFailure = {
           blockingFindings: session.lastPreExecFailure.blockingFindings,
           verdictExcerpt: session.lastPreExecFailure.verdictExcerpt,
@@ -1203,9 +1239,12 @@ export const DISPATCH_RULES: DispatchRule[] = [
           const skipSource = trivialVariant
             ? "trivial-scope pipeline variant (#4781)"
             : "`skip_milestone_validation` preference";
+          const skipValidationReason = trivialVariant ? "trivial-scope" : "preference";
           const content = [
             "---",
             "verdict: pass",
+            "skip_validation: true",
+            `skip_validation_reason: ${skipValidationReason}`,
             "remediation_round: 0",
             "---",
             "",
@@ -1214,6 +1253,45 @@ export const DISPATCH_RULES: DispatchRule[] = [
             `Milestone validation was skipped via ${skipSource}.`,
           ].join("\n");
           writeFileSync(validationPath, content, "utf-8");
+          try {
+            // DB-backed state derivation keys off assessments, not only the file
+            // projection. Persist the skipped validation there too so the next
+            // loop iteration advances to completing-milestone instead of
+            // re-entering validating-milestone.
+            if (isDbAvailable()) {
+              transaction(() => {
+                insertAssessment({
+                  path: validationPath,
+                  milestoneId: mid,
+                  sliceId: null,
+                  taskId: null,
+                  status: "pass",
+                  scope: "milestone-validation",
+                  fullContent: content,
+                });
+                const gateSliceId = getMilestoneSlices(mid)[0]?.id;
+                if (gateSliceId) {
+                  insertMilestoneValidationGates(
+                    mid,
+                    gateSliceId,
+                    "pass",
+                    new Date().toISOString(),
+                  );
+                }
+              });
+            }
+          } catch (err) {
+            try {
+              unlinkSync(validationPath);
+            } catch (unlinkErr) {
+              logWarning(
+                "dispatch",
+                `failed to remove skipped validation file after DB write failure for ${mid}: ${unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr)}`,
+              );
+            }
+            throw err;
+          }
+          invalidateAllCaches();
         }
         return { action: "skip" };
       }
@@ -1298,7 +1376,9 @@ export const DISPATCH_RULES: DispatchRule[] = [
               if (validationContent) {
                 // Allow completion when validation was intentionally skipped by
                 // preference/budget profile (#3399, #3344).
+                const skippedByMarker = /^skip_validation:\s*true$/im.test(validationContent);
                 const skippedByPreference = /skip(?:ped)?[\s\-]+(?:by|per|due to)\s+(?:preference|budget|profile)/i.test(validationContent);
+                const skippedByTrivialVariant = /trivial-scope pipeline variant/i.test(validationContent);
 
                 // Accept either the structured template format (table with MET/N/A/SATISFIED)
                 // or prose evidence patterns the validation agent may emit.
@@ -1307,7 +1387,12 @@ export const DISPATCH_RULES: DispatchRule[] = [
                   (validationContent.includes("MET") || validationContent.includes("N/A") || validationContent.includes("SATISFIED"));
                 const proseMatch =
                   /[Oo]perational[\s\S]{0,500}?(?:✅|pass|verified|confirmed|met|complete|true|yes|addressed|covered|satisfied|partially|n\/a|not[\s-]+applicable)/i.test(validationContent);
-                const hasOperationalCheck = skippedByPreference || structuredMatch || proseMatch;
+                const hasOperationalCheck =
+                  skippedByMarker ||
+                  skippedByPreference ||
+                  skippedByTrivialVariant ||
+                  structuredMatch ||
+                  proseMatch;
                 if (!hasOperationalCheck) {
                   return {
                     action: "stop" as const,

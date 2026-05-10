@@ -22,11 +22,21 @@ Plan (with integrated research) → Execute (per task) → Complete → Reassess
 - **Reassess** — checks if the roadmap still makes sense
 - **Validate Milestone** — reconciliation gate after all slices complete; compares roadmap success criteria against actual results, catches gaps before sealing the milestone
 
+### Idempotent Milestone Completion
+
+Milestone completion is safe to retry. If a `complete-milestone` unit is redispatched after the database already marks the milestone as closed, GSD treats the call as successful instead of returning an error. The existing summary projection is left intact, no duplicate completion event is appended, and the tool response includes `alreadyComplete: true` in its details so operators and integrations can distinguish a retry from the first completion.
+
 ### State Authority
 
 The SQLite database is the runtime source of truth for milestones, slices, tasks, requirements, decisions, summaries, and completion status. Markdown files in `.gsd/` are rendered projections for review, prompts, and git-friendly history; editing a projection does not override the database unless a command imports or saves that change through GSD.
 
 In worktree mode, the project-root database and project-root `.gsd/` state remain authoritative. Worktree markdown projections are useful diagnostics, but they are not synced back as runtime state. If the database is unavailable, runtime state derivation refuses to silently rebuild from markdown. The legacy markdown derivation path is only enabled when `GSD_ALLOW_MARKDOWN_DERIVE_FALLBACK=1`, which exists for tests and explicit recovery scenarios.
+
+### Single-Host Runtime Constraint
+
+Phase C coordination is single-host only. Auto mode and parallel coordination rely on the project-root SQLite database running in WAL mode on local disk for worker heartbeats, milestone leases, dispatch claims, cancellation requests, and command handoff.
+
+That means multiple terminals or worker processes can safely coordinate against the same project on one machine, but sharing `.gsd/gsd.db*` across machines or over network filesystems is unsupported. If you need cross-host orchestration, use an external coordinator instead of trying to stretch the local SQLite/WAL runtime.
 
 ### Deep Planning Mode
 
@@ -69,6 +79,22 @@ Each auto-mode unit has a `UnitContextManifest` with a `ToolsPolicy`, and GSD en
 
 Writes outside those allowed paths, unsafe bash commands, and subagent dispatch from non-dispatch planning units are blocked with a hard policy error instead of relying on prompt compliance. In `planning-dispatch` units, prompts steer the parent agent toward read-only specialists such as `scout`, `planner`, `researcher`, `reviewer`, `security`, or `tester`; implementation-tier agents still belong in `execute-task`.
 
+### Pre-Dispatch Runtime Blocks
+
+Before auto mode launches a unit, the orchestration pipeline now enforces runtime invariants in this order: reconcile state, choose the next unit, compile the unit tool contract, validate the worktree or unit root, then persist the runtime transition. A failure in any pre-dispatch step returns a `blocked` result and records the block before a worker session starts.
+
+Common block reasons and operator actions:
+
+| Block reason | What it means | Remediation |
+|--------------|---------------|-------------|
+| State reconciliation blocker | The authoritative database snapshot is already blocked, or state derivation found existing blockers. | Inspect `/gsd status`, `STATE.md`, and the database-backed blocker message; resolve the blocker or run the appropriate GSD recovery command before retrying `/gsd auto`. |
+| `unknown-unit-type` | The dispatch decision selected a unit with no registered `UnitContextManifest`. | Fix the unit registration or manifest mapping. Retrying without a code/config fix will select the same invalid unit. |
+| `missing-closeout-tool` | A closeout unit such as task, slice, milestone, UAT, or gate completion has no required workflow tool available. | Restore the missing `gsd_*` workflow tool registration or update the unit manifest/tool contract so the unit can durably save its result. |
+| `root-missing` / `root-not-directory` | A source-writing unit would run from a missing or invalid unit root. | Recreate or repair the milestone worktree/root, or clear an incorrect `GSD_UNIT_ROOT`, before launching another source-writing unit. |
+| `git-metadata-missing` | A source-writing unit root exists but is not a git worktree or repository root. | Run the unit from the project root or milestone worktree with valid `.git` metadata; recreate the worktree if it was deleted or partially copied. |
+
+Recovery classification now treats deterministic policy, tool-schema, stale-worker, and invalid-worktree failures as non-transient stops. Provider failures still use provider-specific transient classification and may retry automatically, while verification drift and unknown runtime failures escalate for inspection because repeating the same dispatch can preserve the drift.
+
 ### Context Pre-Loading
 
 The dispatch prompt is carefully constructed with:
@@ -84,6 +110,19 @@ The dispatch prompt is carefully constructed with:
 
 The amount of context inlined is controlled by your [token profile](./token-optimization.md). Budget mode inlines minimal context; quality mode inlines everything.
 
+### Context Mode
+
+Context Mode is enabled by default for auto-mode runs. Eligible auto-mode units receive manifest-driven guidance to preserve the conversation window: use `gsd_exec` for noisy codebase scans, builds, tests, and diagnostics; use `gsd_exec_search` before repeating a prior sandboxed run; and use `gsd_resume` after compaction or session resume to read a prior compaction snapshot from `.gsd/last-snapshot.md` when one exists.
+
+`gsd_exec` writes capped stdout/stderr and metadata under `.gsd/exec/`; output may be truncated. It then returns only a short digest to the agent. This keeps large command output out of the LLM context while preserving exact evidence on disk. To opt out of Context Mode guidance, snapshot injection, `gsd_exec`, `gsd_exec_search`, and `gsd_resume`, set:
+
+```yaml
+context_mode:
+  enabled: false
+```
+
+You can also tune sandbox behavior with `context_mode.exec_timeout_ms`, `context_mode.exec_stdout_cap_bytes`, `context_mode.exec_digest_chars`, and `context_mode.exec_env_allowlist`.
+
 ### Git Isolation
 
 GSD isolates milestone work using one of three modes (configured via `git.isolation` in preferences):
@@ -96,11 +135,11 @@ See [Git Strategy](./git-strategy.md) for details.
 
 ### Parallel Execution
 
-When your project has independent milestones, you can run them simultaneously. Each milestone gets its own worker process and worktree. See [Parallel Orchestration](./parallel-orchestration.md) for setup and usage.
+When your project has independent milestones, you can run them simultaneously. Each milestone gets its own worker process and worktree, and the shared project-root SQLite/WAL runtime coordinates worker heartbeats, milestone leases, dispatch ownership, retry windows, and control commands on the same machine. See [Parallel Orchestration](./parallel-orchestration.md) for setup and usage.
 
 ### Crash Recovery
 
-A lock file tracks the current unit. If the session dies, the next `/gsd auto` reads the surviving session file, synthesizes a recovery briefing from every tool call that made it to disk, and resumes with full context.
+Auto mode persists worker state, unit-dispatch state, and paused-session metadata in the project-root SQLite database. If the session dies, the next `/gsd auto` reconstructs the interrupted unit from DB-backed runtime state, reads the surviving session file, synthesizes a recovery briefing from every tool call that made it to disk, and resumes with full context.
 
 **Headless auto-restart (v2.26):** When running `gsd headless auto`, crashes trigger automatic restart with exponential backoff (5s → 10s → 30s cap, default 3 attempts). Configure with `--max-restarts N`. SIGINT/SIGTERM bypasses restart. Combined with crash recovery, this enables true overnight "run until done" execution.
 

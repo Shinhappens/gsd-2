@@ -1,3 +1,4 @@
+// GSD2 - Claude Code stream adapter regression tests
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -5,6 +6,8 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
 	makeStreamExhaustedErrorMessage,
+	isClaudeCodeAbortErrorMessage,
+	resolveClaudeCodeAbortedMessageText,
 	getResultErrorMessage,
 	makeAbortedMessage,
 	mergePendingToolCalls,
@@ -13,6 +16,7 @@ import {
 	buildPromptFromContext,
 	buildSdkQueryPrompt,
 	buildSdkOptions,
+	resolveClaudeCodeCwd,
 	createClaudeCodeCanUseToolHandler,
 	buildBashPermissionPattern,
 	buildBashPermissionPatternOptions,
@@ -669,6 +673,45 @@ describe("stream-adapter — session persistence (#2859)", () => {
 		assert.equal(options.model, "claude-sonnet-4-20250514");
 	});
 
+	test("buildSdkOptions prefers explicit cwd over process cwd for local SDK execution", () => {
+		const explicitCwd = "/tmp/gsd-session-root";
+		const options = buildSdkOptions("claude-sonnet-4-20250514", "hello world", undefined, { cwd: explicitCwd });
+		assert.equal(options.cwd, explicitCwd);
+	});
+
+	test("buildSdkOptions uses explicit cwd when auto-detecting workflow MCP launch config", () => {
+		const explicitCwd = realpathSync(mkdtempSync(join(tmpdir(), "claude-sdk-cwd-")));
+		const restore = setWorkflowMcpEnv({});
+		try {
+			delete process.env.GSD_WORKFLOW_MCP_COMMAND;
+			delete process.env.GSD_WORKFLOW_MCP_NAME;
+			delete process.env.GSD_WORKFLOW_MCP_ARGS;
+			delete process.env.GSD_WORKFLOW_MCP_ENV;
+			delete process.env.GSD_WORKFLOW_MCP_CWD;
+
+			const distDir = join(explicitCwd, "packages", "mcp-server", "dist");
+			mkdirSync(distDir, { recursive: true });
+			writeFileSync(join(distDir, "cli.js"), "#!/usr/bin/env node\n");
+
+			const options = buildSdkOptions("claude-sonnet-4-20250514", "hello world", undefined, { cwd: explicitCwd });
+			const mcpServers = options.mcpServers as Record<string, any>;
+			assert.equal(mcpServers["gsd-workflow"].cwd, explicitCwd);
+			assert.equal(mcpServers["gsd-workflow"].env.GSD_WORKFLOW_PROJECT_ROOT, explicitCwd);
+		} finally {
+			restore();
+			rmSync(explicitCwd, { recursive: true, force: true });
+		}
+	});
+
+	test("resolveClaudeCodeCwd falls back to process cwd when no stream cwd is provided", () => {
+		assert.equal(resolveClaudeCodeCwd(), process.cwd());
+		assert.equal(resolveClaudeCodeCwd({ cwd: "   " }), process.cwd());
+	});
+
+	test("resolveClaudeCodeCwd returns stream cwd when provided", () => {
+		assert.equal(resolveClaudeCodeCwd({ cwd: "/tmp/current-session" }), "/tmp/current-session");
+	});
+
 	test("buildSdkOptions enables betas for sonnet models", () => {
 		const sonnetOpts = buildSdkOptions("claude-sonnet-4-20250514", "test");
 		assert.ok(
@@ -1212,6 +1255,12 @@ describe("stream-adapter — MCP elicitation bridge", () => {
 // ---------------------------------------------------------------------------
 
 describe("stream-adapter — abort classification (F2)", () => {
+	test("recognizes Claude Code SDK abort exceptions", () => {
+		assert.equal(isClaudeCodeAbortErrorMessage("Claude Code process aborted by user"), true);
+		assert.equal(isClaudeCodeAbortErrorMessage("Request aborted by user"), true);
+		assert.equal(isClaudeCodeAbortErrorMessage("rate limit exceeded"), false);
+	});
+
 	test("makeAbortedMessage sets stopReason to 'aborted', not 'error'", () => {
 		const message = makeAbortedMessage("claude-sonnet-4-6", "");
 		assert.equal(message.stopReason, "aborted");
@@ -1228,6 +1277,24 @@ describe("stream-adapter — abort classification (F2)", () => {
 		const exhausted = makeStreamExhaustedErrorMessage("claude-sonnet-4-6", "");
 		assert.notEqual(aborted.stopReason, exhausted.stopReason);
 		assert.equal(exhausted.errorMessage, "stream_exhausted_without_result");
+	});
+
+	test("abort catch preserves SDK diagnostic text instead of partial output", () => {
+		const text = resolveClaudeCodeAbortedMessageText(
+			"Request aborted by user\nAPI Error: 529 overloaded",
+			"partial mid-stream text",
+		);
+
+		assert.equal(text, "Request aborted by user\nAPI Error: 529 overloaded");
+	});
+
+	test("abort catch falls back to partial output for bare abort markers", () => {
+		const text = resolveClaudeCodeAbortedMessageText(
+			"Request aborted by user",
+			"partial mid-stream text",
+		);
+
+		assert.equal(text, "partial mid-stream text");
 	});
 });
 

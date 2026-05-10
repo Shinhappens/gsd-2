@@ -1,3 +1,6 @@
+// Project/App: GSD-2
+// File Purpose: Workflow template commands for starting, listing, and dispatching workflows.
+
 /**
  * GSD Workflow Template Commands — /gsd start, /gsd templates
  *
@@ -15,6 +18,7 @@ import {
   getTemplateInfo,
   loadWorkflowTemplate,
   loadRegistry,
+  isLegacyWorkflowMode,
   type TemplateMatch,
 } from "./workflow-templates.js";
 import { loadPrompt } from "./prompt-loader.js";
@@ -24,6 +28,8 @@ import { isAutoActive, isAutoPaused } from "./auto.js";
 import { getErrorMessage } from "./error-utils.js";
 import { resolvePlugin, type WorkflowPlugin } from "./workflow-plugins.js";
 import { currentDirectoryRoot } from "./commands/context.js";
+import { formatRecommendedProcessPaths } from "./process-task-path.js";
+import { incrementLegacyTelemetry } from "./legacy-telemetry.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -328,6 +334,9 @@ export async function handleStart(
         "  /gsd start bugfix fix login button not responding\n" +
         "  /gsd start spike evaluate auth libraries\n" +
         "  /gsd start hotfix critical: API returns 500\n\n" +
+        "Recommended task paths:\n" +
+        formatRecommendedProcessPaths() +
+        "\n\n" +
         "Flags:\n" +
         "  --dry-run       Preview what would happen without executing\n" +
         "  --issue <ref>   Link to a GitHub issue\n\n" +
@@ -484,6 +493,9 @@ export async function handleStart(
   if (artifactDir) infoLines.push(`Artifacts: ${artifactDir}`);
   infoLines.push(`Branch: ${actualBranch}`);
   ctx.ui.notify(infoLines.join("\n"), "info");
+  if (isLegacyWorkflowMode(template.mode)) {
+    incrementLegacyTelemetry("legacy.workflowEngineUsed");
+  }
 
   const prompt = loadPrompt("workflow-start", {
     templateId,
@@ -649,6 +661,7 @@ export function dispatchMarkdownPhasePlugin(
   if (artifactDir) infoLines.push(`Artifacts: ${artifactDir}`);
   infoLines.push(`Branch: ${actualBranch}`);
   ctx.ui.notify(infoLines.join("\n"), "info");
+  incrementLegacyTelemetry("legacy.workflowEngineUsed");
 
   const prompt = loadPrompt("workflow-start", {
     templateId,

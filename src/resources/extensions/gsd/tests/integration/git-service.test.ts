@@ -1,3 +1,5 @@
+// Project/App: GSD-2
+// File Purpose: Git service integration and commit-message tests.
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, symlinkSync, readFileSync } from "node:fs";
@@ -211,7 +213,12 @@ describe('git-service', async () => {
   test('buildTaskCommitMessage', () => {
     const msg = buildTaskCommitMessage({
       taskId: "S01/T02",
+      taskDisplayId: "T02",
       taskTitle: "implement user authentication",
+      milestoneId: "M001",
+      milestoneTitle: "User management",
+      sliceId: "S01",
+      sliceTitle: "Authentication",
       oneLiner: "Added JWT-based auth with refresh token rotation",
       keyFiles: ["src/auth.ts", "src/middleware/jwt.ts"],
     });
@@ -220,7 +227,12 @@ describe('git-service', async () => {
     assert.ok(msg.includes("JWT-based auth"), "message includes one-liner content");
     assert.ok(msg.includes("- src/auth.ts"), "message body includes key files");
     assert.ok(msg.includes("- src/middleware/jwt.ts"), "message body includes second key file");
+    assert.ok(msg.includes("GSD context:"), "message includes human GSD context block");
+    assert.ok(msg.includes("- Milestone: M001 - User management"), "message includes milestone name");
+    assert.ok(msg.includes("- Slice: S01 - Authentication"), "message includes slice name");
+    assert.ok(msg.includes("- Task: T02 - implement user authentication"), "message includes task name");
     assert.ok(msg.includes("GSD-Task: S01/T02"), "GSD-Task trailer in body");
+    assert.ok(!msg.includes("chore: auto-commit after execute-task"), "message does not use generic fallback");
   });
 
   test('buildTaskCommitMessage sanitizes subject text', () => {
@@ -538,6 +550,60 @@ describe('git-service', async () => {
 
     const status = run("git status --porcelain", repo);
     assert.ok(status.includes("src/unrelated.ts"), "unrelated dirty file remains in working tree");
+
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  // Regression: #5500. The LLM occasionally hallucinates files in
+  // task.keyFiles that were never written. Pre-existing scoped-stage code
+  // ran `git add -- <every keyFile>` and failed the entire commit on the
+  // first missing path. Verify that valid paths still commit and missing
+  // ones are dropped silently.
+  test('GitServiceImpl: scoped staging drops missing keyFiles and commits the rest', () => {
+    const repo = initTempRepo();
+    const svc = new GitServiceImpl(repo);
+
+    createFile(repo, "src/index.ts", "export const ok = true;");
+    // Note: src/commands/list.ts is intentionally NOT created — the LLM
+    // claimed it wrote this file but didn't.
+
+    const msg = svc.autoCommit("execute-task", "M001/S01/T02", [], {
+      taskId: "S01/T02",
+      taskTitle: "wire up command list",
+      oneLiner: "Added list command stub",
+      keyFiles: ["src/index.ts", "src/commands/list.ts"],
+    });
+    assert.ok(msg !== null, "autoCommit succeeds when at least one keyFile exists");
+
+    const committed = run("git show --name-only --format= HEAD", repo);
+    assert.ok(committed.includes("src/index.ts"), "existing key file is committed");
+    assert.ok(!committed.includes("src/commands/list.ts"), "missing key file is silently dropped");
+
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  // Regression: #5500. When ALL keyFiles are bogus, scopedStageTaskFiles
+  // must return false so autoCommit falls back to smartStage. The commit
+  // still goes out (using `git add -A` semantics) instead of failing.
+  test('GitServiceImpl: all missing keyFiles falls back to smartStage', () => {
+    const repo = initTempRepo();
+    const svc = new GitServiceImpl(repo);
+
+    createFile(repo, "src/actually-changed.ts", "export const real = true;");
+
+    const msg = svc.autoCommit("execute-task", "M001/S01/T03", [], {
+      taskId: "S01/T03",
+      taskTitle: "fix path handling",
+      oneLiner: "Hardened path resolution",
+      keyFiles: ["src/wrong/path-1.ts", "src/wrong/path-2.ts"],
+    });
+    assert.ok(msg !== null, "autoCommit falls back to smartStage when all keyFiles are missing");
+
+    const committed = run("git show --name-only --format= HEAD", repo);
+    assert.ok(
+      committed.includes("src/actually-changed.ts"),
+      "smartStage fallback stages real dirty files when scoped staging finds nothing",
+    );
 
     rmSync(repo, { recursive: true, force: true });
   });

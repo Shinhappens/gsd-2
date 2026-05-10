@@ -360,7 +360,7 @@ gsd
 /gsd queue      # queue the next milestone
 ```
 
-Both terminals read and write the same `.gsd/` files. Decisions in terminal 2 are picked up at the next phase boundary automatically.
+Both terminals coordinate through the same project-root GSD runtime. The SQLite database is authoritative, `.gsd/` markdown is refreshed from it, and decisions in terminal 2 are picked up at the next phase boundary automatically as long as both sessions are on the same machine and local checkout.
 
 ---
 

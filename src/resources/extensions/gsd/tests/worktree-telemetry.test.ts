@@ -89,12 +89,57 @@ test("emitAutoExit records reason and unmerged-work signal", () => {
       reason: "pause",
       milestoneId: "M003",
       milestoneMerged: false,
+      isolationMode: "worktree",
+      worktreeActive: true,
     });
     const entries = queryJournal(base, { eventType: "auto-exit" });
     assert.equal(entries.length, 1);
     assert.equal(entries[0].data?.reason, "pause");
     assert.equal(entries[0].data?.milestoneMerged, false);
+    assert.equal(entries[0].data?.isolationMode, "worktree");
+    assert.equal(entries[0].data?.worktreeActive, true);
   } finally { cleanup(base); }
+});
+
+test("summarizeWorktreeTelemetry only counts unmerged exits from active worktrees", (t) => {
+  const base = makeTmpBase();
+  t.after(() => cleanup(base));
+
+  emitAutoExit(base, {
+    reason: "pause",
+    milestoneId: "M003",
+    milestoneMerged: false,
+    isolationMode: "none",
+    worktreeActive: false,
+  });
+  emitAutoExit(base, {
+    reason: "stop",
+    milestoneId: "M004",
+    milestoneMerged: false,
+    isolationMode: "branch",
+    worktreeActive: false,
+  });
+  emitAutoExit(base, {
+    reason: "other",
+    milestoneId: "M005",
+    milestoneMerged: false,
+    isolationMode: "worktree",
+    worktreeActive: false,
+  });
+  emitAutoExit(base, {
+    reason: "blocked",
+    milestoneId: "M006",
+    milestoneMerged: false,
+  });
+
+  const summary = summarizeWorktreeTelemetry(base);
+  assert.equal(summary.exitsWithUnmergedWork, 0);
+  assert.deepStrictEqual(summary.exitsByReason, {
+    "pause": 1,
+    "stop": 1,
+    "other": 1,
+    "blocked": 1,
+  });
 });
 
 test("summarizeWorktreeTelemetry aggregates events correctly", () => {
@@ -110,8 +155,20 @@ test("summarizeWorktreeTelemetry aggregates events correctly", () => {
     emitWorktreeOrphaned(base, "M002", { reason: "in-progress-unmerged", commitsAhead: 2 });
     emitWorktreeOrphaned(base, "M003", { reason: "complete-unmerged" });
 
-    emitAutoExit(base, { reason: "pause", milestoneId: "M002", milestoneMerged: false });
-    emitAutoExit(base, { reason: "stop", milestoneId: "M002", milestoneMerged: false });
+    emitAutoExit(base, {
+      reason: "pause",
+      milestoneId: "M002",
+      milestoneMerged: false,
+      isolationMode: "worktree",
+      worktreeActive: true,
+    });
+    emitAutoExit(base, {
+      reason: "stop",
+      milestoneId: "M002",
+      milestoneMerged: false,
+      isolationMode: "worktree",
+      worktreeActive: true,
+    });
     emitAutoExit(base, { reason: "all-complete", milestoneId: "M001", milestoneMerged: true });
 
     const summary = summarizeWorktreeTelemetry(base);

@@ -102,10 +102,65 @@ describe("ExtensionRunner.emitToolCall", () => {
 		assert.equal(errors[0].event, "tool_call");
 		assert.equal(errors[0].extensionPath, "/test/throwing-ext");
 	});
+
+	it("preserves shutdown in tool_call handler context", async (t) => {
+		const dir = mkdtempSync(join(tmpdir(), "runner-test-"));
+		t.after(() => {
+			rmSync(dir, { recursive: true, force: true });
+		});
+
+		const sessionManager = SessionManager.create(dir, dir);
+		const authStorage = AuthStorage.create();
+		const modelRegistry = new ModelRegistry(authStorage, join(dir, "models.json"));
+		const runtime = makeMinimalRuntime();
+		let shutdownCount = 0;
+		const handlers = new Map();
+		handlers.set("tool_call", [
+			async (_event: unknown, ctx: { shutdown: () => void }) => {
+				ctx.shutdown();
+			},
+		]);
+		const extension = {
+			path: "/test/shutdown-on-tool-call",
+			handlers,
+			commands: new Map(),
+			shortcuts: new Map(),
+			tools: new Map(),
+			flags: new Map(),
+			diagnostics: [],
+		} as unknown as Extension;
+		const runner = new ExtensionRunner([extension], runtime, dir, sessionManager, modelRegistry);
+		runner.bindCore({} as any, {
+			getModel: () => undefined,
+			isIdle: () => true,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {
+				shutdownCount += 1;
+			},
+			getContextUsage: () => undefined,
+			compact: () => {},
+			getSystemPrompt: () => "",
+			setCompactionThresholdOverride: () => {},
+		});
+
+		const errors: any[] = [];
+		runner.onError((err) => errors.push(err));
+
+		await runner.emitToolCall({
+			type: "tool_call",
+			toolCallId: "test-123",
+			toolName: "test_tool",
+			input: {},
+		} as ToolCallEvent);
+
+		assert.equal(shutdownCount, 1);
+		assert.equal(errors.length, 0);
+	});
 });
 
 describe("ExtensionRunner.createContext", () => {
-	it("uses the live process cwd instead of the constructor cwd", (t) => {
+	it("uses the constructor workspace root instead of ambient process cwd", (t) => {
 		const originalCwd = process.cwd();
 		const dir = mkdtempSync(join(tmpdir(), "runner-test-"));
 		const projectDir = join(dir, "project");
@@ -124,8 +179,63 @@ describe("ExtensionRunner.createContext", () => {
 		const realProjectDir = realpathSync(projectDir);
 		process.chdir(realProjectDir);
 
-		assert.equal(runner.createContext().cwd, realProjectDir);
-		assert.equal(runner.createCommandContext().cwd, realProjectDir);
+		assert.equal(runner.createContext().cwd, originalCwd);
+		assert.equal(runner.createCommandContext().cwd, originalCwd);
+	});
+
+	it("does not let lifecycle event handlers close the TUI", async (t) => {
+		const dir = mkdtempSync(join(tmpdir(), "runner-test-"));
+		t.after(() => {
+			rmSync(dir, { recursive: true, force: true });
+		});
+
+		const sessionManager = SessionManager.create(dir, dir);
+		const authStorage = AuthStorage.create();
+		const modelRegistry = new ModelRegistry(authStorage, join(dir, "models.json"));
+		const runtime = makeMinimalRuntime();
+		let shutdownCount = 0;
+		const handlers = new Map();
+		handlers.set("agent_end", [
+			async (_event: unknown, ctx: { shutdown: () => void }) => {
+				ctx.shutdown();
+			},
+		]);
+		const extension = {
+			path: "/test/shutdown-on-agent-end",
+			handlers,
+			commands: new Map(),
+			shortcuts: new Map(),
+			tools: new Map(),
+			flags: new Map(),
+			diagnostics: [],
+		} as unknown as Extension;
+		const runner = new ExtensionRunner([extension], runtime, dir, sessionManager, modelRegistry);
+		runner.bindCore({} as any, {
+			getModel: () => undefined,
+			isIdle: () => true,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {
+				shutdownCount += 1;
+			},
+			getContextUsage: () => undefined,
+			compact: () => {},
+			getSystemPrompt: () => "",
+			setCompactionThresholdOverride: () => {},
+		});
+
+		const errors: any[] = [];
+		runner.onError((err) => errors.push(err));
+
+		await runner.emit({ type: "agent_end", messages: [] } as any);
+
+		assert.equal(shutdownCount, 0);
+		assert.equal(errors.length, 1);
+		assert.equal(errors[0].event, "agent_end");
+		assert.match(errors[0].error, /cannot request TUI shutdown/);
+
+		runner.createCommandContext().shutdown();
+		assert.equal(shutdownCount, 1);
 	});
 });
 

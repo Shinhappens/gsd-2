@@ -82,6 +82,11 @@ function assertToolError(result: unknown, expected: RegExp | string): string {
   return text;
 }
 
+function cacheBustedWorkflowToolsImport(tag: string): string {
+  const extension = import.meta.url.includes("/dist-test/") ? "js" : "ts";
+  return `./workflow-tools.${extension}?${tag}=${randomUUID()}`;
+}
+
 describe("workflow MCP tools", () => {
   it("registers the full headless-safe workflow tool surface", () => {
     const server = makeMockServer();
@@ -132,6 +137,188 @@ describe("workflow MCP tools", () => {
     }
   });
 
+  it("gsd_exec runs by default, preserves cwd, and returns structured metadata", async () => {
+    const base = makeTmpBase();
+    const originalCwd = process.cwd();
+    try {
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const tool = server.tools.find((t) => t.name === "gsd_exec");
+      assert.ok(tool, "exec tool should be registered");
+
+      const result = await tool!.handler({
+        projectDir: base,
+        runtime: "node",
+        script: "console.log(process.cwd()); console.log('context mode default on');",
+        purpose: "default-on smoke",
+      });
+
+      const record = result as any;
+      assert.equal(record.isError, false);
+      assert.match(record.content[0].text as string, /context mode default on/);
+      assert.equal(record.structuredContent.operation, "gsd_exec");
+      assert.equal(record.structuredContent.runtime, "node");
+      assert.ok(existsSync(record.structuredContent.stdout_path), "stdout should be persisted");
+      assert.equal(process.cwd(), originalCwd, "gsd_exec must not mutate process.cwd");
+      assert.match(
+        readFileSync(record.structuredContent.stdout_path, "utf-8"),
+        new RegExp(base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        "script should run relative to the requested projectDir",
+      );
+    } finally {
+      cleanup(base);
+    }
+  });
+
+  it("gsd_exec returns an MCP error when context mode is disabled", async () => {
+    const base = makeTmpBase();
+    try {
+      writeFileSync(
+        join(base, ".gsd", "PREFERENCES.md"),
+        "---\ncontext_mode:\n  enabled: false\n---\n",
+        "utf-8",
+      );
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const tool = server.tools.find((t) => t.name === "gsd_exec");
+      assert.ok(tool, "exec tool should be registered");
+
+      const result = await tool!.handler({
+        projectDir: base,
+        runtime: "bash",
+        script: "echo should-not-run",
+      });
+
+      assertToolError(result, /context_mode\.enabled: false/);
+      assert.equal((result as any).structuredContent.error, "context_mode_disabled");
+    } finally {
+      cleanup(base);
+    }
+  });
+
+  it("gsd_exec is blocked by the MCP discussion-gate write gate", async () => {
+    const base = makeTmpBase();
+    try {
+      writeWriteGateSnapshot(base, { pendingGateId: "depth_verification_M001_confirm" });
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const tool = server.tools.find((t) => t.name === "gsd_exec");
+      assert.ok(tool, "exec tool should be registered");
+
+      const result = await tool!.handler({
+        projectDir: base,
+        runtime: "bash",
+        script: "echo should-not-run",
+      });
+
+      assertToolError(result, /Discussion gate .* has not been confirmed/);
+    } finally {
+      cleanup(base);
+    }
+  });
+
+  it("gsd_exec_search finds a prior gsd_exec run", async () => {
+    const base = makeTmpBase();
+    try {
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const execTool = server.tools.find((t) => t.name === "gsd_exec");
+      const searchTool = server.tools.find((t) => t.name === "gsd_exec_search");
+      assert.ok(execTool, "exec tool should be registered");
+      assert.ok(searchTool, "exec search tool should be registered");
+
+      await execTool!.handler({
+        projectDir: base,
+        runtime: "bash",
+        script: "printf 'needle-output\\n'",
+        purpose: "find-me-later",
+      });
+
+      const result = await searchTool!.handler({
+        projectDir: base,
+        query: "find-me",
+      });
+
+      assert.match((result as any).content[0].text as string, /find-me-later/);
+      assert.equal((result as any).structuredContent.operation, "gsd_exec_search");
+      assert.equal((result as any).structuredContent.matches, 1);
+      assert.match((result as any).structuredContent.results[0].stdout_path, /\.gsd[\\/]exec[\\/].*\.stdout$/);
+    } finally {
+      cleanup(base);
+    }
+  });
+
+  it("gsd_exec_search returns an MCP error when context mode is disabled", async () => {
+    const base = makeTmpBase();
+    try {
+      writeFileSync(
+        join(base, ".gsd", "PREFERENCES.md"),
+        "---\ncontext_mode:\n  enabled: false\n---\n",
+        "utf-8",
+      );
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const tool = server.tools.find((t) => t.name === "gsd_exec_search");
+      assert.ok(tool, "exec search tool should be registered");
+
+      const result = await tool!.handler({ projectDir: base, query: "anything" });
+
+      assertToolError(result, /context_mode\.enabled: false/);
+      assert.equal((result as any).structuredContent.error, "context_mode_disabled");
+    } finally {
+      cleanup(base);
+    }
+  });
+
+  it("gsd_resume reads the context snapshot", async () => {
+    const base = makeTmpBase();
+    try {
+      writeFileSync(
+        join(base, ".gsd", "last-snapshot.md"),
+        "# GSD context snapshot\n\nResume from here.\n",
+        "utf-8",
+      );
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const tool = server.tools.find((t) => t.name === "gsd_resume");
+      assert.ok(tool, "resume tool should be registered");
+
+      const result = await tool!.handler({ projectDir: base });
+
+      assert.match((result as any).content[0].text as string, /Resume from here/);
+      assert.deepEqual((result as any).structuredContent, {
+        operation: "gsd_resume",
+        found: true,
+        bytes: Buffer.byteLength("# GSD context snapshot\n\nResume from here.\n", "utf-8"),
+      });
+    } finally {
+      cleanup(base);
+    }
+  });
+
+  it("gsd_resume returns an MCP error when context mode is disabled", async () => {
+    const base = makeTmpBase();
+    try {
+      writeFileSync(
+        join(base, ".gsd", "PREFERENCES.md"),
+        "---\ncontext_mode:\n  enabled: false\n---\n",
+        "utf-8",
+      );
+      writeFileSync(join(base, ".gsd", "last-snapshot.md"), "# GSD context snapshot\n\nHidden.\n", "utf-8");
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const tool = server.tools.find((t) => t.name === "gsd_resume");
+      assert.ok(tool, "resume tool should be registered");
+
+      const result = await tool!.handler({ projectDir: base });
+
+      assertToolError(result, /context_mode\.enabled: false/);
+      assert.equal((result as any).structuredContent.error, "context_mode_disabled");
+    } finally {
+      cleanup(base);
+    }
+  });
+
   it("gsd_summary_save supports root-level PROJECT artifacts without milestone_id", async () => {
     const base = makeTmpBase();
     try {
@@ -147,10 +334,21 @@ describe("workflow MCP tools", () => {
         "workflow MCP schema must advertise milestone_id as optional for root artifacts",
       );
 
+      const projectFixture = [
+        "# Project",
+        "",
+        "Root artifact",
+        "",
+        "## Milestone Sequence",
+        "",
+        "- [ ] M001: Foundation - Establish the first runnable slice.",
+        "",
+      ].join("\n");
+
       const result = await tool!.handler({
         projectDir: base,
         artifact_type: "PROJECT",
-        content: "# Project\n\nRoot artifact",
+        content: projectFixture,
       });
 
       const text = (result as any).content[0].text as string;
@@ -161,7 +359,7 @@ describe("workflow MCP tools", () => {
       );
       assert.equal(
         readFileSync(join(base, ".gsd", "PROJECT.md"), "utf-8"),
-        "# Project\n\nRoot artifact",
+        projectFixture,
       );
     } finally {
       cleanup(base);
@@ -278,7 +476,9 @@ describe("workflow MCP tools", () => {
     try {
       process.env.GSD_WORKFLOW_PROJECT_ROOT = base;
       process.env.GSD_WORKFLOW_EXECUTORS_MODULE = "data:text/javascript,export default {}";
-      const { registerWorkflowTools: freshRegisterWorkflowTools } = await import(`./workflow-tools.ts?bad-module=${randomUUID()}`);
+      const { registerWorkflowTools: freshRegisterWorkflowTools } = await import(
+        cacheBustedWorkflowToolsImport("bad-module")
+      );
       const server = makeMockServer();
       freshRegisterWorkflowTools(server as any);
       const tool = server.tools.find((t) => t.name === "gsd_summary_save");
@@ -464,7 +664,7 @@ export const executeTaskComplete = async (params, projectDir) => {
       // Fresh import bypasses the cached workflowToolExecutorsPromise so the
       // mock module is actually loaded for this test.
       const { registerWorkflowTools: freshRegisterWorkflowTools } = await import(
-        `./workflow-tools.ts?escalation-test=${randomUUID()}`
+        cacheBustedWorkflowToolsImport("escalation-test")
       );
       const server = makeMockServer();
       freshRegisterWorkflowTools(server as any);

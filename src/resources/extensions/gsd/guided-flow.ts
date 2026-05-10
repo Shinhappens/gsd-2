@@ -30,7 +30,7 @@ import {
   formatInterruptedSessionRunningMessage,
   formatInterruptedSessionSummary,
 } from "./interrupted-session.js";
-import { listUnitRuntimeRecords, clearUnitRuntimeRecord } from "./unit-runtime.js";
+import { listUnitRuntimeRecords, clearUnitRuntimeRecord, isInFlightRuntimePhase } from "./unit-runtime.js";
 import { resolveExpectedArtifactPath } from "./auto.js";
 import { gsdHome } from "./gsd-home.js";
 import {
@@ -70,6 +70,11 @@ import {
 } from "./preparation.js";
 import { verifyExpectedArtifact } from "./auto-recovery.js";
 import { createWorkspace, scopeMilestone, type MilestoneScope } from "./workspace.js";
+import { getPendingGate, extractDepthVerificationMilestoneId } from "./bootstrap/write-gate.js";
+
+export function shouldSkipGitBootstrapAfterInit(result: { gitEnabled?: boolean }): boolean {
+  return result.gitEnabled === false;
+}
 
 // ─── Re-exports (preserve public API for existing importers) ────────────────
 export {
@@ -83,6 +88,38 @@ export {
   buildExistingMilestonesContext,
 } from "./guided-flow-queue.js";
 import { logWarning } from "./workflow-logger.js";
+import { deleteRuntimeKv } from "./db/runtime-kv.js";
+import { PAUSED_SESSION_KV_KEY } from "./interrupted-session.js";
+import { buildWorkflowDispatchContent } from "./workflow-protocol.js";
+import { isFullGsdToolSurfaceRequested, restoreGsdWorkflowTools, scopeGsdWorkflowToolsForDispatch } from "./bootstrap/register-hooks.js";
+
+type AutoStartOptions = Parameters<typeof startAutoDetached>[4];
+type AutoStartLauncher = typeof startAutoDetached;
+
+function scheduleAutoStartAfterIdle(
+  ctx: ExtensionCommandContext,
+  pi: ExtensionAPI,
+  basePath: string,
+  verboseMode: boolean,
+  options?: AutoStartOptions,
+  launch: AutoStartLauncher = startAutoDetached,
+): void {
+  const waitForIdle =
+    typeof (ctx as { waitForIdle?: unknown }).waitForIdle === "function"
+      ? ctx.waitForIdle.bind(ctx)
+      : async () => {};
+  void waitForIdle()
+    .then(() => {
+      setTimeout(() => launch(ctx, pi, basePath, verboseMode, options), 0);
+    })
+    .catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      ctx.ui.notify(`Auto-start failed while waiting for the prior turn to settle: ${message}`, "error");
+      logWarning("guided", `auto-start idle wait failed: ${message}`);
+    });
+}
+
+export const _scheduleAutoStartAfterIdleForTest = scheduleAutoStartAfterIdle;
 
 // ─── Scope-based validator wrappers ──────────────────────────────────────────
 // These thin wrappers accept a MilestoneScope so callers that already hold a
@@ -113,6 +150,22 @@ export function resolveExpectedArtifactPathForScope(
   unitId: string,
 ): string | null {
   return resolveExpectedArtifactPath(unitType, unitId, scope.workspace.projectRoot);
+}
+
+async function runQuickTaskChoice(ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
+  if (!ctx.hasUI) {
+    ctx.ui.notify("Run /gsd quick <task> for small bounded work, or /gsd do <task> for natural-language routing.", "info");
+    return;
+  }
+
+  const task = (await ctx.ui.input("Quick task", "Describe the small task to run with /gsd quick"))?.trim();
+  if (!task) {
+    ctx.ui.notify("Quick task cancelled.", "info");
+    return;
+  }
+
+  const { handleQuick } = await import("./quick.js");
+  await handleQuick(task, ctx, pi);
 }
 
 /**
@@ -154,6 +207,16 @@ function runPlanV2Gate(
     return "block";
   }
   return "pass";
+}
+
+export const _needsPlanV2GateForTest = needsPlanV2Gate;
+export const _runPlanV2GateForTest = runPlanV2Gate;
+
+export function _roadmapHasParseableSlicesForTest(
+  roadmapContent: string | null | undefined,
+): boolean {
+  if (!roadmapContent) return false;
+  return parseRoadmapSlices(roadmapContent).length > 0;
 }
 
 // ─── Commit Instruction Helpers ──────────────────────────────────────────────
@@ -217,7 +280,7 @@ const USER_DRIVEN_DEEP_SETUP_UNITS = new Set([
   "discuss-requirements",
   "research-decision",
 ]);
-const FOREGROUND_DEEP_SETUP_RULE_NAMES = new Set([
+export const FOREGROUND_DEEP_SETUP_RULE_NAMES = new Set([
   "deep: pre-planning (no workflow prefs) → workflow-preferences",
   "deep: pre-planning (no PROJECT) → discuss-project",
   "deep: pre-planning (no REQUIREMENTS) → discuss-requirements",
@@ -408,6 +471,15 @@ export async function checkDeepProjectSetupAfterTurn(
     }
   }
 
+  // R2: a depth-verification gate is still pending — the LLM emitted the
+  // confirmation question (via ask_user_questions or plain chat) but the user
+  // has not approved yet. Returning false keeps the entry in the
+  // pendingDeepProjectSetupMap so the next user message can resume.
+  const pendingGateId = getPendingGate(entry.basePath);
+  if (pendingGateId) {
+    return false;
+  }
+
   return dispatchNextDeepProjectSetupStage(entry);
 }
 
@@ -418,7 +490,7 @@ async function dispatchNextDeepProjectSetupStage(entry: PendingDeepProjectSetupE
 
   if (!hasPendingDeepStage(prefs, entry.basePath)) {
     pendingDeepProjectSetupMap.delete(entry.basePath);
-    startAutoDetached(entry.ctx, entry.pi, entry.basePath, false, { step: entry.step });
+    scheduleAutoStartAfterIdle(entry.ctx, entry.pi, entry.basePath, false, { step: entry.step });
     return true;
   }
 
@@ -451,7 +523,7 @@ async function dispatchNextDeepProjectSetupStage(entry: PendingDeepProjectSetupE
       entry.ctx.ui.notify(result.reason, result.level);
     } else if (hasPendingDeepStage(prefs, entry.basePath)) {
       pendingDeepProjectSetupMap.delete(entry.basePath);
-      startAutoDetached(entry.ctx, entry.pi, entry.basePath, false, { step: entry.step });
+      scheduleAutoStartAfterIdle(entry.ctx, entry.pi, entry.basePath, false, { step: entry.step });
       return true;
     }
     return false;
@@ -459,7 +531,7 @@ async function dispatchNextDeepProjectSetupStage(entry: PendingDeepProjectSetupE
 
   if (!USER_DRIVEN_DEEP_SETUP_UNITS.has(result.unitType)) {
     pendingDeepProjectSetupMap.delete(entry.basePath);
-    startAutoDetached(entry.ctx, entry.pi, entry.basePath, false, { step: entry.step });
+    scheduleAutoStartAfterIdle(entry.ctx, entry.pi, entry.basePath, false, { step: entry.step });
     return true;
   }
 
@@ -491,6 +563,25 @@ export function checkAutoStartAfterDiscuss(): boolean {
   const contextFile = existsSync(contextFilePath) ? contextFilePath : null;
   const roadmapFile = existsSync(roadmapFilePath) ? roadmapFilePath : null;
   if (!contextFile && !roadmapFile) return false; // neither artifact yet — keep waiting
+
+  // Gate 1a: a depth-verification gate is still pending for THIS milestone — the
+  // LLM emitted the confirmation question (via ask_user_questions or plain chat)
+  // but the user has not answered yet. Advancing now would skip the gate and
+  // race ahead with unverified context.
+  const basePathForGate = entry.scope.workspace.projectRoot;
+  const pendingGateId = getPendingGate(basePathForGate);
+  if (pendingGateId) {
+    const pendingMilestoneId = extractDepthVerificationMilestoneId(pendingGateId);
+    // Block advancement if the gate is for THIS milestone, OR if it's a
+    // project/requirements gate (no milestone id encoded) for the deep setup flow.
+    const isProjectGate =
+      pendingGateId === "depth_verification_project_confirm" ||
+      pendingGateId === "depth_verification_requirements_confirm" ||
+      pendingGateId === "depth_verification_research_decision_confirm";
+    if (pendingMilestoneId === milestoneId || isProjectGate) {
+      return false;
+    }
+  }
 
   // Gate 1b: Discriminate plan-blocked from discuss-incomplete when the DB row is queued.
   // If the DB is available and the row is still "queued" but CONTEXT.md already exists on
@@ -626,9 +717,27 @@ export function checkAutoStartAfterDiscuss(): boolean {
     try { unlinkSync(manifestPath); } catch (e) { logWarning("guided", `manifest unlink failed: ${(e as Error).message}`); }
   }
 
+  // R3b: belt-and-suspenders for silent registration failure. The discuss flow
+  // finished and STATE.md exists, but the milestone may never have landed in
+  // the DB. Without this guard, the user sees "Milestone M001 ready." and then
+  // /gsd reports "No Active Milestone".
+  if (isDbAvailable()) {
+    const milestoneRow = getMilestone(milestoneId);
+    if (!milestoneRow) {
+      ctx.ui.notify(
+        `Milestone ${milestoneId}: discuss artifacts on disk but no DB row exists. ` +
+        `PROJECT.md may have failed to register milestones. ` +
+        `Re-save PROJECT.md with canonical "- [ ] M001: Title — One-liner" lines, ` +
+        `then re-run /gsd to recover.`,
+        "error",
+      );
+      return false;
+    }
+  }
+
   pendingAutoStartMap.delete(basePath);
   ctx.ui.notify(`Milestone ${milestoneId} ready.`, "success");
-  startAutoDetached(ctx, pi, basePath, false, { step });
+  scheduleAutoStartAfterIdle(ctx, pi, basePath, false, { step });
   return true;
 }
 
@@ -969,48 +1078,65 @@ async function dispatchWorkflow(
     }
   }
 
-  // Scope tools for discuss flows (#2949).
+  // Scope tools for guided workflow turns (#2949, token-consumption savings).
   // Providers with grammar-based constrained decoding (xAI/Grok) return
   // "Grammar is too complex" when the combined tool schema is too large.
-  // Discuss flows only need a small subset of GSD tools — strip the heavy
-  // planning/execution/completion tools to keep the grammar within limits.
-  let savedTools: string[] | null = null;
-  if (unitType?.startsWith("discuss-")) {
+  // Guided workflow turns only need the active unit's tool surface; strip
+  // unrelated GSD tools and broad non-GSD tools for this queued turn, then
+  // restore so the narrowed surface does not leak into future dispatches.
+  let savedTools: ReturnType<typeof scopeGsdWorkflowToolsForDispatch> = null;
+
+  try {
     const currentTools = pi.getActiveTools();
-    savedTools = currentTools;
-    // Keep all non-GSD tools (builtins, other extensions) and only the
-    // GSD tools on the discuss allowlist.
-    const scopedTools = currentTools.filter(
-      (t) => !t.startsWith("gsd_") || DISCUSS_TOOLS_ALLOWLIST.includes(t),
+    savedTools = {
+      tools: currentTools,
+      visibleSkills: typeof pi.getVisibleSkills === "function" ? pi.getVisibleSkills() : undefined,
+      restoreVisibleSkills: typeof pi.setVisibleSkills === "function",
+    };
+    if (unitType?.startsWith("discuss-") && !isFullGsdToolSurfaceRequested()) {
+      // Keep all non-GSD tools (builtins, other extensions) and only the
+      // GSD tools on the discuss allowlist.
+      const scopedTools = currentTools.filter(
+        (t) => !t.startsWith("gsd_") || DISCUSS_TOOLS_ALLOWLIST.includes(t),
+      );
+      pi.setActiveTools(scopedTools);
+      const scopedState = scopeGsdWorkflowToolsForDispatch(pi, unitType);
+      savedTools = {
+        tools: currentTools,
+        visibleSkills: scopedState?.visibleSkills ?? savedTools.visibleSkills,
+        restoreVisibleSkills: scopedState?.restoreVisibleSkills ?? savedTools.restoreVisibleSkills,
+      };
+      debugLog("discuss-tool-scoping", {
+        unitType,
+        before: currentTools.length,
+        after: pi.getActiveTools().length,
+        removed: currentTools.length - pi.getActiveTools().length,
+      });
+    } else {
+      savedTools = scopeGsdWorkflowToolsForDispatch(pi, unitType) ?? savedTools;
+    }
+
+    const workflowPath = process.env.GSD_WORKFLOW_PATH ?? join(gsdHome(), "agent", "GSD-WORKFLOW.md");
+    const workflow = readFileSync(workflowPath, "utf-8");
+
+    pi.sendMessage(
+      {
+        customType,
+        content: buildWorkflowDispatchContent({ workflow, workflowPath, task: note }),
+        display: false,
+      },
+      { triggerTurn: true },
     );
-    pi.setActiveTools(scopedTools);
-    debugLog("discuss-tool-scoping", {
-      unitType,
-      before: currentTools.length,
-      after: scopedTools.length,
-      removed: currentTools.length - scopedTools.length,
-    });
-  }
-
-  const workflowPath = process.env.GSD_WORKFLOW_PATH ?? join(gsdHome(), "agent", "GSD-WORKFLOW.md");
-  const workflow = readFileSync(workflowPath, "utf-8");
-
-  pi.sendMessage(
-    {
-      customType,
-      content: `Read the following GSD workflow protocol and execute exactly.\n\n${workflow}\n\n## Your Task\n\n${note}`,
-      display: false,
-    },
-    { triggerTurn: true },
-  );
-
-  // Restore full tool set after the message is queued. The LLM turn has
-  // already captured the scoped set — restoring prevents the narrowed
-  // tools from leaking into subsequent dispatches (#3628).
-  if (savedTools) {
-    pi.setActiveTools(savedTools);
+  } finally {
+    // Restore full tool set after the message is queued. The LLM turn has
+    // already captured the scoped set — restoring prevents the narrowed
+    // tools from leaking into subsequent dispatches (#3628). The finally
+    // block ensures restoration even if sendMessage throws.
+    restoreGsdWorkflowTools(pi, savedTools);
   }
 }
+
+export const _dispatchWorkflowForTest = dispatchWorkflow;
 
 function getStructuredQuestionsAvailability(
   pi: ExtensionAPI,
@@ -1737,8 +1863,8 @@ function selfHealRuntimeRecords(basePath: string, ctx: ExtensionContext): { clea
         cleared++;
         continue;
       }
-      // Clear records stuck in dispatched or timeout phase (process died mid-unit)
-      if (phase === "dispatched" || phase === "timeout") {
+      // Clear records stuck in an in-flight phase (process died mid-unit).
+      if (isInFlightRuntimePhase(phase)) {
         clearUnitRuntimeRecord(basePath, unitType, unitId);
         cleared++;
       }
@@ -1912,7 +2038,7 @@ export async function showSmartEntry(
     // No .gsd/ or zombie .gsd/ — run the project init wizard
     const result = await showProjectInit(ctx, pi, basePath, detection);
     if (!result.completed) return; // User cancelled
-    skipGitBootstrap = result.gitEnabled === false;
+    skipGitBootstrap = shouldSkipGitBootstrapAfterInit(result);
 
     // Init wizard bootstrapped .gsd/ — fall through to the normal flow below
     // which will detect "no milestones" and start the discuss prompt
@@ -1963,10 +2089,12 @@ export async function showSmartEntry(
   if (interrupted.classification === "stale") {
     clearLock(basePath);
     if (interrupted.pausedSession) {
+      // Phase C pt 2: paused-session.json migrated to runtime_kv
+      // (global scope, key PAUSED_SESSION_KV_KEY).
       try {
-        unlinkSync(join(gsdRoot(basePath), "runtime", "paused-session.json"));
+        deleteRuntimeKv("global", "", PAUSED_SESSION_KV_KEY);
       } catch (e) {
-        logWarning("guided", `stale pause file cleanup failed: ${(e as Error).message}`, { file: "guided-flow.ts" });
+        logWarning("guided", `stale paused-session DB cleanup failed: ${(e as Error).message}`, { file: "guided-flow.ts" });
       }
     }
   } else if (interrupted.classification === "recoverable") {
@@ -1988,6 +2116,23 @@ export async function showSmartEntry(
         step: interrupted.pausedSession?.stepMode ?? false,
       });
       return;
+    }
+  }
+
+  if (interrupted.classification !== "recoverable") {
+    try {
+      const { autoImportMarkdownHierarchyIfDbMismatch } = await import("./migration-auto-check.js");
+      const result = await autoImportMarkdownHierarchyIfDbMismatch(basePath);
+      if (result.action === "imported") {
+        ctx.ui.notify(
+          `Recovered migrated planning state into gsd.db (${result.reason}): ${result.afterDb.milestones} milestone(s), ${result.afterDb.slices} slice(s), ${result.afterDb.tasks} task(s).`,
+          "info",
+        );
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      ctx.ui.notify(`GSD could not auto-import existing planning state into gsd.db: ${message}`, "warning");
+      logWarning("guided", `planning state auto-import failed: ${message}`, { file: "guided-flow.ts" });
     }
   }
 
@@ -2013,8 +2158,8 @@ export async function showSmartEntry(
   // standard wizard below.
   {
     const prefs = loadEffectiveGSDPreferences(basePath)?.preferences;
-    const { hasPendingDeepStage } = await import("./auto-dispatch.js");
-    if (hasPendingDeepStage(prefs, basePath)) {
+    const { shouldRunDeepProjectSetup } = await import("./auto-dispatch.js");
+    if (shouldRunDeepProjectSetup(state, prefs, basePath)) {
       await startDeepProjectSetupForeground(ctx, pi, basePath, stepMode);
       return;
     }
@@ -2073,6 +2218,7 @@ export async function showSmartEntry(
 
     if (isFirst) {
       // First ever — skip wizard, just ask directly
+      ctx.ui.setStatus("gsd-step", "New Milestone · answer the questions above to plan");
       setPendingAutoStart(basePath, { ctx, pi, basePath, milestoneId: nextId, step: stepMode });
       await dispatchWorkflow(pi, await prepareAndBuildDiscussPrompt(ctx, pi, nextId,
         `New project, milestone ${nextId}. Do NOT read or explore .gsd/ — it's empty scaffolding.`,
@@ -2084,16 +2230,24 @@ export async function showSmartEntry(
         summary: ["No active milestone."],
         actions: [
           {
+            id: "quick_task",
+            label: "Quick task",
+            description: "For small bounded work, run /gsd quick <task> or /gsd do <task>.",
+            recommended: true,
+          },
+          {
             id: "new_milestone",
             label: "Create next milestone",
-            description: "Define what to build next.",
-            recommended: true,
+            description: "Define a larger body of work with planning artifacts.",
           },
         ],
         notYetMessage: "Run /gsd when ready.",
       });
 
-      if (choice === "new_milestone") {
+      if (choice === "quick_task") {
+        await runQuickTaskChoice(ctx, pi);
+      } else if (choice === "new_milestone") {
+        ctx.ui.setStatus("gsd-step", "New Milestone · answer the questions above to plan");
         setPendingAutoStart(basePath, { ctx, pi, basePath, milestoneId: nextId, step: stepMode });
         await dispatchWorkflow(pi, await prepareAndBuildDiscussPrompt(ctx, pi, nextId,
           `New milestone ${nextId}.`,
@@ -2131,10 +2285,15 @@ export async function showSmartEntry(
       summary: ["All milestones complete."],
       actions: [
         {
+          id: "quick_task",
+          label: "Quick task",
+          description: "Do a small bounded task without opening a milestone.",
+          recommended: true,
+        },
+        {
           id: "new_milestone",
           label: "Start new milestone",
           description: "Define and plan the next milestone.",
-          recommended: true,
         },
         {
           id: "status",
@@ -2145,7 +2304,9 @@ export async function showSmartEntry(
       notYetMessage: "Run /gsd when ready.",
     });
 
-    if (choice === "new_milestone") {
+    if (choice === "quick_task") {
+      await runQuickTaskChoice(ctx, pi);
+    } else if (choice === "new_milestone") {
       const milestoneIds = findMilestoneIds(basePath);
       const uniqueMilestoneIds = !!loadEffectiveGSDPreferences()?.preferences?.unique_milestone_ids;
       const nextId = nextMilestoneIdReserved(milestoneIds, uniqueMilestoneIds, basePath);
@@ -2238,8 +2399,7 @@ export async function showSmartEntry(
     if (hasRoadmap) {
       const roadmapContent = await loadFile(roadmapFile!);
       if (roadmapContent) {
-        const parsed = parseRoadmapSlices(roadmapContent);
-        roadmapHasSlices = parsed.length > 0;
+        roadmapHasSlices = _roadmapHasParseableSlicesForTest(roadmapContent);
       }
     }
 
@@ -2250,12 +2410,17 @@ export async function showSmartEntry(
 
       const actions = [
         {
+          id: "quick_task",
+          label: "Quick task instead",
+          description: "Use this when the work is small and should not become a milestone.",
+          recommended: true,
+        },
+        {
           id: "plan",
           label: "Create roadmap",
           description: hasContext
             ? "Context captured. Decompose into slices with a boundary map."
             : "Decompose the milestone into slices with a boundary map.",
-          recommended: true,
         },
         ...(!hasContext ? [{
           id: "discuss",
@@ -2281,7 +2446,10 @@ export async function showSmartEntry(
         notYetMessage: "Run /gsd when ready.",
       });
 
-      if (choice === "plan") {
+      if (choice === "quick_task") {
+        await runQuickTaskChoice(ctx, pi);
+      } else if (choice === "plan") {
+        ctx.ui.setStatus("gsd-step", "Planning Milestone · decomposing into slices");
         setPendingAutoStart(basePath, { ctx, pi, basePath, milestoneId, step: stepMode });
         await dispatchWorkflow(
           pi,
@@ -2414,6 +2582,7 @@ export async function showSmartEntry(
     });
 
     if (choice === "plan") {
+      ctx.ui.setStatus("gsd-step", "Slice Planning · answer the questions above");
       await dispatchWorkflow(
         pi,
         await buildPlanSlicePrompt(milestoneId, milestoneTitle, sliceId, sliceTitle, basePath),
@@ -2476,6 +2645,7 @@ export async function showSmartEntry(
     });
 
     if (choice === "complete") {
+      ctx.ui.setStatus("gsd-step", "Completing Slice · review changes above");
       await dispatchWorkflow(
         pi,
         await buildCompleteSlicePrompt(milestoneId, milestoneTitle, sliceId, sliceTitle, basePath),
@@ -2544,6 +2714,7 @@ export async function showSmartEntry(
     }
 
     if (choice === "execute") {
+      ctx.ui.setStatus("gsd-step", "Executing Task · follow progress above");
       if (hasInterrupted) {
         await dispatchWorkflow(pi, loadPrompt("guided-resume-task", {
           milestoneId,

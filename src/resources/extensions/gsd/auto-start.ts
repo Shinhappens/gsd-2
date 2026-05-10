@@ -1,3 +1,5 @@
+// Project/App: GSD-2
+// File Purpose: Auto-mode bootstrap, worktree recovery, and fresh-start initialization.
 /**
  * Auto-mode bootstrap — fresh-start initialization path.
  *
@@ -65,6 +67,7 @@ import { snapshotSkills } from "./skill-discovery.js";
 import { isDbAvailable, getMilestone, openDatabase, getDbStatus } from "./gsd-db.js";
 import { isClosedStatus } from "./status-guards.js";
 import { classifyMilestoneSummaryContent } from "./milestone-summary-classifier.js";
+import { auditOrphanedPreflightStashes } from "./orphan-stash-audit.js";
 
 import {
   debugLog,
@@ -92,14 +95,24 @@ import {
   resolveDefaultSessionModel,
   resolveDynamicRoutingConfig,
 } from "./preferences-models.js";
-import type { WorktreeResolver } from "./worktree-resolver.js";
+import type { WorktreeLifecycle } from "./worktree-lifecycle.js";
 import { getSessionModelOverride } from "./session-model-override.js";
 
 export interface BootstrapDeps {
   shouldUseWorktreeIsolation: (basePath?: string) => boolean;
   registerSigtermHandler: (basePath: string) => void;
   lockBase: () => string;
-  buildResolver: () => WorktreeResolver;
+  buildLifecycle: () => WorktreeLifecycle;
+}
+
+export function resolveIsolationNoneBranchCheckout(
+  currentBranch: string,
+  integrationBranch: string,
+  isolationMode: string,
+  isRepo: boolean,
+): string | null {
+  if (!isRepo || isolationMode !== "none") return null;
+  return currentBranch.startsWith("milestone/") ? integrationBranch : null;
 }
 
 /**
@@ -114,6 +127,18 @@ export interface BootstrapDeps {
 // Guard constant for consecutive bootstrap attempts that found phase === "complete".
 // Counter moved to AutoSession.consecutiveCompleteBootstraps so s.reset() clears it.
 const MAX_CONSECUTIVE_COMPLETE_BOOTSTRAPS = 2;
+
+export function hasGitIndexLockForTest(basePath: string): boolean {
+  return existsSync(join(basePath, ".git", "index.lock"));
+}
+
+export function _shouldAbortBootstrapForUnavailableDbForTest(
+  gsdDbPath: string,
+  dbAvailable: boolean,
+  pathExists: (path: string) => boolean = existsSync,
+): boolean {
+  return pathExists(gsdDbPath) && !dbAvailable;
+}
 
 export async function openProjectDbIfPresent(basePath: string): Promise<void> {
   const gsdDbPath = resolveProjectRootDbPath(basePath);
@@ -332,6 +357,169 @@ export function auditOrphanedMilestoneBranches(
   return { recovered, warnings };
 }
 
+/**
+ * Pure decision function for picking which orphan milestone the auto-loop
+ * should resume the merge transition for. Extracted so it can be unit-tested
+ * without spinning up a git repo or a SQLite DB.
+ *
+ * Returns the lexicographically-greatest milestone id (e.g. "M002" beats
+ * "M001") whose branch is unmerged AND has commits ahead of main AND whose
+ * status is `complete`. Lex-ordering matches the project's M00x convention,
+ * which is the most-recently-completed milestone in practice.
+ * `isComplete` errors propagate; `commitsAhead` errors are treated as 0.
+ */
+export function _selectResumableMilestone(
+  branchNames: readonly string[],
+  mergedBranches: ReadonlySet<string>,
+  isComplete: (milestoneId: string) => boolean,
+  commitsAhead: (branch: string) => number,
+): string | null {
+  const candidates: string[] = [];
+  for (const branch of branchNames) {
+    if (!branch.startsWith("milestone/")) continue;
+    const milestoneId = branch.slice("milestone/".length);
+    if (mergedBranches.has(branch)) continue;
+    if (!isComplete(milestoneId)) continue;
+    let ahead = 0;
+    try {
+      ahead = commitsAhead(branch);
+    } catch {
+      continue;
+    }
+    if (ahead <= 0) continue;
+    candidates.push(milestoneId);
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort();
+  return candidates[candidates.length - 1];
+}
+
+/**
+ * Find the most-recent completed milestone whose branch still has unmerged
+ * commits ahead of the integration branch. Used by `bootstrapAutoSession`
+ * to seed `s.currentMilestoneId` so the auto-loop's transition guard at
+ * `phases.ts:730` fires on the first iteration after a process restart —
+ * without this, the in-memory-only `s.currentMilestoneId` is `null` after
+ * restart, the guard short-circuits, and the orphaned milestone branch
+ * never gets merged into main (#5538-followup).
+ *
+ * Returns null when isolation is `none`, the DB is unavailable, or no
+ * orphan candidate exists. All git failures degrade silently — startup
+ * must never block on this defensive lookup.
+ */
+export function findUnmergedCompletedMilestone(
+  basePath: string,
+  isolationMode: "worktree" | "branch" | "none",
+): string | null {
+  if (isolationMode === "none") return null;
+  if (!isDbAvailable()) return null;
+
+  let milestoneBranches: string[];
+  try {
+    milestoneBranches = nativeBranchList(basePath, "milestone/*");
+  } catch {
+    return null;
+  }
+  if (milestoneBranches.length === 0) return null;
+
+  let mainBranch: string;
+  try {
+    mainBranch = nativeDetectMainBranch(basePath);
+  } catch {
+    mainBranch = "main";
+  }
+
+  let mergedBranches: Set<string>;
+  try {
+    mergedBranches = new Set(
+      nativeBranchListMerged(basePath, mainBranch, "milestone/*"),
+    );
+  } catch {
+    mergedBranches = new Set();
+  }
+
+  return _selectResumableMilestone(
+    milestoneBranches,
+    mergedBranches,
+    (milestoneId) => {
+      const row = getMilestone(milestoneId);
+      return !!row && row.status === "complete";
+    },
+    (branch) => nativeCommitCountBetween(basePath, mainBranch, branch),
+  );
+}
+
+/**
+ * Run `mergeAndExit` for a milestone whose worktree/branch finalization
+ * never completed in a prior session — the active-milestone in phase
+ * `complete` with a survivor `milestone/<id>` branch still around.
+ *
+ * Wraps the call in try/catch so a thrown error from `_mergeBranchMode`
+ * (made fail-loud in commit 68ef58a3c) is converted into a user-facing
+ * error notify instead of an unhandled exception that propagates through
+ * `bootstrapAutoSession` to the slash-command caller's `.catch` block.
+ *
+ * Returns `{ merged: true }` on success; `{ merged: false, error }` on
+ * throw — caller decides whether to abort bootstrap.
+ */
+export function _finalizeSurvivorBranch(
+  lifecycle: WorktreeLifecycle,
+  milestoneId: string,
+  ui: { notify: (msg: string, level?: "info" | "warning" | "error" | "success") => void },
+): { merged: boolean; error?: unknown } {
+  ui.notify(
+    `Milestone ${milestoneId} is complete but branch/worktree was not finalized. Running merge now.`,
+    "info",
+  );
+  const result = lifecycle.exitMilestone(
+    milestoneId,
+    { merge: true },
+    { notify: ui.notify.bind(ui) },
+  );
+  if (result.ok) return { merged: true };
+  const err = result.cause instanceof Error ? result.cause : new Error(String(result.cause));
+  const msg = err.message;
+  ui.notify(
+    `Survivor-branch finalization for ${milestoneId} failed: ${msg}. Resolve manually and re-run /gsd auto.`,
+    "error",
+  );
+  return { merged: false, error: err };
+}
+
+/**
+ * Merge a milestone whose DB row is `complete` but whose branch is still
+ * unmerged into the integration branch. Called from `bootstrapAutoSession`
+ * for orphans surfaced by `findUnmergedCompletedMilestone`.
+ *
+ * Notifies the user before and after, swallowing errors so a transient git
+ * failure never blocks bootstrap. Returns `{ merged: true }` when the
+ * underlying `mergeAndExit` completes; `{ merged: false, error }` on throw.
+ *
+ * Extracted to keep `bootstrapAutoSession` testable: the merge call and the
+ * notify shape are exercised against a mock resolver in
+ * `tests/orphan-merge-bootstrap.test.ts`.
+ */
+export function _mergeOrphanCompletedMilestone(
+  lifecycle: WorktreeLifecycle,
+  orphanId: string,
+  ui: { notify: (msg: string, level?: "info" | "warning" | "error" | "success") => void },
+): { merged: boolean; error?: unknown } {
+  ui.notify(`Detected unmerged completed milestone ${orphanId}. Merging now.`, "info");
+  const result = lifecycle.exitMilestone(
+    orphanId,
+    { merge: true },
+    { notify: ui.notify.bind(ui) },
+  );
+  if (result.ok) return { merged: true };
+  const err = result.cause instanceof Error ? result.cause : new Error(String(result.cause));
+  const msg = err.message;
+  ui.notify(
+    `Could not merge orphan milestone ${orphanId}: ${msg}. Resolve manually and re-run /gsd auto.`,
+    "warning",
+  );
+  return { merged: false, error: err };
+}
+
 export async function bootstrapAutoSession(
   s: AutoSession,
   ctx: ExtensionCommandContext,
@@ -346,7 +534,7 @@ export async function bootstrapAutoSession(
     shouldUseWorktreeIsolation,
     registerSigtermHandler,
     lockBase,
-    buildResolver,
+    buildLifecycle,
   } = deps;
 
   const dirCheck = validateDirectory(base);
@@ -577,6 +765,39 @@ export async function bootstrapAutoSession(
       logWarning("bootstrap", `orphaned milestone branch audit failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
+    // ── Orphaned preflight-stash audit (#5538-followup) ──
+    // Reapplies pre-merge stashes whose milestone is now complete but whose
+    // postflight pop was skipped by an interrupted merge in a prior session.
+    // Uses `git stash apply` (not pop) so the entry remains as a backup.
+    try {
+      if (isDbAvailable()) {
+        const stashAudit = auditOrphanedPreflightStashes(base, (milestoneId) => {
+          const row = getMilestone(milestoneId);
+          return !!row && isClosedStatus(row.status);
+        });
+        for (const entry of stashAudit.applied) {
+          ctx.ui.notify(
+            `Orphan audit: applied preflight stash ${entry.stashRef} for completed milestone ${entry.milestoneId}. The stash entry is preserved as a backup.`,
+            "info",
+          );
+        }
+        for (const msg of stashAudit.warnings) {
+          ctx.ui.notify(`Orphan audit: ${msg}`, "warning");
+        }
+        if (stashAudit.applied.length > 0) {
+          debugLog("orphan-stash-audit", {
+            applied: stashAudit.applied,
+            warnings: stashAudit.warnings,
+          });
+        }
+      }
+    } catch (err) {
+      logWarning(
+        "bootstrap",
+        `orphaned preflight-stash audit failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
     let state = await deriveState(base);
 
     // Stale worktree state recovery (#654)
@@ -649,26 +870,69 @@ export async function bootstrapAutoSession(
     // hasSurvivorBranch after a successful promotion.
     if (decideSurvivorAction(hasSurvivorBranch, state.phase) === "finalize") {
       const mid = state.activeMilestone!.id;
-      ctx.ui.notify(
-        `Milestone ${mid} is complete but branch/worktree was not finalized. Running merge now.`,
-        "info",
-      );
-      const resolver = buildResolver();
-      resolver.mergeAndExit(mid, {
-        notify: ctx.ui.notify.bind(ctx.ui),
-      });
+      // Commit 68ef58a3c made `_mergeBranchMode` throw on wrong-branch
+      // instead of returning false silently. Wrap the call so the throw is
+      // converted into an error notify + clean bootstrap abort, not an
+      // unhandled exception propagating to the slash-command caller (#5549
+      // post-merge audit, R2).
+      const finalize = _finalizeSurvivorBranch(buildLifecycle(), mid, ctx.ui);
+      if (!finalize.merged) {
+        return releaseLockAndReturn();
+      }
       invalidateAllCaches();
       state = await deriveState(base);
       // Clear survivor flag — finalization is done
       hasSurvivorBranch = false;
     }
 
-    const deepProjectStagePending = !hasSurvivorBranch
-      ? (await import("./auto-dispatch.js")).hasPendingDeepStage(
-          loadEffectiveGSDPreferences(base)?.preferences,
-          base,
-        )
-      : false;
+    // ── Orphan-completed-milestone merge (#5538-followup) ──
+    // A process killed between `complete-milestone` (DB flip + SUMMARY write)
+    // and the loop's transition-guard merge strands the milestone branch
+    // forever: `s.currentMilestoneId` is in-memory only, so on the next
+    // bootstrap the guard at phases.ts:730 sees `mid === s.currentMilestoneId`
+    // and short-circuits.
+    //
+    // The earlier attempt at this fix seeded `s.currentMilestoneId` to the
+    // orphan id pre-state-derivation, but the unconditional assignment at
+    // line 948 (`s.currentMilestoneId = state.activeMilestone?.id ?? null`)
+    // immediately overwrote the seed. Active-merge is the more durable fix:
+    // call `mergeAndExit` directly during bootstrap, then re-derive state so
+    // the loop's normal flow continues without an in-memory hint.
+    //
+    // Mirrors the survivor-finalize block above. Failures degrade to a
+    // warning notify so a transient git error doesn't block bootstrap.
+    {
+      const orphan = findUnmergedCompletedMilestone(base, getIsolationMode(base));
+      if (orphan && orphan !== state.activeMilestone?.id) {
+        // ADR-016 phase 2 / B4 (#5622): the swap-run-revert protocol for
+        // the orphan-merge dance is owned by `adoptOrphanWorktree`. The
+        // verb snapshots prior `s.basePath` / `s.originalBasePath`, swaps
+        // into the orphan worktree, runs the merge callback under the
+        // swap, and reverts (or holds the swap) based on the result.
+        // Callers can no longer forget the revert step on failure — the
+        // pattern that originally motivated this verb.
+        const lifecycle = buildLifecycle();
+        const result = lifecycle.adoptOrphanWorktree(orphan, base, () =>
+          _mergeOrphanCompletedMilestone(lifecycle, orphan, ctx.ui),
+        );
+        if (!result.merged) {
+          // Verb already restored basePath/originalBasePath to `base` and
+          // chdir'd there. Return early.
+          return releaseLockAndReturn();
+        }
+        invalidateAllCaches();
+        state = await deriveState(base);
+      }
+    }
+
+    const effectivePrefs = loadEffectiveGSDPreferences(base)?.preferences;
+    const { shouldRunDeepProjectSetup } = await import("./auto-dispatch.js");
+    const deepProjectStagePending = shouldRunDeepProjectSetup(
+      state,
+      effectivePrefs,
+      base,
+      { hasSurvivorBranch },
+    );
 
     if (deepProjectStagePending) {
       // Deep project-level setup runs before the first milestone exists. Let
@@ -714,7 +978,7 @@ export async function bootstrapAutoSession(
         const mid = state.activeMilestone!.id;
         const contextFile = resolveMilestoneFile(base, mid, "CONTEXT");
         const hasContext = !!(contextFile && (await loadFile(contextFile)));
-        if (!hasContext) {
+        if (!hasContext && effectivePrefs?.planning_depth !== "deep") {
           const { showSmartEntry } = await import("./guided-flow.js");
           await showSmartEntry(ctx, pi, base, { step: requestedStepMode });
 
@@ -771,7 +1035,10 @@ export async function bootstrapAutoSession(
     s.stepMode = requestedStepMode;
     s.verbose = verboseMode;
     s.cmdCtx = ctx;
-    s.basePath = base;
+    // ADR-016 phase 2 / B2 (#5620): single owner of bootstrap basePath
+    // mutation. Sets s.basePath = base and s.originalBasePath = base
+    // (originalBasePath is empty on a fresh bootstrap).
+    buildLifecycle().adoptSessionRoot(base);
     s.unitDispatchCount.clear();
     s.unitRecoveryCount.clear();
     s.lastBudgetAlertLevel = 0;
@@ -788,7 +1055,7 @@ export async function bootstrapAutoSession(
     s.resourceVersionOnStart = readResourceVersion();
     s.pendingQuickTasks = [];
     s.currentUnit = null;
-    s.currentMilestoneId = deepProjectStagePending ? null : state.activeMilestone?.id ?? null;
+    s.currentMilestoneId ??= deepProjectStagePending ? null : state.activeMilestone?.id ?? null;
     s.originalModelId = startModelSnapshot?.id ?? ctx.model?.id ?? null;
     s.originalModelProvider = startModelSnapshot?.provider ?? ctx.model?.provider ?? null;
     s.originalThinkingLevel = startThinkingSnapshot ?? null;
@@ -807,13 +1074,21 @@ export async function bootstrapAutoSession(
     // Guard against stale milestone branch when isolation:none (#3613).
     // A prior session with isolation:branch/worktree may have left HEAD on
     // milestone/<MID>. Auto-checkout back to the integration branch.
-    if (getIsolationMode(base) === "none" && nativeIsRepo(base)) {
+    const isolationMode = getIsolationMode(base);
+    const isRepo = nativeIsRepo(base);
+    if (isolationMode === "none" && isRepo) {
       try {
         const currentBranch = nativeGetCurrentBranch(base);
-        if (currentBranch.startsWith("milestone/")) {
-          const integrationBranch = nativeDetectMainBranch(base);
-          nativeCheckoutBranch(base, integrationBranch);
-          logWarning("bootstrap", `Returned to "${integrationBranch}" — HEAD was on stale milestone branch "${currentBranch}" (isolation: none does not use milestone branches).`);
+        const integrationBranch = nativeDetectMainBranch(base);
+        const branchToCheckout = resolveIsolationNoneBranchCheckout(
+          currentBranch,
+          integrationBranch,
+          isolationMode,
+          isRepo,
+        );
+        if (branchToCheckout) {
+          nativeCheckoutBranch(base, branchToCheckout);
+          logWarning("bootstrap", `Returned to "${branchToCheckout}" — HEAD was on stale milestone branch "${currentBranch}" (isolation: none does not use milestone branches).`);
         }
       } catch (err) {
         logWarning("bootstrap", `Could not auto-checkout from stale milestone branch: ${err instanceof Error ? err.message : String(err)}`);
@@ -821,7 +1096,9 @@ export async function bootstrapAutoSession(
     }
 
     // ── Auto-worktree setup ──
-    s.originalBasePath = base;
+    // s.originalBasePath was set to `base` by `adoptSessionRoot(base)` above
+    // (ADR-016 phase 2 / B2, #5620). The redundant assignment that used to
+    // live here is gone.
 
     const isUnderGsdWorktrees = (p: string): boolean => {
       // Direct layout: /.gsd/worktrees/
@@ -842,9 +1119,34 @@ export async function bootstrapAutoSession(
       !detectWorktreeName(base) &&
       !isUnderGsdWorktrees(base)
     ) {
-      buildResolver().enterMilestone(s.currentMilestoneId, {
+      const enterResult = buildLifecycle().enterMilestone(s.currentMilestoneId, {
         notify: ctx.ui.notify.bind(ctx.ui),
       });
+      if (!enterResult.ok) {
+        s.active = false;
+        if (enterResult.reason === "lease-conflict") {
+          ctx.ui.notify(
+            `Cannot enter milestone ${s.currentMilestoneId}: lease is held by another worker.`,
+            "error",
+          );
+        } else if (enterResult.reason === "creation-failed") {
+          ctx.ui.notify(
+            `Cannot enter milestone ${s.currentMilestoneId}: worktree/branch creation failed. Isolation is degraded.`,
+            "error",
+          );
+        } else if (enterResult.reason === "invalid-milestone-id") {
+          ctx.ui.notify(
+            `Cannot enter milestone ${s.currentMilestoneId}: milestone id is invalid.`,
+            "error",
+          );
+        } else {
+          ctx.ui.notify(
+            `Auto-mode bootstrap stopped: failed to enter milestone ${s.currentMilestoneId} (${enterResult.reason}).`,
+            "error",
+          );
+        }
+        return releaseLockAndReturn();
+      }
       if (s.basePath !== base) {
         // Successfully entered worktree — re-register SIGTERM handler at original base
         registerSigtermHandler(s.originalBasePath);
@@ -862,7 +1164,7 @@ export async function bootstrapAutoSession(
         logError("engine", `failed to initialize project database: ${(err as Error).message}`);
       }
     }
-    if (existsSync(gsdDbPath) && !isDbAvailable()) {
+    if (_shouldAbortBootstrapForUnavailableDbForTest(gsdDbPath, isDbAvailable())) {
       try {
         const { openDatabase: openDb } = await import("./gsd-db.js");
         openDb(gsdDbPath);

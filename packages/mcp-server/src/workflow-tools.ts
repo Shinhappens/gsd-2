@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
+import { WORKFLOW_TOOL_NAMES as CONTRACT_WORKFLOW_TOOL_NAMES } from "@gsd-build/contracts";
 
 import { logAliasUsage } from "./alias-telemetry.js";
 
@@ -577,6 +578,17 @@ async function importLocalModule<T>(relativePath: string): Promise<T> {
   throw lastErr;
 }
 
+async function loadProjectPreferences(projectDir: string): Promise<unknown | null> {
+  const { loadEffectiveGSDPreferences } = await importLocalModule<any>(
+    "../../../src/resources/extensions/gsd/preferences.js",
+  );
+  try {
+    return loadEffectiveGSDPreferences(projectDir).preferences;
+  } catch {
+    return null;
+  }
+}
+
 function getWorkflowExecutorModuleCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
   const candidates: string[] = [];
   const explicitModule = env.GSD_WORKFLOW_EXECUTORS_MODULE?.trim();
@@ -662,43 +674,7 @@ interface McpToolServer {
   ): unknown;
 }
 
-export const WORKFLOW_TOOL_NAMES = [
-  "gsd_decision_save",
-  "gsd_save_decision",
-  "gsd_requirement_update",
-  "gsd_update_requirement",
-  "gsd_requirement_save",
-  "gsd_save_requirement",
-  "gsd_milestone_generate_id",
-  "gsd_generate_milestone_id",
-  "gsd_plan_milestone",
-  "gsd_plan_slice",
-  "gsd_plan_task",
-  "gsd_task_plan",
-  "gsd_replan_slice",
-  "gsd_slice_replan",
-  "gsd_slice_complete",
-  "gsd_complete_slice",
-  "gsd_skip_slice",
-  "gsd_complete_milestone",
-  "gsd_milestone_complete",
-  "gsd_validate_milestone",
-  "gsd_milestone_validate",
-  "gsd_reassess_roadmap",
-  "gsd_roadmap_reassess",
-  "gsd_save_gate_result",
-  "gsd_summary_save",
-  "gsd_task_complete",
-  "gsd_complete_task",
-  "gsd_milestone_status",
-  "gsd_journal_query",
-  // ADR-013 step 3: memory-store tools exposed to external MCP clients.
-  // gsd_memory_graph is namespaced to avoid collision with the existing
-  // gsd_graph tool (project knowledge graph from .gsd/ artifacts).
-  "gsd_capture_thought",
-  "gsd_memory_query",
-  "gsd_memory_graph",
-] as const;
+export const WORKFLOW_TOOL_NAMES = CONTRACT_WORKFLOW_TOOL_NAMES;
 
 const DEFAULT_WORKFLOW_OP_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -1426,6 +1402,30 @@ const journalQueryParams = {
 };
 const journalQuerySchema = z.object(journalQueryParams);
 
+const execRuntimeSchema = z.enum(["bash", "node", "python"]);
+const execParams = {
+  projectDir: projectDirParam,
+  runtime: execRuntimeSchema.describe("Interpreter: bash (-c), node (-e), or python3 (-c)."),
+  script: nonEmptyString("script").describe("Script body. Keep output small; capped stdout/stderr are persisted under .gsd/exec."),
+  purpose: z.string().optional().describe("Short label recorded in meta.json for later review."),
+  timeout_ms: z.number().int().min(1_000).max(600_000).optional().describe("Per-invocation timeout in milliseconds."),
+};
+const execSchema = z.object(execParams);
+
+const execSearchParams = {
+  projectDir: projectDirParam,
+  query: z.string().optional().describe("Substring matched against id and purpose, case-insensitive."),
+  runtime: execRuntimeSchema.optional().describe("Restrict to one runtime."),
+  failing_only: z.boolean().optional().describe("Only non-zero exit codes and timeouts."),
+  limit: z.number().int().min(1).max(200).optional().describe("Max results (default 20, cap 200)."),
+};
+const execSearchSchema = z.object(execSearchParams);
+
+const resumeParams = {
+  projectDir: projectDirParam,
+};
+const resumeSchema = z.object(resumeParams);
+
 /**
  * Wrap a real McpToolServer so every handler we register catches thrown
  * errors and returns a structured `{isError: true, content: [...]}` MCP
@@ -1879,6 +1879,63 @@ export function registerWorkflowTools(realServer: McpToolServer): void {
         return { content: [{ type: "text" as const, text: "No matching journal entries found." }] };
       }
       return { content: [{ type: "text" as const, text: JSON.stringify(entries, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "gsd_exec",
+    "Run a short bash/node/python script in the project directory. Capped stdout/stderr and metadata persist under .gsd/exec; only a digest returns to MCP.",
+    execParams,
+    async (args: Record<string, unknown>) => {
+      const { projectDir, ...params } = parseWorkflowArgs(execSchema, args);
+      await enforceWorkflowWriteGate("gsd_exec", projectDir);
+      const { executeGsdExec } = await importLocalModule<any>(
+        "../../../src/resources/extensions/gsd/tools/exec-tool.js",
+      );
+      return adaptExecutorResult(
+        await runSerializedWorkflowOperation(async () =>
+          executeGsdExec(params, {
+            baseDir: projectDir,
+            preferences: await loadProjectPreferences(projectDir),
+          }),
+        ),
+      );
+    },
+  );
+
+  server.tool(
+    "gsd_exec_search",
+    "Search prior gsd_exec runs from .gsd/exec/*.meta.json without re-running them.",
+    execSearchParams,
+    async (args: Record<string, unknown>) => {
+      const { projectDir, ...params } = parseWorkflowArgs(execSearchSchema, args);
+      const { executeExecSearch } = await importLocalModule<any>(
+        "../../../src/resources/extensions/gsd/tools/exec-search-tool.js",
+      );
+      return adaptExecutorResult(
+        executeExecSearch(params, {
+          baseDir: projectDir,
+          preferences: await loadProjectPreferences(projectDir),
+        }),
+      );
+    },
+  );
+
+  server.tool(
+    "gsd_resume",
+    "Read .gsd/last-snapshot.md so agents can re-orient after compaction or session resume.",
+    resumeParams,
+    async (args: Record<string, unknown>) => {
+      const { projectDir, ...params } = parseWorkflowArgs(resumeSchema, args);
+      const { executeResume } = await importLocalModule<any>(
+        "../../../src/resources/extensions/gsd/tools/resume-tool.js",
+      );
+      return adaptExecutorResult(
+        executeResume(params, {
+          baseDir: projectDir,
+          preferences: await loadProjectPreferences(projectDir),
+        }),
+      );
     },
   );
 

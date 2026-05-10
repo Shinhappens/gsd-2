@@ -159,9 +159,9 @@ export function diagnoseExpectedArtifact(
       }
       return `${relSliceFile(base, mid, sid!, "RESEARCH")} (slice research)`;
     case "plan-slice":
-      return `${relSliceFile(base, mid, sid!, "PLAN")} (slice plan)`;
+      return `${relSliceFile(base, mid, sid!, "PLAN")} plus tasks/T##-PLAN.md files (slice plan and task plans)`;
     case "refine-slice":
-      return `${relSliceFile(base, mid, sid!, "PLAN")} (refined slice plan from sketch)`;
+      return `${relSliceFile(base, mid, sid!, "PLAN")} plus tasks/T##-PLAN.md files (refined slice plan and task plans)`;
     case "execute-task": {
       return `Task ${tid} marked [x] in ${relSliceFile(base, mid, sid!, "PLAN")} + summary written`;
     }

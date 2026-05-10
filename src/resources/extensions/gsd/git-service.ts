@@ -1,3 +1,5 @@
+// Project/App: GSD-2
+// File Purpose: Git operations, commit-message formatting, and turn git actions.
 /**
  * GSD Git Service
  *
@@ -14,6 +16,7 @@ import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { gsdRoot } from "./paths.js";
 import { GIT_NO_PROMPT_ENV } from "./git-constants.js";
 import { loadEffectiveGSDPreferences } from "./preferences.js";
+import { logWarning } from "./workflow-logger.js";
 
 
 import {
@@ -128,6 +131,11 @@ export interface TurnGitActionResult {
 export interface TaskCommitContext {
   taskId: string;
   taskTitle: string;
+  milestoneId?: string;
+  milestoneTitle?: string;
+  sliceId?: string;
+  sliceTitle?: string;
+  taskDisplayId?: string;
   /** The one-liner from the task summary (e.g. "Added retry-aware worker status logging") */
   oneLiner?: string;
   /** Files modified by this task (from task summary frontmatter) */
@@ -169,6 +177,11 @@ export function buildTaskCommitMessage(ctx: TaskCommitContext): string {
     bodyParts.push(fileLines);
   }
 
+  const contextLines = buildTaskCommitContextLines(ctx);
+  if (contextLines.length > 0) {
+    bodyParts.push(`GSD context:\n${contextLines.join("\n")}`);
+  }
+
   // Trailers: GSD-Task first, then Resolves
   bodyParts.push(`GSD-Task: ${ctx.taskId}`);
 
@@ -177,6 +190,28 @@ export function buildTaskCommitMessage(ctx: TaskCommitContext): string {
   }
 
   return `${subject}\n\n${bodyParts.join("\n\n")}`;
+}
+
+function buildTaskCommitContextLines(ctx: TaskCommitContext): string[] {
+  const lines: string[] = [];
+  const milestone = formatNamedContext(ctx.milestoneId, ctx.milestoneTitle);
+  const slice = formatNamedContext(ctx.sliceId, ctx.sliceTitle);
+  const taskId = ctx.taskDisplayId ?? ctx.taskId.split("/").pop();
+  const task = formatNamedContext(taskId, ctx.taskTitle);
+
+  if (milestone) lines.push(`- Milestone: ${milestone}`);
+  if (slice) lines.push(`- Slice: ${slice}`);
+  if (task) lines.push(`- Task: ${task}`);
+  return lines;
+}
+
+function formatNamedContext(id: string | undefined, title: string | undefined): string | null {
+  const cleanId = id?.trim();
+  const cleanTitle = title?.trim();
+  if (!cleanId && !cleanTitle) return null;
+  if (!cleanId) return cleanTitle ?? null;
+  if (!cleanTitle || cleanTitle === cleanId) return cleanId;
+  return `${cleanId} - ${cleanTitle}`;
 }
 
 function sanitizeCommitSubjectDescription(value: string): string {
@@ -722,16 +757,53 @@ export class GitServiceImpl {
     if (keyFiles.length === 0) return false;
 
     const allExclusions = [...RUNTIME_EXCLUSION_PATHS, ...extraExclusions];
-    const paths = Array.from(new Set(
-      keyFiles
-        .map(file => normalizeRepoRelativePath(this.basePath, file))
-        .filter((file): file is string => file !== null)
-        .filter(file => !isExcludedScopedPath(file, allExclusions)),
-    ));
+    const normalized = keyFiles
+      .map(file => normalizeRepoRelativePath(this.basePath, file))
+      .filter((file): file is string => file !== null)
+      .filter(file => !isExcludedScopedPath(file, allExclusions));
+
+    // Drop entries that don't exist on disk. The LLM occasionally lists files
+    // it intended to write but didn't (or names them with wrong casing/path).
+    // Pre-`b304f738b` `git add -A` swallowed these silently; the scoped
+    // pathspec form passes each path explicitly, so a single bad entry made
+    // the whole commit fail (see #5500). Filter so valid paths still commit.
+    const missing: string[] = [];
+    const existing: string[] = [];
+    for (const path of normalized) {
+      if (existsSync(join(this.basePath, path))) {
+        existing.push(path);
+      } else {
+        missing.push(path);
+      }
+    }
+    if (missing.length > 0) {
+      logWarning(
+        "engine",
+        `scoped stage: dropping ${missing.length} non-existent keyFile(s) from task commit: ${missing.join(", ")}`,
+        { file: "git-service.ts" },
+      );
+    }
+
+    const paths = Array.from(new Set(existing));
     if (paths.length === 0) return false;
 
-    nativeAddPaths(this.basePath, paths);
-    return true;
+    try {
+      nativeAddPaths(this.basePath, paths);
+      return true;
+    } catch (err) {
+      // Defense-in-depth: even after existence filtering, libgit2/git can
+      // still reject paths (gitignore matches, case-only differences on
+      // case-insensitive FS, submodule boundaries). Returning false lets
+      // autoCommit fall through to smartStage so the commit still goes out
+      // — restoring the resilience the unscoped path used to provide.
+      const msg = err instanceof Error ? err.message : String(err);
+      logWarning(
+        "engine",
+        `scoped stage failed (${msg}); falling back to smartStage`,
+        { file: "git-service.ts" },
+      );
+      return false;
+    }
   }
 
   /** Tracks whether runtime file cleanup has run this session. */
@@ -1035,7 +1107,7 @@ export function createDraftPR(
   milestoneId: string,
   title: string,
   body: string,
-  opts?: { head?: string; base?: string },
+  opts?: { head?: string; base?: string; env?: NodeJS.ProcessEnv },
 ): string | null {
   try {
     const args = [
@@ -1045,7 +1117,12 @@ export function createDraftPR(
     ];
     if (opts?.head) args.push("--head", opts.head);
     if (opts?.base) args.push("--base", opts.base);
-    const result = execFileSync("gh", args, { cwd: basePath, encoding: "utf8", timeout: 30000, env: GIT_NO_PROMPT_ENV });
+    const result = execFileSync("gh", args, {
+      cwd: basePath,
+      encoding: "utf8",
+      timeout: 30000,
+      env: opts?.env ?? GIT_NO_PROMPT_ENV,
+    });
     return result.trim();
   } catch {
     return null;

@@ -28,7 +28,7 @@ Then do the thing `STATE.md` says to do next.
 ## The Hierarchy
 
 ```
-Milestone  →  a shippable version (4-10 slices)
+Milestone  →  a shippable version (1-10 slices, sized to the work)
   Slice    →  one demoable vertical capability (1-7 tasks)
     Task   →  one context-window-sized unit of work (fits in one session)
 ```
@@ -331,7 +331,7 @@ The **Don't Hand-Roll** and **Common Pitfalls** sections prevent the most expens
 
 **For a milestone (roadmap):**
 1. Read `M###-CONTEXT.md`, `M###-RESEARCH.md`, and `.gsd/DECISIONS.md` if they exist.
-2. Decompose the vision into 4-10 demoable vertical slices.
+2. Decompose the vision into 1-10 demoable vertical slices. Prefer one slice for tiny, single-file, or static work unless the request clearly spans independent capabilities.
 3. Order by risk (high-risk first to validate feasibility early).
 4. Write `M###-ROADMAP.md` with checkboxes, risk levels, dependencies, demo sentences.
 5. **Write the boundary map** — for each slice, specify what it produces (functions, types, interfaces, endpoints) and what it consumes from upstream slices. This forces interface thinking before implementation and enables deterministic verification that slices actually connect.

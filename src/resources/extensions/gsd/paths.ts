@@ -188,9 +188,14 @@ export function resolveDir(parentDir: string, idPrefix: string): string | null {
     // Exact match first (current convention: bare ID)
     const exact = entries.find(e => e.isDirectory() && e.name === idPrefix);
     if (exact) return exact.name;
+    const idLower = idPrefix.toLowerCase();
+    const exactCaseInsensitive = entries.find(
+      e => e.isDirectory() && e.name.toLowerCase() === idLower
+    );
+    if (exactCaseInsensitive) return exactCaseInsensitive.name;
     // Prefix match for legacy descriptor dirs: M001-SOMETHING
     const prefixed = entries.find(
-      e => e.isDirectory() && e.name.startsWith(idPrefix + "-")
+      e => e.isDirectory() && e.name.toLowerCase().startsWith(idLower + "-")
     );
     return prefixed ? prefixed.name : null;
   } catch {

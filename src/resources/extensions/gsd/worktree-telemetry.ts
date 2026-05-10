@@ -42,6 +42,7 @@ function baseEntry(eventType: JournalEntry["eventType"], data: Record<string, un
 // silently fragment the telemetry buckets produced by summarizeWorktreeTelemetry.
 
 export type WorktreeCreatedReason = "create-milestone" | "enter-milestone";
+export type WorktreeIsolationMode = "worktree" | "branch" | "none";
 export type AutoExitReason =
   | "pause"
   | "stop"
@@ -126,6 +127,8 @@ export function emitAutoExit(
     reason: AutoExitReason;
     milestoneId?: string;
     milestoneMerged: boolean;
+    isolationMode?: WorktreeIsolationMode;
+    worktreeActive?: boolean;
   },
 ): void {
   emitJournalEvent(projectRoot, baseEntry("auto-exit", {
@@ -133,6 +136,8 @@ export function emitAutoExit(
     flowId: meta.flowId,
     milestoneId: meta.milestoneId,
     milestoneMerged: meta.milestoneMerged,
+    isolationMode: meta.isolationMode,
+    worktreeActive: meta.worktreeActive,
     exitedAt: now(),
   }));
 }
@@ -222,7 +227,7 @@ export interface WorktreeTelemetrySummary {
   mergeConflicts: number;
   /** Auto-exit reasons and their counts */
   exitsByReason: Record<string, number>;
-  /** Auto-exits where the milestone was NOT merged before exit — the #4761 producer metric */
+  /** Auto-exits from an active worktree where the milestone was NOT merged before exit */
   exitsWithUnmergedWork: number;
   /** Count of canonical-root-redirects (how often #4761 validation would have read stale state) */
   canonicalRedirects: number;
@@ -279,7 +284,7 @@ export function summarizeWorktreeTelemetry(
       case "auto-exit": {
         const reason = typeof d.reason === "string" ? d.reason : "unknown";
         summary.exitsByReason[reason] = (summary.exitsByReason[reason] ?? 0) + 1;
-        if (d.milestoneMerged === false) summary.exitsWithUnmergedWork++;
+        if (d.milestoneMerged === false && d.worktreeActive === true) summary.exitsWithUnmergedWork++;
         break;
       }
       case "canonical-root-redirect":

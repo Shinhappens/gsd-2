@@ -1,3 +1,5 @@
+// Project/App: GSD-2
+// File Purpose: Markdown projection renderer for GSD workflow database rows.
 // GSD Markdown Renderer — DB → Markdown file generation
 //
 // Transforms DB state into correct markdown files on disk.
@@ -23,7 +25,8 @@ import {
   insertArtifact,
   getGateResults,
 } from "./gsd-db.js";
-import type { MilestoneRow, SliceRow, TaskRow, ArtifactRow } from "./gsd-db.js";
+import type { MilestoneRow, ArtifactRow } from "./db-milestone-artifact-rows.js";
+import type { SliceRow, TaskRow } from "./db-task-slice-rows.js";
 import type { GateRow } from "./types.js";
 import {
   resolveMilestoneFile,

@@ -34,11 +34,52 @@ import {
 } from "../auto-worktree.ts";
 import { normalizeWorktreePathForCompare } from "../worktree-root.ts";
 import {
-  WorktreeResolver,
-  type WorktreeResolverDeps,
+  WorktreeLifecycle,
+  type WorktreeLifecycleDeps,
   type NotifyCtx,
-} from "../worktree-resolver.ts";
+} from "../worktree-lifecycle.ts";
+import { type TaskCommitContext } from "../worktree.ts";
+import { WorktreeStateProjection } from "../worktree-state-projection.ts";
+import { resolveWorktreeProjectRoot } from "../worktree-root.ts";
 import { AutoSession } from "../auto/session.ts";
+
+// Test-local: LegacyTestDeps had three fields Lifecycle does not need
+// (shouldUseWorktreeIsolation, syncWorktreeStateBack, captureIntegrationBranch).
+// Permit them in test fixtures so existing override patterns keep working —
+// Lifecycle ignores the extras via structural typing.
+type LegacyTestDeps = WorktreeLifecycleDeps & {
+  shouldUseWorktreeIsolation?: () => boolean;
+  syncWorktreeStateBack?: (
+    mainBasePath: string,
+    worktreePath: string,
+    milestoneId: string,
+  ) => { synced: string[] };
+  captureIntegrationBranch?: (basePath: string, mid: string | undefined) => void;
+  autoCommitCurrentBranch?: (
+    basePath: string,
+    unitType: string,
+    unitId: string,
+    taskContext?: TaskCommitContext,
+  ) => string | null;
+  getCurrentBranch?: (basePath: string) => string;
+  checkoutBranch?: (basePath: string, branch: string) => void;
+  readFileSync?: (path: string, encoding: BufferEncoding) => string;
+};
+
+/** Shim factory preserving the legacy WorktreeResolver throw shape for tests. */
+function makeResolver(s: AutoSession, deps: LegacyTestDeps) {
+  const lifecycle = new WorktreeLifecycle(s, deps);
+  return {
+    get workPath(): string { return s.basePath; },
+    get projectRoot(): string {
+      return resolveWorktreeProjectRoot(s.basePath, s.originalBasePath);
+    },
+    mergeAndExit: (mid: string, ctx: NotifyCtx) => {
+      const r = lifecycle.exitMilestone(mid, { merge: true }, ctx);
+      if (!r.ok && r.cause instanceof Error) throw r.cause;
+    },
+  };
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -69,10 +110,10 @@ function makeSession(overrides?: Partial<{ basePath: string; originalBasePath: s
 
 interface CallLog { fn: string; args: unknown[] }
 
-function makeDeps(overrides?: Partial<WorktreeResolverDeps>): WorktreeResolverDeps & { calls: CallLog[] } {
+function makeDeps(overrides?: Partial<LegacyTestDeps>): LegacyTestDeps & { calls: CallLog[] } {
   const calls: CallLog[] = [];
 
-  const deps: WorktreeResolverDeps & { calls: CallLog[] } = {
+  const deps: LegacyTestDeps & { calls: CallLog[] } = {
     calls,
     isInAutoWorktree: (basePath: string) => {
       calls.push({ fn: "isInAutoWorktree", args: [basePath] });
@@ -103,12 +144,21 @@ function makeDeps(overrides?: Partial<WorktreeResolverDeps>): WorktreeResolverDe
       calls.push({ fn: "getAutoWorktreePath", args: [basePath, milestoneId] });
       return null;
     },
-    autoCommitCurrentBranch: (basePath: string, reason: string, milestoneId: string) => {
-      calls.push({ fn: "autoCommitCurrentBranch", args: [basePath, reason, milestoneId] });
+    autoCommitCurrentBranch: (
+      basePath: string,
+      unitType: string,
+      unitId: string,
+      taskContext?: TaskCommitContext,
+    ) => {
+      calls.push({ fn: "autoCommitCurrentBranch", args: [basePath, unitType, unitId, taskContext] });
+      return null;
     },
     getCurrentBranch: (basePath: string) => {
       calls.push({ fn: "getCurrentBranch", args: [basePath] });
       return "main";
+    },
+    checkoutBranch: (basePath: string, branch: string) => {
+      calls.push({ fn: "checkoutBranch", args: [basePath, branch] });
     },
     autoWorktreeBranch: (milestoneId: string) => `milestone/${milestoneId}`,
     resolveMilestoneFile: (basePath: string, milestoneId: string, fileType: string) => {
@@ -121,11 +171,12 @@ function makeDeps(overrides?: Partial<WorktreeResolverDeps>): WorktreeResolverDe
     },
     GitServiceImpl: class {
       constructor(_basePath: string, _gitConfig: unknown) {}
-    } as unknown as WorktreeResolverDeps["GitServiceImpl"],
+    } as unknown as LegacyTestDeps["GitServiceImpl"],
     loadEffectiveGSDPreferences: () => ({ preferences: { git: {} } }),
     invalidateAllCaches: () => { calls.push({ fn: "invalidateAllCaches", args: [] }); },
-    captureIntegrationBranch: (_basePath: string, _mid: string) => {},
+    captureIntegrationBranch: (_basePath: string, _mid: string | undefined) => {},
     enterBranchModeForMilestone: (_basePath: string, _milestoneId: string) => {},
+    worktreeProjection: new WorktreeStateProjection(),
     ...overrides,
   };
 
@@ -270,7 +321,7 @@ describe("WorktreeResolver: roadmap-fallback skipped when basePath is same physi
     // Override calls ref so we can inspect it directly
     (deps as unknown as { calls: CallLog[] }).calls = calls;
 
-    const resolver = new WorktreeResolver(s, deps);
+    const resolver = makeResolver(s, deps);
     const ctx = makeNotifyCtx();
 
     // mergeAndExit → _mergeWorktreeMode
@@ -316,7 +367,7 @@ describe("WorktreeResolver: roadmap-fallback skipped when basePath is same physi
     });
     (deps as unknown as { calls: CallLog[] }).calls = calls;
 
-    const resolver = new WorktreeResolver(s, deps);
+    const resolver = makeResolver(s, deps);
     const ctx = makeNotifyCtx();
 
     resolver.mergeAndExit("M002", ctx);

@@ -1,10 +1,13 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+// GSD2 - Write gate runtime persistence and policy guards.
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { minimatch } from "minimatch";
 
+import { getIsolationMode } from "../preferences.js";
 import type { ToolsPolicy } from "../unit-context-manifest.js";
 import { logWarning } from "../workflow-logger.js";
+import { isGsdWorktreePath, resolveWorktreeProjectRoot } from "../worktree-root.js";
 
 /**
  * Regex matching milestone CONTEXT.md file names in both legacy M001
@@ -145,6 +148,22 @@ function writeGateSnapshotPath(basePath: string): string {
   return join(basePath, ".gsd", "runtime", "write-gate-state.json");
 }
 
+function ensureWriteGateSnapshotDirectory(basePath: string): void {
+  const gsdPath = join(basePath, ".gsd");
+  if (!existsSync(gsdPath)) {
+    try {
+      const stat = lstatSync(gsdPath);
+      if (stat.isSymbolicLink()) {
+        const target = readlinkSync(gsdPath);
+        mkdirSync(isAbsolute(target) ? target : resolve(basePath, target), { recursive: true });
+      }
+    } catch {
+      // If .gsd truly does not exist, the runtime mkdir below will create it.
+    }
+  }
+  mkdirSync(join(gsdPath, "runtime"), { recursive: true });
+}
+
 function currentWriteGateSnapshot(basePath: string = process.cwd()): WriteGateSnapshot {
   const state = getWriteGateState(basePath);
   return {
@@ -158,7 +177,7 @@ function currentWriteGateSnapshot(basePath: string = process.cwd()): WriteGateSn
 function persistWriteGateSnapshot(basePath: string): void {
   if (!shouldPersistWriteGateSnapshot()) return;
   const path = writeGateSnapshotPath(basePath);
-  mkdirSync(join(basePath, ".gsd", "runtime"), { recursive: true });
+  ensureWriteGateSnapshotDirectory(basePath);
   const tempPath = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   writeFileSync(tempPath, JSON.stringify(currentWriteGateSnapshot(basePath), null, 2), "utf-8");
   try {
@@ -351,8 +370,9 @@ export function shouldBlockPendingGate(
   toolName: string,
   milestoneId: string | null,
   queuePhaseActive?: boolean,
+  basePath: string = process.cwd(),
 ): { block: boolean; reason?: string } {
-  return shouldBlockPendingGateInSnapshot(currentWriteGateSnapshot(), toolName, milestoneId, queuePhaseActive);
+  return shouldBlockPendingGateInSnapshot(currentWriteGateSnapshot(basePath), toolName, milestoneId, queuePhaseActive);
 }
 
 export function shouldBlockPendingGateInSnapshot(
@@ -386,8 +406,9 @@ export function shouldBlockPendingGateBash(
   command: string,
   milestoneId: string | null,
   queuePhaseActive?: boolean,
+  basePath: string = process.cwd(),
 ): { block: boolean; reason?: string } {
-  return shouldBlockPendingGateBashInSnapshot(currentWriteGateSnapshot(), command, milestoneId, queuePhaseActive);
+  return shouldBlockPendingGateBashInSnapshot(currentWriteGateSnapshot(basePath), command, milestoneId, queuePhaseActive);
 }
 
 export function shouldBlockPendingGateBashInSnapshot(
@@ -444,6 +465,7 @@ export function shouldBlockContextWrite(
   inputPath: string,
   milestoneId: string | null,
   _queuePhaseActive?: boolean,
+  basePath: string = process.cwd(),
 ): { block: boolean; reason?: string } {
   if (toolName !== "write") return { block: false };
   if (!MILESTONE_CONTEXT_RE.test(inputPath)) return { block: false };
@@ -460,7 +482,7 @@ export function shouldBlockContextWrite(
     };
   }
 
-  if (isMilestoneDepthVerified(targetMilestoneId)) return { block: false };
+  if (isMilestoneDepthVerified(targetMilestoneId, basePath)) return { block: false };
 
   return {
     block: true,
@@ -483,8 +505,9 @@ export function shouldBlockContextArtifactSave(
   artifactType: string,
   milestoneId: string | null,
   sliceId?: string | null,
+  basePath: string = process.cwd(),
 ): { block: boolean; reason?: string } {
-  return shouldBlockContextArtifactSaveInSnapshot(currentWriteGateSnapshot(), artifactType, milestoneId, sliceId);
+  return shouldBlockContextArtifactSaveInSnapshot(currentWriteGateSnapshot(basePath), artifactType, milestoneId, sliceId);
 }
 
 export function shouldBlockContextArtifactSaveInSnapshot(
@@ -877,4 +900,136 @@ export function shouldBlockPlanningUnit(
   // CONTEXT.md write) catch known mutating shapes; defaulting to allow here
   // avoids breaking gsd_* MCP tools or future safe additions.
   return { block: false };
+}
+
+// ─── Worktree isolation write gate (#5199) ────────────────────────────────
+//
+// When `git.isolation: worktree` is configured, the per-unit commit pipeline
+// only runs inside the auto-mode loop (`auto-post-unit.ts`). If the LLM
+// authors code at the project root before auto-mode is started, those writes
+// land in the working tree but never reach a commit — they're silently
+// orphaned outside git history. This guard blocks those writes at the
+// tool_call seam so the agent receives a clear error instead.
+
+const WORKTREE_GATE_BOOTSTRAP_UNITS = new Set([
+  "discuss-milestone",
+  "plan-milestone",
+  "init",
+]);
+
+function realpathOrResolve(p: string): string {
+  const abs = resolve(p);
+  try {
+    return realpathSync(abs);
+  } catch {
+    // Path doesn't exist (yet) — realpath the deepest existing ancestor so
+    // platforms where /tmp -> /private/tmp don't break containment checks.
+    let dir = abs;
+    const tail: string[] = [];
+    while (dir && dir !== resolve(dir, "..")) {
+      try {
+        const real = realpathSync(dir);
+        return tail.length ? join(real, ...tail.reverse()) : real;
+      } catch {
+        const idx = dir.lastIndexOf(sep);
+        if (idx <= 0) break;
+        tail.push(dir.slice(idx + 1));
+        dir = dir.slice(0, idx) || sep;
+      }
+    }
+    return abs;
+  }
+}
+
+function isPathContained(target: string, container: string): boolean {
+  if (target === container) return true;
+  return target.startsWith(container.endsWith(sep) ? container : container + sep);
+}
+
+/**
+ * Block planning-write tool calls that would land code at the project root
+ * while `git.isolation: worktree` is in effect and auto-mode hasn't created
+ * (or flipped cwd into) the milestone worktree.
+ *
+ * Pure / unit-testable. Callers in `register-hooks.ts` supply the resolved
+ * project root and current auto liveness; this function does no I/O beyond
+ * realpath resolution.
+ *
+ * Allow rules (in order):
+ *   1. Tool isn't a planning-write (write/edit/multi_edit/notebook_edit).
+ *   2. `GSD_DISABLE_WORKTREE_WRITE_GUARD=1` self-hosting bypass.
+ *   3. Isolation mode is not "worktree".
+ *   4. Active unit is a bootstrap unit (discuss-milestone/plan-milestone/init).
+ *   5. Target is inside `<projectRoot>/.gsd/worktrees/` (a real worktree).
+ *   6. Target is inside `<projectRoot>/.gsd/` and isn't masquerading as a
+ *      worktrees sibling (rejects the `.gsd/worktrees-extra/…` prefix trick).
+ *   7. Auto is live AND `effectiveBasePath` is itself a `.gsd/worktrees/…` path.
+ *
+ * Otherwise: block with a message that points the agent at `/gsd` to start
+ * auto-mode.
+ */
+export function shouldBlockWorktreeWrite(
+  toolName: string,
+  targetPath: string,
+  effectiveBasePath: string,
+  isAutoLive: boolean,
+  currentUnitType?: string | null,
+): { block: boolean; reason?: string } {
+  const tool = canonicalToolName(toolName);
+  if (!PLANNING_WRITE_TOOLS.has(tool)) return { block: false };
+  if (process.env.GSD_DISABLE_WORKTREE_WRITE_GUARD === "1") return { block: false };
+  if (getIsolationMode(effectiveBasePath) !== "worktree") return { block: false };
+  if (currentUnitType && WORKTREE_GATE_BOOTSTRAP_UNITS.has(currentUnitType)) return { block: false };
+
+  if (!targetPath) {
+    return {
+      block: true,
+      reason: [
+        `HARD BLOCK: ${tool} called with empty path while \`git.isolation: worktree\` is configured`,
+        `and auto-mode is not active. Refusing to allow writes that cannot be located.`,
+      ].join(" "),
+    };
+  }
+
+  // Resolve the target relative to the project root, then realpath to defeat
+  // symlink-based escapes and prefix tricks (e.g. .gsd/worktrees-extra/).
+  const projectRoot = resolveWorktreeProjectRoot(effectiveBasePath);
+  const absTarget = isAbsolute(targetPath) ? targetPath : resolve(projectRoot, targetPath);
+  const realTarget = realpathOrResolve(absTarget);
+  const realRoot = realpathOrResolve(projectRoot);
+  const realGsd = realpathOrResolve(join(projectRoot, ".gsd"));
+  const realWorktreesDir = realpathOrResolve(join(projectRoot, ".gsd", "worktrees"));
+
+  // Allow writes inside the legitimate worktrees subtree.
+  if (isPathContained(realTarget, realWorktreesDir)) return { block: false };
+
+  // Allow writes to .gsd/ planning artifacts, but reject siblings whose name
+  // starts with "worktrees" (the worktrees-extra prefix trick — case 4).
+  if (isPathContained(realTarget, realGsd)) {
+    const rel = relative(realGsd, realTarget);
+    const firstSeg = rel.split(/[\/\\]/)[0] ?? "";
+    if (!firstSeg.startsWith("worktrees")) return { block: false };
+    // fall through: looks like worktrees<something> sibling — block
+  }
+
+  // Auto is live and the caller is operating inside a worktree path —
+  // host tool's write happens in worktree context; let it through.
+  if (isAutoLive && isGsdWorktreePath(effectiveBasePath)) return { block: false };
+
+  // Block. Provide enough context that the agent can self-correct.
+  const displayTarget = isPathContained(realTarget, realRoot)
+    ? relative(realRoot, realTarget) || "."
+    : realTarget;
+  return {
+    block: true,
+    reason: [
+      `HARD BLOCK: Worktree isolation is configured (\`git.isolation: worktree\`) but auto-mode is`,
+      `not running and the target "${displayTarget}" is not inside \`.gsd/worktrees/<MID>/\`.`,
+      `Code edits at the project root would be lost — only the auto-mode commit pipeline`,
+      `(auto-post-unit) commits work, and it never runs outside the loop.`,
+      `Required action: start auto-mode with \`/gsd\` so the milestone worktree is created,`,
+      `then write inside it. To disable this guard for self-hosting development, set`,
+      `GSD_DISABLE_WORKTREE_WRITE_GUARD=1.`,
+    ].join(" "),
+  };
 }

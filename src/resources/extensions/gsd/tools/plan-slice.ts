@@ -18,6 +18,7 @@ import { renderAllProjections } from "../workflow-projections.js";
 import { writeManifest } from "../workflow-manifest.js";
 import { appendEvent } from "../workflow-events.js";
 import { logWarning } from "../workflow-logger.js";
+import { validatePlanningPathScope } from "../planning-path-scope.js";
 
 export interface PlanSliceTaskInput {
   taskId: string;
@@ -139,6 +140,18 @@ export async function handlePlanSlice(
     params = validateParams(rawParams);
   } catch (err) {
     return { error: `validation failed: ${(err as Error).message}` };
+  }
+
+  const pathScopeError = validatePlanningPathScope(
+    basePath,
+    params.tasks.flatMap((task, index) => [
+      { field: `tasks[${index}].files`, values: task.files },
+      { field: `tasks[${index}].inputs`, values: task.inputs },
+      { field: `tasks[${index}].expectedOutput`, values: task.expectedOutput },
+    ]),
+  );
+  if (pathScopeError) {
+    return { error: `validation failed: ${pathScopeError}` };
   }
 
   // ── Guards + DB writes inside a single transaction (prevents TOCTOU) ───
