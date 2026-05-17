@@ -56,8 +56,9 @@ import { verifyExpectedArtifact, diagnoseExpectedArtifact, buildLoopRemediationS
 import { writeUnitRuntimeRecord } from "../unit-runtime.js";
 import { withTimeout, FINALIZE_PRE_TIMEOUT_MS, FINALIZE_POST_TIMEOUT_MS } from "./finalize-timeout.js";
 import { getEligibleSlices } from "../slice-parallel-eligibility.js";
-import { startSliceParallel } from "../slice-parallel-orchestrator.js";
+import { isSliceParallelActive, startSliceParallel } from "../slice-parallel-orchestrator.js";
 import { isDbAvailable, getMilestoneSlices } from "../gsd-db.js";
+import { reconcileBeforeSpawn } from "../state-reconciliation.js";
 import type { MinimalModelRegistry } from "../context-budget.js";
 import type { PostflightResult, PreflightResult } from "../clean-root-preflight.js";
 import { ensurePlanV2Graph, isEmptyPlanV2GraphResult, isMissingFinalizedContextResult } from "../uok/plan-v2.js";
@@ -74,11 +75,67 @@ import {
 } from "../workflow-mcp.js";
 import { resolveManifest } from "../unit-context-manifest.js";
 import { createWorktreeSafetyModule, type WorktreeSafetyResult } from "../worktree-safety.js";
+import { isSuspiciousGhostCompletion } from "../auto-unit-closeout.js";
+import { decideVerificationRetry, verificationRetryKey } from "./verification-retry-policy.js";
+import { buildPhaseHandoffOutcome, setAutoOutcomeWidget } from "../auto-dashboard.js";
+import { getConsecutiveDispatchBlocker } from "../dispatch-guard.js";
+
+export const STUCK_WINDOW_SIZE = 6;
 
 // ─── Path Comparison Helper ───────────────────────────────────────────────
 /** Compare two paths for physical identity, tolerating trailing slashes and symlinks. */
 function isSamePathLocal(a: string, b: string): boolean {
   return normalizeWorktreePathForCompare(a) === normalizeWorktreePathForCompare(b);
+}
+
+async function applyVerificationRetryPolicy(
+  ic: IterationContext,
+  unitType: string | undefined,
+  phase: "artifact-verification-retry" | "verification-retry",
+): Promise<PhaseResult | null> {
+  const { ctx, pi, s, deps } = ic;
+  const retryInfo = s.pendingVerificationRetry;
+  const key = unitType && retryInfo
+    ? verificationRetryKey(unitType, retryInfo.unitId)
+    : undefined;
+  const decision = decideVerificationRetry({
+    unitType,
+    retryInfo,
+    previousFailureHash: key ? s.verificationRetryFailureHashes.get(key) : undefined,
+  });
+
+  if (decision.action === "pause") {
+    s.pendingVerificationRetry = null;
+    debugLog("autoLoop", {
+      phase: `${phase}-paused`,
+      reason: decision.reason,
+      unitType,
+      unitId: retryInfo?.unitId,
+      failureHash: decision.failureHash,
+    });
+    ctx.ui.notify(
+      decision.reason === "duplicate-failure-context"
+        ? `Verification retry for ${unitType ?? "unit"} ${retryInfo?.unitId ?? "unknown"} produced the same failure context. Pausing auto-mode instead of re-dispatching.`
+        : "Verification retry requested without retry context. Pausing auto-mode instead of re-dispatching.",
+      "warning",
+    );
+    await deps.pauseAuto(ctx, pi);
+    return { action: "break", reason: decision.reason };
+  }
+
+  s.verificationRetryFailureHashes.set(decision.key, decision.failureHash);
+  debugLog("autoLoop", {
+    phase: `${phase}-backoff`,
+    iteration: ic.iteration,
+    unitType,
+    unitId: retryInfo?.unitId,
+    attempt: retryInfo?.attempt,
+    delayMs: decision.delayMs,
+    baseDelayMs: decision.baseDelayMs,
+    failureHash: decision.failureHash,
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, decision.delayMs));
+  return null;
 }
 
 export function shouldDegradeEmptyWorktreeToProjectRoot(
@@ -93,13 +150,25 @@ export function shouldDegradeEmptyWorktreeToProjectRoot(
 }
 
 function unitWritesSource(unitType: string): boolean | null {
-  const manifest = resolveManifest(unitType);
+  // Backward compatibility: sidecar queues from older builds may persist
+  // prefixed unit types (e.g. "sidecar/quick-task").
+  const normalizedUnitType = unitType.startsWith("sidecar/")
+    ? unitType.slice("sidecar/".length)
+    : unitType;
+  const manifest = resolveManifest(normalizedUnitType);
   if (!manifest) return null;
   return manifest.tools.mode === "all" || manifest.tools.mode === "docs";
 }
 
 function formatWorktreeSafetyFailure(result: Extract<WorktreeSafetyResult, { ok: false }>): string {
   return `Worktree Safety failed (${result.kind}): ${result.reason} ${result.remediation}`;
+}
+
+function formatWorktreeSafetyStopReason(result: Extract<WorktreeSafetyResult, { ok: false }>): string {
+  if (result.kind === "empty-worktree-with-project-content") {
+    return `Worktree Safety failed (${result.kind}). Run /gsd doctor fix, then /gsd auto.`;
+  }
+  return `Worktree Safety failed (${result.kind}).`;
 }
 
 function resolveEmptyWorktreeWithProjectContent(
@@ -150,7 +219,8 @@ async function validateSourceWriteWorktreeSafety(
   if (!writesSource) return null;
 
   const projectRoot = s.canonicalProjectRoot ?? resolveWorktreeProjectRoot(s.basePath, s.originalBasePath);
-  if (deps.getIsolationMode(projectRoot) !== "worktree") return null;
+  const isolationMode = deps.getIsolationMode(projectRoot);
+  if (isolationMode !== "worktree") return null;
 
   const safety = createWorktreeSafetyModule();
   const result = safety.validateUnitRoot({
@@ -160,6 +230,7 @@ async function validateSourceWriteWorktreeSafety(
     projectRoot,
     unitRoot: s.basePath,
     milestoneId,
+    isolationMode,
     expectedBranch: milestoneId ? deps.autoWorktreeBranch(milestoneId) : null,
     emptyWorktreeWithProjectContent: resolveEmptyWorktreeWithProjectContent(s.basePath, projectRoot),
     lease: s.workerId
@@ -184,7 +255,7 @@ async function validateSourceWriteWorktreeSafety(
     projectRoot,
   });
   ctx.ui.notify(msg, "error");
-  await deps.stopAuto(ctx, pi, msg);
+  await deps.stopAuto(ctx, pi, formatWorktreeSafetyStopReason(result));
   return { action: "break", reason: result.kind };
 }
 
@@ -514,6 +585,13 @@ export function _buildCancelledUnitStopReason(
   };
 }
 
+export function _isPauseOriginCancelledResult(
+  isPaused: boolean,
+  errorContext?: { message: string; category: string },
+): boolean {
+  return isPaused && !errorContext;
+}
+
 async function failClosedOnFinalizeTimeout(
   ic: IterationContext,
   iterData: IterationData,
@@ -806,6 +884,12 @@ export async function runPreDispatch(
     isDbAvailable()
   ) {
     try {
+      const projectRoot = _resolveDispatchGuardBasePath(s);
+      if (isSliceParallelActive(projectRoot)) {
+        ctx.ui.notify("Slice-parallel: workers are still running; waiting for completion before next dispatch.", "info");
+        await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+        return { action: "continue" };
+      }
       const dbSlices = getMilestoneSlices(mid);
       if (dbSlices.length > 0) {
         const doneIds = new Set(dbSlices.filter(sl => sl.status === "complete" || sl.status === "done").map(sl => sl.id));
@@ -826,8 +910,18 @@ export async function runPreDispatch(
             `Slice-parallel: dispatching ${eligible.length} eligible slices for ${mid}.`,
             "info",
           );
+          // ADR-017 #5707: reconcile before spawning so each worker doesn't
+          // independently race on the same drift. Failure aborts the spawn.
+          const spawnGate = await reconcileBeforeSpawn(projectRoot);
+          if (!spawnGate.ok) {
+            ctx.ui.notify(
+              `Slice-parallel: aborting spawn — ${spawnGate.reason}`,
+              "error",
+            );
+            return { action: "break", reason: `slice-parallel-reconciliation-failed: ${spawnGate.reason}` };
+          }
           const result = await startSliceParallel(
-            s.basePath,
+            projectRoot,
             mid,
             eligible,
             {
@@ -840,8 +934,7 @@ export async function runPreDispatch(
               `Slice-parallel: started ${result.started.length} worker(s): ${result.started.join(", ")}.`,
               "info",
             );
-            await deps.stopAuto(ctx, pi, `Slice-parallel dispatched for ${mid}`);
-            return { action: "break", reason: "slice-parallel-dispatched" };
+            return { action: "continue" };
           }
           // Fall through to sequential if no workers started
         }
@@ -1169,7 +1262,6 @@ export async function runDispatch(
 ): Promise<PhaseResult<IterationData>> {
   const { ctx, pi, s, deps, prefs } = ic;
   const { state, mid, midTitle } = preData;
-  const STUCK_WINDOW_SIZE = 6;
   const provider = ctx.model?.provider;
   const authMode = provider && typeof ctx.modelRegistry?.getProviderAuthMode === "function"
     ? ctx.modelRegistry.getProviderAuthMode(provider)
@@ -1264,9 +1356,15 @@ export async function runDispatch(
   }
 
   const guardBasePath = _resolveDispatchGuardBasePath(s);
+  let mainBranch = "main";
+  try {
+    mainBranch = deps.getMainBranch(guardBasePath);
+  } catch (err) {
+    debugLog("autoLoop", { phase: "getMainBranch-failed", error: String(err) });
+  }
   const priorSliceBlocker = deps.getPriorSliceCompletionBlocker(
     guardBasePath,
-    deps.getMainBranch(guardBasePath),
+    mainBranch,
     unitType,
     unitId,
   );
@@ -1274,6 +1372,18 @@ export async function runDispatch(
     await deps.stopAuto(ctx, pi, priorSliceBlocker);
     debugLog("autoLoop", { phase: "exit", reason: "prior-slice-blocker" });
     return { action: "break", reason: "prior-slice-blocker" };
+  }
+
+  const consecutiveDispatchBlocker = getConsecutiveDispatchBlocker(
+    loopState,
+    state.phase,
+    unitType,
+    unitId,
+  );
+  if (consecutiveDispatchBlocker) {
+    await deps.stopAuto(ctx, pi, consecutiveDispatchBlocker);
+    debugLog("autoLoop", { phase: "exit", reason: "consecutive-dispatch-blocker" });
+    return { action: "break", reason: "consecutive-dispatch-blocker" };
   }
 
   const worktreeSafetyBlock = await validateSourceWriteWorktreeSafety(
@@ -1288,16 +1398,19 @@ export async function runDispatch(
   // ── Sliding-window stuck detection with graduated recovery ──
   const derivedKey = `${unitType}/${unitId}`;
 
-  // Always record this dispatch in the sliding window so detectStuck() has
-  // accurate history. Skipping the push when pendingVerificationRetry is set
-  // caused infinite artifact-retry loops to be invisible to stuck detection
-  // (#2007). Only the *response* to a stuck signal is suppressed during retries.
+  // Always record this dispatch in the sliding window and run detection so
+  // Rules 1/3/4 can catch retry loops with repeated failure content (#5719).
+  // Rules 2/2b suppress legitimate retry backoff through the dispatch ledger.
   loopState.recentUnits.push({ key: derivedKey });
-  if (loopState.recentUnits.length > STUCK_WINDOW_SIZE) loopState.recentUnits.shift();
+  while (loopState.recentUnits.length > STUCK_WINDOW_SIZE) {
+    loopState.recentUnits.shift();
+  }
 
-  if (!s.pendingVerificationRetry) {
-    const stuckSignal = detectStuck(loopState.recentUnits);
-    if (stuckSignal) {
+  const stuckSignal = detectStuck(loopState.recentUnits, {
+    pendingRetry: !!s.pendingVerificationRetry,
+    retryAttempt: s.pendingVerificationRetry?.attempt,
+  });
+  if (stuckSignal) {
       debugLog("autoLoop", {
         phase: "stuck-check",
         unitType,
@@ -1351,7 +1464,6 @@ export async function runDispatch(
           );
           deps.invalidateAllCaches();
           loopState.recentUnits.length = 0;
-          loopState.stuckRecoveryAttempts = 0;
           return { action: "continue" };
         }
         ctx.ui.notify(
@@ -1413,16 +1525,15 @@ export async function runDispatch(
         );
         return { action: "break", reason: "stuck-detected" };
       }
-    } else {
-      // Progress detected — reset recovery counter
-      if (loopState.stuckRecoveryAttempts > 0) {
-        debugLog("autoLoop", {
-          phase: "stuck-counter-reset",
-          from: loopState.recentUnits[loopState.recentUnits.length - 2]?.key ?? "",
-          to: derivedKey,
-        });
-        loopState.stuckRecoveryAttempts = 0;
-      }
+  } else {
+    // Progress detected — reset recovery counter
+    if (loopState.stuckRecoveryAttempts > 0) {
+      debugLog("autoLoop", {
+        phase: "stuck-counter-reset",
+        from: loopState.recentUnits[loopState.recentUnits.length - 2]?.key ?? "",
+        to: derivedKey,
+      });
+      loopState.stuckRecoveryAttempts = 0;
     }
   }
 
@@ -1736,42 +1847,8 @@ export async function runUnitPhase(
     s.currentUnit.id === unitId
   );
   const previousTier = s.currentUnitRouting?.tier;
-
-  // Scope workflow-logger buffer to this unit so post-finalize drains are
-  // per-unit. Without this, the module-level _buffer accumulates across every
-  // unit in the same Node process (see workflow-logger.ts module header).
-  _resetLogs();
   const dispatchKey = `${unitType}/${unitId}`;
-  s.unitDispatchCount.set(dispatchKey, (s.unitDispatchCount.get(dispatchKey) ?? 0) + 1);
-  s.currentUnit = { type: unitType, id: unitId, startedAt: Date.now() };
-  s.lastGitActionFailure = null;
-  s.lastGitActionStatus = null;
-  s.lastUnitAgentEndMessages = null;
-  setCurrentPhase(unitType, {
-    basePath: s.basePath,
-    traceId: ic.flowId,
-    turnId: `iter-${ic.iteration}`,
-    causedBy: "unit-start",
-  });
-  s.lastToolInvocationError = null; // #2883: clear stale error from previous unit
-  const unitStartSeq = ic.nextSeq();
-  deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: unitStartSeq, eventType: "unit-start", data: { unitType, unitId } });
-  deps.captureAvailableSkills();
-  writeUnitRuntimeRecord(
-    s.basePath,
-    unitType,
-    unitId,
-    s.currentUnit.startedAt,
-    {
-      phase: "dispatched",
-      wrapupWarningSent: false,
-      timeoutAt: null,
-      lastProgressAt: s.currentUnit.startedAt,
-      progressCount: 0,
-      lastProgressKind: "dispatch",
-      recoveryAttempts: 0, // Reset so re-dispatched units get full recovery budget (#2322)
-    },
-  );
+  const nextDispatchCount = (s.unitDispatchCount.get(dispatchKey) ?? 0) + 1;
 
   // Status bar (widget + preconditions deferred until after model selection — see #2899)
   ctx.ui.setStatus("gsd-auto", "auto");
@@ -1834,7 +1911,7 @@ export async function runUnitPhase(
         : s.pendingCrashRecovery;
     finalPrompt = `${capped}\n\n---\n\n${finalPrompt}`;
     s.pendingCrashRecovery = null;
-  } else if ((s.unitDispatchCount.get(dispatchKey) ?? 0) > 1) {
+  } else if (nextDispatchCount > 1) {
     const diagnostic = deps.getDeepDiagnostic(s.basePath);
     if (diagnostic) {
       const cappedDiag =
@@ -1842,7 +1919,11 @@ export async function runUnitPhase(
           ? diagnostic.slice(0, MAX_RECOVERY_CHARS) +
             "\n\n[...diagnostic truncated to prevent memory exhaustion]"
           : diagnostic;
-      finalPrompt = `**RETRY — your previous attempt did not produce the required artifact.**\n\nDiagnostic from previous attempt:\n${cappedDiag}\n\nFix whatever went wrong and make sure you write the required file this time.\n\n---\n\n${finalPrompt}`;
+      const retryInstruction =
+        unitType === "execute-task"
+          ? "The required artifact is `T##-SUMMARY.md`. Do NOT manually write this file. Call `gsd_task_complete` with `milestoneId`, `sliceId`, `taskId`, and the required completion fields. Do not re-run implementation work — call the tool."
+          : "Fix whatever went wrong and make sure you write the required file this time.";
+      finalPrompt = `**RETRY — your previous attempt did not produce the required artifact.**\n\nDiagnostic from previous attempt:\n${cappedDiag}\n\n${retryInstruction}\n\n---\n\n${finalPrompt}`;
     }
   }
 
@@ -1877,6 +1958,11 @@ export async function runUnitPhase(
   }
 
   // Select and apply model (with tier escalation on retry — normal units only)
+  const prevUnitRouting = s.currentUnitRouting;
+  const prevUnitModel = s.currentUnitModel;
+  const prevDispatchedModelId = s.currentDispatchedModelId;
+  const prevSessionModel = ctx.model;
+  const prevSessionThinkingLevel = pi.getThinkingLevel();
   const modelResult = await deps.selectAndApplyModel(
     ctx,
     pi,
@@ -1943,13 +2029,66 @@ export async function runUnitPhase(
           ? ctx.modelRegistry.getProviderAuthMode(ctx.model.provider)
           : undefined,
       baseUrl: (s.currentUnitModel as any)?.baseUrl ?? ctx.model?.baseUrl,
+      activeTools: typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [],
     },
   );
   if (compatibilityError) {
+    s.currentUnitRouting = prevUnitRouting;
+    s.currentUnitModel = prevUnitModel;
+    s.currentDispatchedModelId = prevDispatchedModelId;
+    if (s.checkpointSha) {
+      cleanupCheckpoint(s.basePath, unitId);
+      s.checkpointSha = null;
+    }
+    if (prevSessionModel) {
+      const ok = await pi.setModel(prevSessionModel, { persist: false });
+      if (!ok) {
+        ctx.ui.notify("Failed to restore previous session model after compatibility check failure.", "warning");
+      }
+      if (prevSessionThinkingLevel) {
+        pi.setThinkingLevel(prevSessionThinkingLevel);
+      }
+    }
     ctx.ui.notify(compatibilityError, "error");
     await deps.stopAuto(ctx, pi, compatibilityError);
     return { action: "break", reason: "workflow-capability" };
   }
+
+  // Scope workflow-logger buffer to this unit so post-finalize drains are
+  // per-unit. Without this, the module-level _buffer accumulates across every
+  // unit in the same Node process (see workflow-logger.ts module header).
+  _resetLogs();
+  const unitStartedAt = Date.now();
+  s.unitDispatchCount.set(dispatchKey, nextDispatchCount);
+  s.currentUnit = { type: unitType, id: unitId, startedAt: unitStartedAt };
+  s.lastGitActionFailure = null;
+  s.lastGitActionStatus = null;
+  s.lastUnitAgentEndMessages = null;
+  setCurrentPhase(unitType, {
+    basePath: s.basePath,
+    traceId: ic.flowId,
+    turnId: `iter-${ic.iteration}`,
+    causedBy: "unit-start",
+  });
+  s.lastToolInvocationError = null; // #2883: clear stale error from previous unit
+  const unitStartSeq = ic.nextSeq();
+  deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: unitStartSeq, eventType: "unit-start", data: { unitType, unitId } });
+  deps.captureAvailableSkills();
+  writeUnitRuntimeRecord(
+    s.basePath,
+    unitType,
+    unitId,
+    unitStartedAt,
+    {
+      phase: "dispatched",
+      wrapupWarningSent: false,
+      timeoutAt: null,
+      lastProgressAt: unitStartedAt,
+      progressCount: 0,
+      lastProgressKind: "dispatch",
+      recoveryAttempts: 0, // Reset so re-dispatched units get full recovery budget (#2322)
+    },
+  );
 
   // Progress widget + preconditions — deferred to after model selection so the
   // widget's first render tick shows the correct model (#2899).
@@ -2006,6 +2145,33 @@ export async function runUnitPhase(
     status: unitResult.status,
   });
 
+  if (
+    unitResult.status === "completed" &&
+    s.currentUnit &&
+    (unitResult.event?.messages?.length ?? 0) === 0 &&
+    isSuspiciousGhostCompletion(ctx, unitResult.requestDispatchedAt ?? s.currentUnit.startedAt)
+  ) {
+    const message =
+      `${unitType} ${unitId} completed without assistant output or tool calls; treating as a stale ghost completion.`;
+    debugLog("autoLoop", {
+      phase: "ghost-completion",
+      iteration: ic.iteration,
+      unitType,
+      unitId,
+      elapsedMs: Date.now() - (unitResult.requestDispatchedAt ?? s.currentUnit.startedAt),
+    });
+    logWarning("engine", message);
+    ctx.ui.notify(`${message} Pausing auto-mode before closeout side effects.`, "warning");
+    await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, {
+      message,
+      category: "unknown",
+      isTransient: true,
+    });
+    s.currentUnit = null;
+    await deps.pauseAuto(ctx, pi);
+    return { action: "break", reason: "ghost-completion" };
+  }
+
   // Now that runUnit has called newSession(), the session file path is correct.
   const sessionFile = deps.getSessionFile(ctx);
   deps.updateSessionLock(
@@ -2038,6 +2204,11 @@ export async function runUnitPhase(
   }
 
   if (unitResult.status === "cancelled") {
+    if (_isPauseOriginCancelledResult(s.paused, unitResult.errorContext)) {
+      debugLog("autoLoop", { phase: "cancelled-after-pause", unitType, unitId });
+      return { action: "break", reason: "paused" };
+    }
+
     const errorCategory = unitResult.errorContext?.category;
     // Provider-error pause: agent_end recovery normally pauses before this
     // branch. Provider readiness failures happen before dispatch, so pause here
@@ -2146,6 +2317,20 @@ export async function runUnitPhase(
       await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, unitResult.errorContext);
       return { action: "break", reason: "session-timeout" };
     }
+    if (
+      unitResult.errorContext?.isTransient &&
+      errorCategory === "aborted"
+    ) {
+      ctx.ui.notify(
+        `Unit ${unitType} ${unitId} was aborted by the user. Pausing auto-mode (recoverable).`,
+        "warning",
+      );
+      debugLog("autoLoop", { phase: "unit-aborted-transient-pause", unitType, unitId, category: errorCategory });
+      await deps.pauseAuto(ctx, pi);
+      await deps.autoCommitUnit?.(s.basePath, unitType, unitId, ctx);
+      await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, unitResult.errorContext);
+      return { action: "break", reason: "unit-aborted-pause" };
+    }
     // All other cancelled states (structural errors, non-transient failures): hard stop
     if (s.currentUnit) {
       await deps.closeoutUnit(
@@ -2227,18 +2412,17 @@ export async function runUnitPhase(
     }
   }
 
-  if (s.currentUnitRouting) {
-    deps.recordOutcome(
-      unitType,
-      s.currentUnitRouting.tier as "light" | "standard" | "heavy",
-      true, // success assumed; dispatch will re-dispatch if artifact missing
-    );
-  }
-
   const skipArtifactVerification = unitType.startsWith("hook/") || unitType === "custom-step";
   const artifactVerified =
     skipArtifactVerification ||
     verifyExpectedArtifact(unitType, unitId, s.basePath);
+  if (s.currentUnitRouting) {
+    deps.recordOutcome(
+      unitType,
+      s.currentUnitRouting.tier as "light" | "standard" | "heavy",
+      artifactVerified,
+    );
+  }
   if (artifactVerified) {
     s.unitDispatchCount.delete(dispatchKey);
     s.unitRecoveryCount.delete(`${unitType}/${unitId}`);
@@ -2263,7 +2447,11 @@ export async function runUnitPhase(
     }
   }
 
-  deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "unit-end", data: { unitType, unitId, status: unitResult.status, artifactVerified, ...(unitResult.errorContext ? { errorContext: unitResult.errorContext } : {}) }, causedBy: { flowId: ic.flowId, seq: unitStartSeq } });
+  const unitEndStatus =
+    !artifactVerified && unitResult.status === "completed"
+      ? "no-artifact"
+      : unitResult.status;
+  deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "unit-end", data: { unitType, unitId, status: unitEndStatus, artifactVerified, ...(unitResult.errorContext ? { errorContext: unitResult.errorContext } : {}) }, causedBy: { flowId: ic.flowId, seq: unitStartSeq } });
 
   // ── Safety harness: checkpoint cleanup or rollback ──
   if (s.checkpointSha) {
@@ -2338,6 +2526,8 @@ export async function runFinalize(
   const preUnitSnapshot = s.currentUnit
     ? { type: s.currentUnit.type, id: s.currentUnit.id, startedAt: s.currentUnit.startedAt }
     : null;
+  s.currentUnit = null;
+  clearCurrentPhase();
   const preResultGuard = await withTimeout(
     deps.postUnitPreVerification(postUnitCtx, preVerificationOpts),
     FINALIZE_PRE_TIMEOUT_MS,
@@ -2386,6 +2576,14 @@ export async function runFinalize(
           attempt: retryInfo?.attempt,
         },
       });
+      const retryPolicyResult = await applyVerificationRetryPolicy(
+        ic,
+        preUnitSnapshot?.type,
+        "artifact-verification-retry",
+      );
+      if (retryPolicyResult) {
+        return retryPolicyResult;
+      }
       // Continue the loop — next iteration will inject the retry context into the prompt.
       debugLog("autoLoop", { phase: "artifact-verification-retry", iteration: ic.iteration });
       return { action: "continue" };
@@ -2423,6 +2621,14 @@ export async function runFinalize(
         debugLog("autoLoop", { phase: "sidecar-verification-retry-skipped", iteration: ic.iteration });
       } else {
         // s.pendingVerificationRetry was set by runPostUnitVerification.
+        const retryPolicyResult = await applyVerificationRetryPolicy(
+          ic,
+          iterData.unitType,
+          "verification-retry",
+        );
+        if (retryPolicyResult) {
+          return retryPolicyResult;
+        }
         // Continue the loop — next iteration will inject the retry context into the prompt.
         debugLog("autoLoop", { phase: "verification-retry", iteration: ic.iteration });
         return { action: "continue" };
@@ -2479,10 +2685,21 @@ export async function runFinalize(
       lastProgressAt: Date.now(),
       lastProgressKind: "finalize-success",
     });
+    if (
+      !preUnitSnapshot.type.startsWith("hook/") &&
+      preUnitSnapshot.type !== "custom-step" &&
+      preUnitSnapshot.type !== "complete-milestone"
+    ) {
+      setAutoOutcomeWidget(ctx, {
+        ...buildPhaseHandoffOutcome({
+          unitType: preUnitSnapshot.type,
+          unitId: preUnitSnapshot.id,
+          agentEndMessages: s.lastUnitAgentEndMessages,
+        }),
+        startedAt: s.autoStartTime,
+      });
+    }
   }
-  s.currentUnit = null;
-  clearCurrentPhase();
-
   // Surface accumulated workflow-logger issues for this unit to the user.
   // Warnings/errors logged during the unit are buffered in the logger and
   // drained here so the user sees a single consolidated post-unit alert.

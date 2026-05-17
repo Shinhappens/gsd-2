@@ -8,7 +8,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
@@ -208,8 +208,8 @@ test("postflightPopStash conflict warning names the exact stash ref", () => {
     assert.match(postflight.message, /failed after merge of milestone M005C/);
 
     const warning = notifications.find((n) => n.level === "warning")?.msg ?? "";
-    assert.match(warning, /git stash pop stash@\{\d+\}/);
     assert.match(warning, /git stash apply stash@\{\d+\}/);
+    assert.match(warning, /git stash drop stash@\{\d+\}/);
   } finally {
     try { rmSync(repo, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch { /* ignore */ }
   }
@@ -275,6 +275,111 @@ test("postflightPopStash falls back to milestone marker prefix when exact marker
     assert.equal(content.replace(/\r\n/g, "\n"), "# fallback stash\n");
     const stashList = run("git stash list", repo);
     assert.ok(!stashList.includes("gsd-preflight-stash:M008:fallback"), "fallback stash should be consumed");
+  } finally {
+    try { rmSync(repo, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch { /* ignore */ }
+  }
+});
+
+test("postflightPopStash preserves stash when untracked collision differs from merged file", () => {
+  const repo = createTempRepo();
+  try {
+    writeFileSync(join(repo, "tests.txt"), "local preflight test\n");
+    const preflight = preflightCleanRoot(repo, "M009", () => {});
+    assert.equal(preflight.stashPushed, true, "preflight must stash untracked file");
+
+    writeFileSync(join(repo, "tests.txt"), "merged milestone test\n");
+    run("git add tests.txt", repo);
+    run('git commit -m "feat: add merged test"', repo);
+
+    const notifications: Array<{ msg: string; level: string }> = [];
+    const postflight = postflightPopStash(repo, "M009", preflight.stashMarker, (msg, level) => {
+      notifications.push({ msg, level });
+    });
+
+    assert.equal(postflight.needsManualRecovery, false, "different already-present untracked files must not stop auto-mode");
+    assert.equal(postflight.resolution, "already-present-preserved");
+    assert.deepEqual(postflight.collidedPaths, ["tests.txt"]);
+    assert.equal(readFileSync(join(repo, "tests.txt"), "utf-8"), "merged milestone test\n");
+    assert.equal(run("git status --porcelain", repo), "", "merged file must stay clean");
+
+    const stashList = run("git stash list", repo);
+    assert.ok(preflight.stashMarker && stashList.includes(preflight.stashMarker), "stash backup must be preserved");
+    assert.ok(
+      notifications.some((n) => n.level === "warning" && n.msg.includes("preserving")),
+      "user must be warned that the stash was preserved as backup",
+    );
+  } finally {
+    try { rmSync(repo, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch { /* ignore */ }
+  }
+});
+
+test("postflightPopStash drops stash when untracked collision is identical to merged file", () => {
+  const repo = createTempRepo();
+  try {
+    writeFileSync(join(repo, "tests.txt"), "same test content\n");
+    const preflight = preflightCleanRoot(repo, "M010", () => {});
+    assert.equal(preflight.stashPushed, true, "preflight must stash untracked file");
+
+    writeFileSync(join(repo, "tests.txt"), "same test content\n");
+    run("git add tests.txt", repo);
+    run('git commit -m "feat: add same test"', repo);
+
+    const postflight = postflightPopStash(repo, "M010", preflight.stashMarker, () => {});
+
+    assert.equal(postflight.needsManualRecovery, false, "identical already-present files must not stop auto-mode");
+    assert.equal(postflight.resolution, "already-present-dropped");
+    assert.equal(readFileSync(join(repo, "tests.txt"), "utf-8"), "same test content\n");
+
+    const stashList = run("git stash list", repo);
+    assert.ok(!stashList.includes(preflight.stashMarker ?? ""), "identical stash must be dropped");
+  } finally {
+    try { rmSync(repo, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch { /* ignore */ }
+  }
+});
+
+test("postflightPopStash requires manual recovery for mixed tracked changes and untracked collision", () => {
+  const repo = createTempRepo();
+  try {
+    writeFileSync(join(repo, "README.md"), "# local tracked work\n");
+    writeFileSync(join(repo, "tests.txt"), "local untracked work\n");
+    const preflight = preflightCleanRoot(repo, "M011", () => {});
+    assert.equal(preflight.stashPushed, true, "preflight must stash mixed changes");
+
+    writeFileSync(join(repo, "tests.txt"), "merged milestone test\n");
+    run("git add tests.txt", repo);
+    run('git commit -m "feat: add merged test"', repo);
+
+    const postflight = postflightPopStash(repo, "M011", preflight.stashMarker, () => {});
+
+    assert.equal(postflight.needsManualRecovery, true, "tracked stash payload must still require manual recovery");
+    assert.equal(postflight.resolution, "manual-recovery");
+    const stashList = run("git stash list", repo);
+    assert.ok(preflight.stashMarker && stashList.includes(preflight.stashMarker), "mixed stash must be preserved");
+  } finally {
+    try { rmSync(repo, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch { /* ignore */ }
+  }
+});
+
+test("postflightPopStash requires manual recovery when an untracked stash path is missing after collision", () => {
+  const repo = createTempRepo();
+  try {
+    writeFileSync(join(repo, "tests.txt"), "local untracked work\n");
+    writeFileSync(join(repo, "other-tests.txt"), "other local untracked work\n");
+    const preflight = preflightCleanRoot(repo, "M012", () => {});
+    assert.equal(preflight.stashPushed, true, "preflight must stash untracked files");
+
+    writeFileSync(join(repo, "tests.txt"), "merged milestone test\n");
+    run("git add tests.txt", repo);
+    run('git commit -m "feat: add one merged test"', repo);
+
+    const postflight = postflightPopStash(repo, "M012", preflight.stashMarker, () => {});
+
+    assert.equal(postflight.needsManualRecovery, true, "partial untracked restores must still require manual recovery");
+    assert.equal(postflight.resolution, "manual-recovery");
+    assert.equal(existsSync(join(repo, "other-tests.txt")), true, "git may partially restore the non-colliding path");
+    assert.match(run("git status --porcelain", repo), /\?\? other-tests\.txt/, "partial restore must leave manual recovery visible");
+    const stashList = run("git stash list", repo);
+    assert.ok(preflight.stashMarker && stashList.includes(preflight.stashMarker), "stash must remain for manual recovery");
   } finally {
     try { rmSync(repo, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch { /* ignore */ }
   }

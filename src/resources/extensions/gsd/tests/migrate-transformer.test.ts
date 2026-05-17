@@ -497,6 +497,7 @@ test('Scenario 11: Requirements edge cases', () => {
       makeRequirement('', 'Another No ID', 'validated'),
       makeRequirement('R005', 'Has ID', 'something-weird'),
       makeRequirement('R006', 'Deferred One', 'DEFERRED'),
+      makeRequirement('AUTH-7', 'Legacy ID', 'active'),
     ],
     phases: {
       '1-req-edge': makePhase('1-req-edge', 1, 'req-edge'),
@@ -510,6 +511,8 @@ test('Scenario 11: Requirements edge cases', () => {
   assert.deepStrictEqual(result.requirements[2]?.id, 'R005', 'req-edge: existing id preserved');
   assert.deepStrictEqual(result.requirements[2]?.status, 'active', 'req-edge: unknown status normalized to active');
   assert.deepStrictEqual(result.requirements[3]?.status, 'deferred', 'req-edge: uppercase DEFERRED normalized');
+  assert.deepStrictEqual(result.requirements[4]?.id, 'R003', 'req-edge: non-R legacy id gets next canonical id');
+  assert.ok(result.requirements[4]?.description.includes('Legacy ID: AUTH-7'), 'req-edge: original legacy id is preserved in description');
 });
 
 // ─── Scenario 12: Vision derivation ────────────────────────────────────────
@@ -553,6 +556,8 @@ test('Scenario 13: Decisions content', () => {
   const result = transformToGSD(project);
 
   assert.ok(result.decisionsContent.includes('decision-01'), 'decisions: extracts key-decisions from summaries');
+  assert.ok(result.decisionsContent.includes('| D001 |'), 'decisions: writes DB-importable decision ID');
+  assert.ok(result.decisionsContent.includes('| # | When | Scope | Decision | Choice | Rationale | Revisable? | Made By |'), 'decisions: writes canonical table header');
 });
 
 // ─── Scenario 14: No undefined values in output ───────────────────────────
@@ -616,4 +621,3 @@ test('Scenario 15: Empty research', () => {
 });
 
 // ─── Results ───────────────────────────────────────────────────────────────
-

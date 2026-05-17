@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 
 import { loadRegistry } from "../workflow-templates.js";
 import { gsdHome } from "../gsd-home.js";
+import { VISUAL_BRIEF_MODES } from "../../visual-brief/prompts.js";
 
 
 export interface GsdCommandDefinition {
@@ -13,7 +14,7 @@ export interface GsdCommandDefinition {
 type CompletionMap = Record<string, readonly GsdCommandDefinition[]>;
 
 export const GSD_COMMAND_DESCRIPTION =
-  "GSD — Get Shit Done: /gsd help|start|templates|next|auto|stop|pause|status|widget|visualize|queue|quick|discuss|capture|triage|dispatch|history|undo|undo-task|reset-slice|rate|skip|export|cleanup|model|mode|prefs|config|keys|hooks|run-hook|skill-health|doctor|debug|logs|forensics|changelog|migrate|remote|steer|knowledge|new-milestone|new-project|parallel|cmux|park|unpark|init|setup|onboarding|inspect|extensions|update|fast|mcp|rethink|workflow|codebase|notifications|ship|do|session-report|backlog|pr-branch|add-tests|scan|language|worktree|eval-review";
+  "GSD — Get Shit Done: /gsd help|start|templates|next|auto|stop|pause|status|widget|visualize|brief|queue|quick|discuss|capture|triage|dispatch|verdict|history|undo|undo-task|reset-slice|rate|skip|export|cleanup|model|mode|prefs|config|keys|hooks|run-hook|skill-health|doctor|debug|logs|forensics|changelog|migrate|remote|steer|knowledge|new-milestone|new-project|parallel|cmux|park|unpark|init|setup|onboarding|inspect|extensions|update|fast|mcp|rethink|workflow|codebase|notifications|ship|do|session-report|backlog|pr-branch|add-tests|scan|language|worktree|eval-review";
 
 export const TOP_LEVEL_SUBCOMMANDS: readonly GsdCommandDefinition[] = [
   { cmd: "help", desc: "Categorized command reference with descriptions" },
@@ -24,6 +25,7 @@ export const TOP_LEVEL_SUBCOMMANDS: readonly GsdCommandDefinition[] = [
   { cmd: "status", desc: "Progress dashboard" },
   { cmd: "widget", desc: "Cycle widget: full → small → min → off" },
   { cmd: "visualize", desc: "Open 10-tab workflow visualizer (progress, timeline, deps, metrics, health, agent, changes, knowledge, captures, export)" },
+  { cmd: "brief", desc: "Generate a visual HTML brief: diagram, plan, diff review, recap, table, or slides" },
   { cmd: "queue", desc: "Queue and reorder future milestones" },
   { cmd: "quick", desc: "Execute a quick task without full planning overhead" },
   { cmd: "discuss", desc: "Discuss architecture and decisions" },
@@ -31,6 +33,7 @@ export const TOP_LEVEL_SUBCOMMANDS: readonly GsdCommandDefinition[] = [
   { cmd: "changelog", desc: "Show categorized release notes" },
   { cmd: "triage", desc: "Manually trigger triage of pending captures" },
   { cmd: "dispatch", desc: "Dispatch a specific phase directly" },
+  { cmd: "verdict", desc: "Override the recorded milestone validation verdict (pass|needs-attention|needs-remediation)" },
   { cmd: "history", desc: "View execution history" },
   { cmd: "undo", desc: "Revert last completed unit" },
   { cmd: "undo-task", desc: "Reset a specific task's completion state (DB + markdown)" },
@@ -88,6 +91,7 @@ export const TOP_LEVEL_SUBCOMMANDS: readonly GsdCommandDefinition[] = [
 ];
 
 const NESTED_COMPLETIONS: CompletionMap = {
+  brief: VISUAL_BRIEF_MODES.map((mode) => ({ cmd: mode.mode, desc: mode.description })),
   auto: [
     { cmd: "--verbose", desc: "Show detailed execution output" },
     { cmd: "--debug", desc: "Enable debug logging" },
@@ -244,6 +248,11 @@ const NESTED_COMPLETIONS: CompletionMap = {
     { cmd: "reassess", desc: "Reassess current progress" },
     { cmd: "uat", desc: "Run user acceptance testing" },
     { cmd: "replan", desc: "Replan the current slice" },
+  ],
+  verdict: [
+    { cmd: "pass", desc: "Override the milestone validation verdict to pass" },
+    { cmd: "needs-attention", desc: "Override the verdict to needs-attention (requires --rationale)" },
+    { cmd: "needs-remediation", desc: "Override the verdict to needs-remediation (requires --rationale)" },
   ],
   rate: [
     { cmd: "over", desc: "Model was overqualified for this task" },

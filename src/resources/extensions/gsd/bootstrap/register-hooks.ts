@@ -16,7 +16,7 @@ import { canonicalToolName, clearDiscussionFlowState, isDepthConfirmationAnswer,
 import { resolveManifest } from "../unit-context-manifest.js";
 import { isBlockedStateFile, isBashWriteToStateFile, BLOCKED_WRITE_ERROR } from "../write-intercept.js";
 import { loadFile, saveFile, formatContinue } from "../files.js";
-import { getAutoRuntimeSnapshot, isAutoActive, isAutoPaused, markToolEnd, markToolStart, recordToolInvocationError } from "../auto-runtime-state.js";
+import { clearToolInvocationError, getAutoRuntimeSnapshot, isAutoActive, isAutoPaused, markToolEnd, markToolStart, recordToolInvocationError } from "../auto-runtime-state.js";
 
 import { checkToolCallLoop, resetToolCallLoopGuard } from "./tool-call-loop-guard.js";
 import { saveActivityLog } from "../activity-log.js";
@@ -31,6 +31,7 @@ import { resolveWorktreeProjectRoot } from "../worktree-root.js";
 import { extractSubagentAgentClasses } from "./subagent-input.js";
 import { approvalGateIdForUnit, isExplicitApprovalResponse, shouldPauseForUserApprovalQuestion } from "../user-input-boundary.js";
 import { resolveSkillManifest } from "../skill-manifest.js";
+import { getGuidedUnitContext } from "../guided-unit-context.js";
 
 let approvalQuestionAbortInFlight = false;
 
@@ -143,7 +144,7 @@ const AUTO_UNIT_SCOPED_TOOLS: Record<string, readonly string[]> = {
   "plan-slice": ["gsd_plan_slice", "gsd_plan_task", "gsd_decision_save"],
   "refine-slice": ["gsd_plan_slice", "gsd_plan_task", "gsd_decision_save"],
   "replan-slice": ["gsd_replan_slice", "gsd_plan_task", "gsd_decision_save"],
-  "complete-slice": ["gsd_slice_complete", "gsd_decision_save", "gsd_requirement_update", "subagent"],
+  "complete-slice": ["gsd_slice_complete", "gsd_task_reopen", "gsd_replan_slice", "gsd_decision_save", "gsd_requirement_update", "subagent"],
   "reassess-roadmap": ["gsd_reassess_roadmap"],
   "execute-task": ["gsd_task_complete", "gsd_decision_save"],
   "execute-task-simple": ["gsd_task_complete", "gsd_decision_save"],
@@ -423,6 +424,10 @@ export function registerHooks(
   pi: ExtensionAPI,
   ecosystemHandlers: GSDEcosystemBeforeAgentStartHandler[],
 ): void {
+  // ADR-005 Phase 3b: surface pi-ai ProviderSwitchReport via audit, notification, and counter.
+  // Idempotent — only the first registerHooks call installs.
+  void import("../provider-switch-observer.js").then((m) => m.installProviderSwitchObserver());
+
   pi.on("session_start", async (_event, ctx) => {
     const basePath = contextBasePath(ctx);
     initSessionNotifications(ctx);
@@ -480,6 +485,8 @@ export function registerHooks(
     }
     await loadToolApiKeysForSession();
     if (!isAutoActive()) {
+      ctx.ui.setWidget("gsd-progress", undefined);
+      ctx.ui.setWidget("gsd-outcome", undefined);
       const { initHealthWidget } = await import("../health-widget.js");
       initHealthWidget(ctx);
     } else {
@@ -501,6 +508,13 @@ export function registerHooks(
       const milestoneId = extractDepthVerificationMilestoneId(pendingApprovalGate);
       if (milestoneId) markDepthVerified(milestoneId, beforeAgentBasePath);
       clearPendingGate(beforeAgentBasePath);
+      if (isAutoPaused() && !isAutoActive()) {
+        const { resumeAutoAfterProviderDelay } = await import("./provider-error-resume.js");
+        void resumeAutoAfterProviderDelay(pi, ctx).catch((err) => {
+          const message = err instanceof Error ? err.message : String(err);
+          ctx.ui.notify(`Failed to resume auto-mode after approval: ${message}`, "warning");
+        });
+      }
     }
     clearDeferredApprovalGate(beforeAgentBasePath);
 
@@ -634,6 +648,7 @@ export function registerHooks(
     if (approvalQuestionAbortInFlight) return;
 
     const dash = getAutoRuntimeSnapshot();
+    if (dash.active) return;
     let unitType = dash.currentUnit?.type;
     let unitId = dash.currentUnit?.id;
 
@@ -766,7 +781,8 @@ export function registerHooks(
     // subagent dispatch. Closes the b23 bug class where a discuss-milestone
     // turn used the host Edit tool to modify user source files.
     const dash = getAutoRuntimeSnapshot();
-    const activeUnitType = dash.currentUnit?.type;
+    const guidedUnit = getGuidedUnitContext(discussionBasePath);
+    const activeUnitType = dash.currentUnit?.type ?? guidedUnit?.unitType;
     if (activeUnitType) {
       const manifest = resolveManifest(activeUnitType);
       if (manifest) {
@@ -785,7 +801,7 @@ export function registerHooks(
         const planningGuard = shouldBlockPlanningUnit(
           event.toolName,
           planningInput,
-          dash.basePath || discussionBasePath,
+          dash.basePath || guidedUnit?.basePath || discussionBasePath,
           activeUnitType,
           manifest.tools,
           agentClasses,
@@ -799,11 +815,10 @@ export function registerHooks(
     // git.isolation=worktree but auto-mode hasn't created the milestone
     // worktree yet. Without this, writes silently orphan outside git history.
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-      const wtBasePath = resolveWorktreeProjectRoot(dash.basePath ?? discussionBasePath);
       const wtGuard = shouldBlockWorktreeWrite(
         event.toolName,
         event.input.path,
-        wtBasePath,
+        dash.basePath ?? discussionBasePath,
         isAutoActive(),
         dash.currentUnit?.type,
       );
@@ -892,6 +907,8 @@ export function registerHooks(
       // Let recordToolInvocationError classify the failure so non-gsd_ harness
       // errors and deterministic policy rejections are handled consistently.
       recordToolInvocationError(event.toolName, errorText);
+    } else if (isAutoActive()) {
+      clearToolInvocationError();
     }
     const toolName = canonicalToolName(event.toolName);
     if (toolName !== "ask_user_questions") return;
@@ -1009,6 +1026,8 @@ export function registerHooks(
       // Let recordToolInvocationError classify the failure so non-gsd_ harness
       // errors and deterministic policy rejections are handled consistently.
       recordToolInvocationError(event.toolName, errorText);
+    } else if (isAutoActive()) {
+      clearToolInvocationError();
     }
     // Safety harness: record tool execution results for evidence cross-referencing
     if (isAutoActive()) {

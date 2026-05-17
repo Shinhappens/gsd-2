@@ -30,9 +30,13 @@ import { join } from "node:path";
 import {
   findStaleWorkerForProject,
   getAllAutoWorkers,
+  markWorkerCrashed,
+  markWorkerStopping,
+  markWorkerStoppingByPid,
   type AutoWorkerRow,
 } from "./db/auto-workers.js";
-import { getLatestForUnit, type DispatchStatus } from "./db/unit-dispatches.js";
+import { forceReleaseLeasesForWorker } from "./db/milestone-leases.js";
+import { markLatestActiveForWorkerCanceled, type DispatchStatus } from "./db/unit-dispatches.js";
 import { getRuntimeKv, setRuntimeKv, deleteRuntimeKv } from "./db/runtime-kv.js";
 import { _getAdapter, isDbAvailable } from "./gsd-db.js";
 import { gsdRoot, normalizeRealPath } from "./paths.js";
@@ -54,6 +58,15 @@ const SESSION_FILE_KV_KEY = "session_file";
 
 function lockPath(basePath: string): string {
   return join(gsdRoot(basePath), effectiveLockFile());
+}
+
+function clearLegacyLockFile(basePath: string): void {
+  try {
+    const p = lockPath(basePath);
+    if (existsSync(p)) unlinkSync(p);
+  } catch {
+    // Best-effort.
+  }
 }
 
 function readLegacyLock(basePath: string): LockData | null {
@@ -185,12 +198,18 @@ export function writeLock(
     // Best-effort — never throw from the lock writer.
   }
 
-  if (!isDbAvailable() || !sessionFile) return;
+  if (!isDbAvailable()) return;
   try {
     const projectRoot = normalizeRealPath(basePath);
     const worker = findActiveWorkerForCurrentProcess(projectRoot);
     if (!worker) return;
-    setRuntimeKv("worker", worker.worker_id, SESSION_FILE_KV_KEY, sessionFile);
+    if (sessionFile) {
+      setRuntimeKv("worker", worker.worker_id, SESSION_FILE_KV_KEY, sessionFile);
+    } else {
+      // Preliminary unit locks (before runUnit/newSession settles) must clear
+      // any prior pointer so crash recovery cannot ingest stale cross-unit context.
+      deleteRuntimeKv("worker", worker.worker_id, SESSION_FILE_KV_KEY);
+    }
   } catch {
     // Best-effort — never throw from the lock writer.
   }
@@ -204,18 +223,48 @@ export function writeLock(
  * stale session-file pointer.
  */
 export function clearLock(basePath: string): void {
-  try {
-    const p = lockPath(basePath);
-    if (existsSync(p)) unlinkSync(p);
-  } catch {
-    // Best-effort.
-  }
+  clearLegacyLockFile(basePath);
 
   if (!isDbAvailable()) return;
   try {
     const projectRoot = normalizeRealPath(basePath);
+    const staleWorker = findStaleWorkerForProject(projectRoot);
+    if (staleWorker) {
+      markWorkerCrashed(staleWorker.worker_id);
+      forceReleaseLeasesForWorker(staleWorker.worker_id);
+      deleteRuntimeKv("worker", staleWorker.worker_id, SESSION_FILE_KV_KEY);
+      return;
+    }
+    const lock = readLegacyLock(basePath);
+    if (lock?.pid) markWorkerStoppingByPid(projectRoot, lock.pid);
     const worker = findActiveWorkerForCurrentProcess(projectRoot);
+    if (worker) deleteRuntimeKv("worker", worker.worker_id, SESSION_FILE_KV_KEY);
+
+    const stale = findStaleWorkerForProject(projectRoot);
+    if (stale) {
+      markWorkerStopping(stale.worker_id);
+      deleteRuntimeKv("worker", stale.worker_id, SESSION_FILE_KV_KEY);
+    }
+  } catch {
+    // Best-effort.
+  }
+}
+
+/**
+ * Clear a stale DB-backed worker lock after readCrashLock/findStaleWorkerForProject
+ * has identified a dead worker. Unlike clearLock(), this targets the stale
+ * worker row instead of the current process's active worker.
+ */
+export function clearStaleWorkerLock(basePath: string): void {
+  clearLegacyLockFile(basePath);
+
+  if (!isDbAvailable()) return;
+  try {
+    const projectRoot = normalizeRealPath(basePath);
+    const worker = findStaleWorkerForProject(projectRoot);
     if (!worker) return;
+    markLatestActiveForWorkerCanceled(worker.worker_id, "crash-recovered");
+    markWorkerCrashed(worker.worker_id);
     deleteRuntimeKv("worker", worker.worker_id, SESSION_FILE_KV_KEY);
   } catch {
     // Best-effort.

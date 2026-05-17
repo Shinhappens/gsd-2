@@ -62,7 +62,11 @@ async function runSuccessfulFinalize(s: AutoSession) {
   );
 }
 
-async function runFinalizeWithDeps(s: AutoSession, depsOverrides: Record<string, unknown>) {
+async function runFinalizeWithDeps(
+  s: AutoSession,
+  depsOverrides: Record<string, unknown>,
+  ctxOverride?: Record<string, unknown>,
+) {
   const unit = s.currentUnit;
   assert.ok(unit, "test setup must provide currentUnit");
 
@@ -86,7 +90,7 @@ async function runFinalizeWithDeps(s: AutoSession, depsOverrides: Record<string,
 
   return runFinalize(
     {
-      ctx: { ui: { notify() {} } },
+      ctx: ctxOverride ?? { ui: { notify() {} } },
       pi: {},
       s,
       deps,
@@ -222,4 +226,51 @@ test("runFinalize merges a verified complete-milestone immediately and only once
   assert.equal(second.action, "next");
   assert.equal(lifecycleMergeCalls, 1);
   assert.equal(resolverMergeCalls, 0);
+});
+
+test("runFinalize does not render next-phase handoff for complete-milestone", async (t) => {
+  const base = mkdtempSync(join(tmpdir(), "gsd-finalize-complete-handoff-"));
+  t.after(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  const s = new AutoSession();
+  const widgetCalls: Array<[string, unknown]> = [];
+  s.basePath = base;
+  s.originalBasePath = base;
+  s.currentMilestoneId = "M001";
+  s.currentUnit = {
+    type: "complete-milestone",
+    id: "M001",
+    startedAt: Date.now(),
+  };
+
+  const result = await runFinalizeWithDeps(
+    s,
+    {
+      preflightCleanRoot: () => ({ stashPushed: false }),
+      postflightPopStash: () => ({ needsManualRecovery: false }),
+      lifecycle: {
+        exitMilestone() {
+          return { ok: true, merged: true, codeFilesChanged: false };
+        },
+      },
+    },
+    {
+      hasUI: true,
+      ui: {
+        notify() {},
+        setWidget(key: string, value: unknown) {
+          widgetCalls.push([key, value]);
+        },
+      },
+    },
+  );
+
+  assert.equal(result.action, "next");
+  assert.equal(
+    widgetCalls.some(([key]) => key === "gsd-outcome"),
+    false,
+    "complete-milestone finalize should leave terminal completion UI to stopAuto",
+  );
 });

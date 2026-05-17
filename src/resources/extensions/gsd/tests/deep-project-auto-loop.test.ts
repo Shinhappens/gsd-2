@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +10,7 @@ import { runDispatch, runPreDispatch } from "../auto/phases.ts";
 import { AutoSession } from "../auto/session.ts";
 import { resolveUnitSupervisionTimeouts } from "../auto-timers.ts";
 import { bootstrapAutoSession } from "../auto-start.ts";
-import { postUnitPreVerification } from "../auto-post-unit.ts";
+import { postUnitPostVerification, postUnitPreVerification } from "../auto-post-unit.ts";
 import { resolveDispatch, setResearchProjectPromptBuilderForTest } from "../auto-dispatch.ts";
 import { resolveExpectedArtifactPath, verifyExpectedArtifact, writeBlockerPlaceholder } from "../auto-recovery.ts";
 import { finalizeProjectResearchTimeout } from "../project-research-policy.ts";
@@ -272,6 +272,7 @@ test("deep project setup: bootstrap can start auto-mode without an active milest
       {
         shouldUseWorktreeIsolation: () => false,
         registerSigtermHandler: () => {},
+        registerAutoWorkerForSession: () => {},
         lockBase: () => base,
         buildLifecycle: () => ({
           adoptSessionRoot: (sessionBase: string, originalBase?: string) => {
@@ -386,6 +387,7 @@ test("deep project setup: bootstrap continues queued M002 without milestone cont
       {
         shouldUseWorktreeIsolation: () => false,
         registerSigtermHandler: () => {},
+        registerAutoWorkerForSession: () => {},
         lockBase: () => base,
         buildLifecycle: () => ({
           adoptSessionRoot: (sessionBase: string, originalBase?: string) => {
@@ -1581,6 +1583,63 @@ test("deep project setup: discuss-milestone question failure pauses instead of a
     assert.ok(
       notifications.some((message) => message.includes("waiting for your input")),
       "should notify that the discuss unit is waiting for user input",
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("verified task git closeout failure retries and continues auto-mode", async () => {
+  const base = makeBase();
+  try {
+    execFileSync("git", ["init"], { cwd: base, stdio: "ignore" });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: base, stdio: "ignore" });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: base, stdio: "ignore" });
+    const hookPath = join(base, ".git", "hooks", "pre-commit");
+    writeFileSync(
+      hookPath,
+      [
+        "#!/bin/sh",
+        "count_file=.git/pre-commit-count",
+        "count=0",
+        "if [ -f \"$count_file\" ]; then count=$(cat \"$count_file\"); fi",
+        "count=$((count + 1))",
+        "printf \"%s\" \"$count\" > \"$count_file\"",
+        "echo blocked by test hook >&2",
+        "exit 1",
+      ].join("\n"),
+    );
+    chmodSync(hookPath, 0o755);
+    writeFileSync(join(base, "work.txt"), "changed\n");
+
+    const s = new AutoSession();
+    s.active = true;
+    s.basePath = base;
+    s.originalBasePath = base;
+    s.currentUnit = { type: "execute-task", id: "M001/S01/T01", startedAt: Date.now() };
+
+    let pauseCalled = false;
+    const notifications: Array<{ message: string; severity?: string }> = [];
+    const result = await postUnitPostVerification({
+      s,
+      ctx: { ui: { notify: (message: string, severity?: string) => notifications.push({ message, severity }) } } as any,
+      pi: {} as any,
+      buildSnapshotOpts: () => ({}) as any,
+      lockBase: () => base,
+      stopAuto: async () => {},
+      pauseAuto: async () => { pauseCalled = true; },
+      updateProgressWidget: () => {},
+    });
+
+    assert.equal(result, "continue");
+    assert.equal(pauseCalled, false);
+    assert.equal(s.lastGitActionStatus, "failed");
+    const preCommitCount = Number(readFileSync(join(base, ".git", "pre-commit-count"), "utf-8"));
+    assert.equal(Number.isFinite(preCommitCount), true);
+    assert.ok(preCommitCount >= 3, "git closeout should retry the failing commit path");
+    assert.ok(
+      notifications.some((entry) => entry.severity === "warning" && entry.message.includes("Git commit failed")),
+      "verified task git closeout failure should warn instead of stopping auto-mode",
     );
   } finally {
     rmSync(base, { recursive: true, force: true });

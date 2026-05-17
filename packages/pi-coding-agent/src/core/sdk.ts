@@ -573,7 +573,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					const removed = modelRegistry.authStorage.removeLegacyOAuthCredential(resolvedProvider);
 					if (removed) {
 						console.warn(
-							`[auth] Removed unsupported Anthropic OAuth credential from auth.json (#3952).`,
+							`[auth] Removed unsupported Anthropic OAuth credential from auth.json.`,
 						);
 					}
 					if (isClaudeCodeBinaryInPath()) {

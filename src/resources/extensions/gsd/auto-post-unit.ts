@@ -7,8 +7,8 @@
  *
  * Split into two functions called sequentially by auto-loop with
  * the verification gate between them:
- *   1. postUnitPreVerification() — commit, doctor, state rebuild, worktree sync, artifact verification
- *   2. postUnitPostVerification() — DB dual-write, hooks, triage, quick-tasks
+ *   1. postUnitPreVerification() — closeout git for non-task units, doctor, state rebuild, worktree sync, artifact verification
+ *   2. postUnitPostVerification() — post-verified task git, DB dual-write, hooks, triage, quick-tasks
  *
  * Extracted from the pre-loop agent_end handler in auto.ts.
  */
@@ -41,12 +41,13 @@ import {
   resolveExpectedArtifactPath,
   writeBlockerPlaceholder,
   diagnoseExpectedArtifact,
+  diagnoseWorktreeIntegrityFailure,
 } from "./auto-recovery.js";
 import { regenerateIfMissing } from "./workflow-projections.js";
 import { WorktreeStateProjection } from "./worktree-state-projection.js";
 import { createWorkspace, scopeMilestone } from "./workspace.js";
 import { normalizeWorktreePathForCompare } from "./worktree-root.js";
-import { isDbAvailable, getTask, getSlice, getMilestone, updateTaskStatus, _getAdapter, getVerificationEvidence } from "./gsd-db.js";
+import { isDbAvailable, getDbPath, refreshOpenDatabaseFromDisk, getTask, getSlice, getMilestone, updateTaskStatus, _getAdapter, getVerificationEvidence } from "./gsd-db.js";
 import { renderPlanCheckboxes } from "./markdown-renderer.js";
 import { consumeSignal } from "./session-status-io.js";
 import {
@@ -62,8 +63,7 @@ import { runSafely } from "./auto-utils.js";
 import type { AutoSession, SidecarItem } from "./auto/session.js";
 import { getEvidence, clearEvidenceFromDisk } from "./safety/evidence-collector.js";
 import { validateFileChanges } from "./safety/file-change-validator.js";
-// crossReferenceEvidence available for future use when verification_evidence is stored in DB
-// import { crossReferenceEvidence, type ClaimedEvidence } from "./safety/evidence-cross-ref.js";
+import { crossReferenceEvidence, type ClaimedEvidence } from "./safety/evidence-cross-ref.js";
 import { validateContent } from "./safety/content-validator.js";
 import { resolveSafetyHarnessConfig } from "./safety/safety-harness.js";
 import { resolveExpectedArtifactPath as resolveArtifactForContent } from "./auto-artifact-paths.js";
@@ -83,6 +83,9 @@ import {
   finalizeProjectResearchTimeout,
 } from "./project-research-policy.js";
 import { validateArtifact } from "./schemas/validate.js";
+import { verificationRetryKey } from "./auto/verification-retry-policy.js";
+import { getLedger } from "./metrics.js";
+import { getUnitCostSpikeAction } from "./auto-budget.js";
 
 // ─── Path Comparison Helper ───────────────────────────────────────────────
 /** Compare two paths for physical identity, tolerating trailing slashes and symlinks. */
@@ -108,6 +111,40 @@ function formatPreExecutionCheckDetail(check: PreExecutionCheckJSON): string {
 
 const COMPLETE_MILESTONE_DB_SETTLE_MS = 1500;
 const COMPLETE_MILESTONE_DB_SETTLE_POLL_MS = 100;
+const GIT_ACTION_FAILURE_LOG_REL_PATH = ".gsd/git-action-failures.log";
+const DEFAULT_PER_UNIT_COST_CAP_USD = 5.0;
+
+function getCurrentUnitCostStats(unitId: string): { unitCostUsd: number; rollingAvgUsd: number } {
+  const ledger = getLedger();
+  if (!ledger || !Array.isArray(ledger.units) || ledger.units.length === 0) {
+    return { unitCostUsd: 0, rollingAvgUsd: 0 };
+  }
+  let unitCostUsd = 0;
+  let totalCost = 0;
+  let totalUnits = 0;
+  for (const unit of ledger.units) {
+    const cost = typeof unit?.cost === "number" ? unit.cost : 0;
+    if (!Number.isFinite(cost) || cost < 0) continue;
+    totalCost += cost;
+    totalUnits++;
+    if (unit?.id === unitId) unitCostUsd += cost;
+  }
+  return {
+    unitCostUsd,
+    rollingAvgUsd: totalUnits > 0 ? totalCost / totalUnits : 0,
+  };
+}
+
+function persistGitActionFailure(basePath: string, action: TurnGitActionMode, message: string): string {
+  const logPath = join(basePath, GIT_ACTION_FAILURE_LOG_REL_PATH);
+  const logDir = join(basePath, ".gsd");
+  const timestamp = new Date().toISOString();
+  const body = message.trim() || "unknown git failure";
+  const entry = `[${timestamp}] action=${action}\n${body}\n\n`;
+  mkdirSync(logDir, { recursive: true });
+  appendFileSync(logPath, entry, "utf-8");
+  return logPath;
+}
 
 function stripKnownIdPrefix(value: string | undefined | null, id: string): string | undefined {
   const raw = String(value ?? "").trim();
@@ -163,7 +200,12 @@ async function buildTaskCommitContextForUnit(
     sliceTitle: stripKnownIdPrefix(slice?.title, sid),
     oneLiner: summary?.oneLiner || task?.one_liner || undefined,
     keyFiles:
-      summary?.frontmatter.key_files?.filter(f => !f.includes("{{")) ??
+      summary?.frontmatter.key_files?.filter((f) => {
+        const normalized = f.trim();
+        return normalized.length > 0 &&
+          !normalized.includes("{{") &&
+          !/^(?:\(none\)|none\.?|n\/a)$/i.test(normalized);
+      }) ??
       task?.key_files ??
       undefined,
     issueNumber: ghIssueNumber,
@@ -221,6 +263,10 @@ export function _shouldDispatchQuickTaskForTest(
     state.currentUnit.type !== "quick-task";
 }
 
+export function shouldDeferCloseoutGitAction(unitType: string): boolean {
+  return unitType === "execute-task";
+}
+
 /** Unit types that only touch `.gsd/` internal state files (no code changes).
  *  Auto-commit is skipped for these — their state files are picked up by the
  *  next actual task commit via `smartStage()`. */
@@ -236,7 +282,7 @@ import {
   unitVerb,
   describeNextUnit,
 } from "./auto-dashboard.js";
-import { existsSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { join, relative } from "node:path";
 import { _resetHasChangesCache } from "./native-git-bridge.js";
 import { autoCommitCurrentBranch } from "./worktree.js";
@@ -366,7 +412,7 @@ export function detectRogueFileWrites(
 export const MAX_ARTIFACT_VERIFICATION_RETRIES = 3;
 
 export const STEP_COMPLETE_FALLBACK_MESSAGE =
-  "Step complete. Run /clear, then /gsd to continue (or /gsd auto to run continuously).";
+  "Step complete. Run /clear if you want a clean view, then /gsd next to continue one step (or /gsd auto to run continuously).";
 
 export function buildStepCompleteMessage(nextState: import("./types.js").GSDState): string {
   if (nextState.phase === "complete") {
@@ -374,7 +420,24 @@ export function buildStepCompleteMessage(nextState: import("./types.js").GSDStat
   }
   const next = describeNextUnit(nextState);
   return `Step complete. Next: ${next.label}\n`
-    + `Run /clear, then /gsd to continue (or /gsd auto to run continuously).`;
+    + `Run /clear if you want a clean view, then /gsd next to continue one step (or /gsd auto to run continuously).`;
+}
+
+/**
+ * Decide whether step mode should stop at the step wizard after a unit finishes.
+ *
+ * @param currentUnitType The just-finished unit type, such as "execute-task" or
+ *   "complete-milestone"; may be null/undefined when no current unit is known.
+ * @param phaseAfterUnit The freshly derived next phase, such as "executing" or
+ *   "complete"; may be null/undefined if state derivation failed.
+ * @returns true to show the step wizard; false to keep the loop running so
+ *   terminal milestone completion can reach the merge/finalization path.
+ */
+export function shouldReturnStepWizardAfterUnit(
+  currentUnitType: string | null | undefined,
+  phaseAfterUnit: string | null | undefined,
+): boolean {
+  return currentUnitType !== "complete-milestone" && phaseAfterUnit !== "complete";
 }
 
 export interface PreVerificationOpts {
@@ -409,6 +472,11 @@ function artifactValidationKind(unitType: string): "project" | "requirements" | 
 }
 
 function describeArtifactVerificationFailure(unitType: string, unitId: string, basePath: string): string {
+  const worktreeFailure = diagnoseWorktreeIntegrityFailure(basePath);
+  if (worktreeFailure) {
+    return `${worktreeFailure} Unit: ${unitType} ${unitId}.`;
+  }
+
   const artifactPath = resolveExpectedArtifactPath(unitType, unitId, basePath);
   if (!artifactPath) {
     return `Artifact verification failed: ${unitType} "${unitId}" has no resolvable artifact path.`;
@@ -466,6 +534,178 @@ export async function autoCommitUnit(
 }
 
 /**
+ * Execute the turn-level git action (commit, snapshot, or status-only).
+ *
+ * @param opts.softFailure - Defaults to false. When true, retry git failures,
+ * warn, and continue without pausing auto-mode; use for best-effort deferred
+ * closeout work where a git failure should not block the run.
+ */
+async function runCloseoutGitAction(
+  pctx: PostUnitContext,
+  unit: NonNullable<AutoSession["currentUnit"]>,
+  opts?: { softFailure?: boolean },
+): Promise<"continue" | "dispatched"> {
+  const { s, ctx, pi, pauseAuto } = pctx;
+  const prefs = loadEffectiveGSDPreferences()?.preferences;
+  const uokFlags = resolveUokFlags(prefs);
+  const turnAction: TurnGitActionMode = uokFlags.gitops ? uokFlags.gitopsTurnAction : "commit";
+  const traceId = s.currentTraceId ?? `turn:${unit.startedAt}`;
+  const turnId = s.currentTurnId ?? `${unit.type}/${unit.id}/${unit.startedAt}`;
+
+  s.lastGitActionFailure = null;
+  s.lastGitActionStatus = null;
+
+  try {
+    let taskContext: TaskCommitContext | undefined;
+    let targetRepositories: string[] | undefined;
+
+    if (turnAction === "commit" && unit.type === "execute-task") {
+      taskContext = await buildTaskCommitContextForUnit(s.basePath, unit.id);
+      const { milestone: mid, slice: sid, task: tid } = parseUnitId(unit.id);
+      if (mid && sid && tid && isDbAvailable()) {
+        targetRepositories = getTask(mid, sid, tid)?.target_repositories;
+      }
+    }
+
+    // Invalidate the nativeHasChanges cache before auto-commit (#1853).
+    // The cache has a 10-second TTL and is keyed by basePath. A stale
+    // `false` result causes autoCommit to skip staging entirely.
+    _resetHasChangesCache();
+
+    const skipLifecycleCommit =
+      turnAction === "commit" && LIFECYCLE_ONLY_UNITS.has(unit.type);
+
+    if (skipLifecycleCommit) {
+      debugLog("postUnit", {
+        phase: "git-action-skipped",
+        reason: "lifecycle-only-unit",
+        unitType: unit.type,
+        unitId: unit.id,
+      });
+    } else {
+      const maxAttempts = opts?.softFailure ? 3 : 1;
+      let gitResult = runTurnGitAction({
+        basePath: s.basePath,
+        action: turnAction,
+        unitType: unit.type,
+        unitId: unit.id,
+        taskContext,
+        targetRepositories,
+      });
+      for (let attempt = 1; gitResult.status === "failed" && attempt < maxAttempts; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+        gitResult = runTurnGitAction({
+          basePath: s.basePath,
+          action: turnAction,
+          unitType: unit.type,
+          unitId: unit.id,
+          taskContext,
+          targetRepositories,
+        });
+      }
+
+      if (uokFlags.gitops) {
+        writeTurnGitTransaction({
+          basePath: s.basePath,
+          traceId,
+          turnId,
+          unitType: unit.type,
+          unitId: unit.id,
+          stage: "publish",
+          action: turnAction,
+          push: uokFlags.gitopsTurnPush,
+          status: gitResult.status,
+          error: gitResult.error,
+          metadata: {
+            dirty: gitResult.dirty,
+            dirtyRepositories: gitResult.dirtyRepositories,
+            commitMessage: gitResult.commitMessage,
+            commitMessages: gitResult.commitMessages,
+            commitErrors: gitResult.commitErrors,
+            skippedRepositories: gitResult.skippedRepositories,
+            snapshotLabel: gitResult.snapshotLabel,
+          },
+        });
+      }
+
+      if (gitResult.status === "failed") {
+        s.lastGitActionFailure = gitResult.error ?? `git ${turnAction} failed`;
+        s.lastGitActionStatus = "failed";
+        const fullError = gitResult.error ?? "unknown error";
+        const failureLogPath = persistGitActionFailure(s.basePath, turnAction, fullError);
+        if (uokFlags.gitops && uokFlags.gates) {
+          const parsed = parseUnitId(unit.id);
+          const gateRunner = new UokGateRunner();
+          gateRunner.register({
+            id: "closeout-git-action",
+            type: "closeout",
+            execute: async () => ({
+              outcome: "fail",
+              failureClass: "git",
+              rationale: `turn git action "${turnAction}" failed`,
+              findings: fullError,
+            }),
+          });
+          await gateRunner.run("closeout-git-action", {
+            basePath: s.basePath,
+            traceId,
+            turnId,
+            milestoneId: parsed.milestone ?? undefined,
+            sliceId: parsed.slice ?? undefined,
+            taskId: parsed.task ?? undefined,
+            unitType: unit.type,
+            unitId: unit.id,
+          });
+        }
+
+        const failureMsg = `Git ${turnAction} failed: ${fullError.split("\n")[0]} (full details: ${failureLogPath})`;
+        ctx.ui.notify(failureMsg, opts?.softFailure ? "warning" : "error");
+        debugLog("postUnit", {
+          phase: opts?.softFailure ? "git-action-failed-soft" : "git-action-failed-blocking",
+          action: turnAction,
+          error: fullError,
+          failureLogPath,
+        });
+        if (opts?.softFailure) {
+          return "continue";
+        }
+        await pauseAuto(ctx, pi);
+        return "dispatched";
+      }
+
+      s.lastGitActionStatus = "ok";
+
+      if (turnAction === "commit" && gitResult.commitMessage) {
+        ctx.ui.notify(`Committed: ${gitResult.commitMessage.split("\n")[0]}`, "info");
+      } else if (turnAction === "snapshot" && gitResult.snapshotLabel) {
+        ctx.ui.notify(`Snapshot recorded: ${gitResult.snapshotLabel}`, "info");
+      }
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    s.lastGitActionFailure = message;
+    s.lastGitActionStatus = "failed";
+    debugLog("postUnit", { phase: "git-action", error: message, action: turnAction });
+    ctx.ui.notify(`Git ${turnAction} failed: ${message.split("\n")[0]}`, opts?.softFailure ? "warning" : "error");
+    if (opts?.softFailure) {
+      return "continue";
+    }
+    if (uokFlags.gitops) {
+      await pauseAuto(ctx, pi);
+      return "dispatched";
+    }
+  }
+
+  // GitHub sync (non-blocking, opt-in)
+  await runSafely("postUnit", "github-sync", async () => {
+    const { runGitHubSync } = await import("../github-sync/sync.js");
+    await runGitHubSync(s.basePath, unit.type, unit.id);
+  });
+
+  return "continue";
+}
+
+/**
  * Pre-verification processing: parallel worker signal check, cache invalidation,
  * auto-commit, doctor run, state rebuild, worktree sync, artifact verification.
  *
@@ -475,7 +715,7 @@ export async function autoCommitUnit(
  * - "retry" — artifact verification failed, s.pendingVerificationRetry set for loop re-iteration
  */
 export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreVerificationOpts): Promise<"dispatched" | "continue" | "retry"> {
-  const { s, ctx, pi, buildSnapshotOpts, stopAuto, pauseAuto } = pctx;
+  const { s, ctx, pi, stopAuto, pauseAuto } = pctx;
 
   // ── Parallel worker signal check ──
   const milestoneLock = process.env.GSD_MILESTONE_LOCK;
@@ -501,134 +741,29 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
     await new Promise(r => setTimeout(r, 100));
   }
 
-  const prefs = loadEffectiveGSDPreferences()?.preferences;
-  const uokFlags = resolveUokFlags(prefs);
+  const dbPath = getDbPath();
+  if (isDbAvailable() && dbPath && dbPath !== ":memory:") {
+    const refreshed = refreshOpenDatabaseFromDisk();
+    if (!refreshed) {
+      logWarning("db", "post-unit database refresh failed; derived state may be stale");
+    }
+  }
 
   // Turn-level git action (commit | snapshot | status-only)
   if (s.currentUnit) {
     const unit = s.currentUnit;
-    const turnAction: TurnGitActionMode = uokFlags.gitops ? uokFlags.gitopsTurnAction : "commit";
-    const traceId = s.currentTraceId ?? `turn:${unit.startedAt}`;
-    const turnId = s.currentTurnId ?? `${unit.type}/${unit.id}/${unit.startedAt}`;
-    s.lastGitActionFailure = null;
-    s.lastGitActionStatus = null;
-    try {
-      let taskContext: TaskCommitContext | undefined;
-
-      if (turnAction === "commit" && s.currentUnit.type === "execute-task") {
-        taskContext = await buildTaskCommitContextForUnit(s.basePath, s.currentUnit.id);
-      }
-
-      // Invalidate the nativeHasChanges cache before auto-commit (#1853).
-      // The cache has a 10-second TTL and is keyed by basePath.  A stale
-      // `false` result causes autoCommit to skip staging entirely, leaving
-      // code files only in the working tree where they are destroyed by
-      // `git worktree remove --force` during teardown.
-      _resetHasChangesCache();
-
-      const skipLifecycleCommit =
-        turnAction === "commit" && LIFECYCLE_ONLY_UNITS.has(s.currentUnit.type);
-
-      if (skipLifecycleCommit) {
-        debugLog("postUnit", {
-          phase: "git-action-skipped",
-          reason: "lifecycle-only-unit",
-          unitType: s.currentUnit.type,
-          unitId: s.currentUnit.id,
-        });
-      } else {
-        const gitResult = runTurnGitAction({
-          basePath: s.basePath,
-          action: turnAction,
-          unitType: s.currentUnit.type,
-          unitId: s.currentUnit.id,
-          taskContext,
-        });
-
-        if (uokFlags.gitops) {
-          writeTurnGitTransaction({
-            basePath: s.basePath,
-            traceId,
-            turnId,
-            unitType: unit.type,
-            unitId: unit.id,
-            stage: "publish",
-            action: turnAction,
-            push: uokFlags.gitopsTurnPush,
-            status: gitResult.status,
-            error: gitResult.error,
-            metadata: {
-              dirty: gitResult.dirty,
-              commitMessage: gitResult.commitMessage,
-              snapshotLabel: gitResult.snapshotLabel,
-            },
-          });
-        }
-
-        if (gitResult.status === "failed") {
-          s.lastGitActionFailure = gitResult.error ?? `git ${turnAction} failed`;
-          s.lastGitActionStatus = "failed";
-          if (uokFlags.gitops && uokFlags.gates) {
-            const parsed = parseUnitId(unit.id);
-            const gateRunner = new UokGateRunner();
-            gateRunner.register({
-              id: "closeout-git-action",
-              type: "closeout",
-              execute: async () => ({
-                outcome: "fail",
-                failureClass: "git",
-                rationale: `turn git action "${turnAction}" failed`,
-                findings: gitResult.error ?? "unknown git failure",
-              }),
-            });
-            await gateRunner.run("closeout-git-action", {
-              basePath: s.basePath,
-              traceId,
-              turnId,
-              milestoneId: parsed.milestone ?? undefined,
-              sliceId: parsed.slice ?? undefined,
-              taskId: parsed.task ?? undefined,
-              unitType: unit.type,
-              unitId: unit.id,
-            });
-          }
-
-          const failureMsg = `Git ${turnAction} failed: ${(gitResult.error ?? "unknown error").split("\n")[0]}`;
-          ctx.ui.notify(failureMsg, "error");
-          debugLog("postUnit", {
-            phase: "git-action-failed-blocking",
-            action: turnAction,
-            error: gitResult.error ?? "unknown error",
-          });
-          await pauseAuto(ctx, pi);
-          return "dispatched";
-        }
-
-        s.lastGitActionStatus = "ok";
-
-        if (turnAction === "commit" && gitResult.commitMessage) {
-          ctx.ui.notify(`Committed: ${gitResult.commitMessage.split("\n")[0]}`, "info");
-        } else if (turnAction === "snapshot" && gitResult.snapshotLabel) {
-          ctx.ui.notify(`Snapshot recorded: ${gitResult.snapshotLabel}`, "info");
-        }
-      }
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      s.lastGitActionFailure = message;
-      s.lastGitActionStatus = "failed";
-      debugLog("postUnit", { phase: "git-action", error: message, action: turnAction });
-      ctx.ui.notify(`Git ${turnAction} failed: ${message.split("\n")[0]}`, uokFlags.gitops ? "error" : "warning");
-      if (uokFlags.gitops) {
-        await pauseAuto(ctx, pi);
+    if (shouldDeferCloseoutGitAction(unit.type)) {
+      debugLog("postUnit", {
+        phase: "git-action-deferred-until-verification",
+        unitType: unit.type,
+        unitId: unit.id,
+      });
+    } else {
+      const gitActionResult = await runCloseoutGitAction(pctx, unit);
+      if (gitActionResult === "dispatched") {
         return "dispatched";
       }
     }
-
-    // GitHub sync (non-blocking, opt-in)
-    await runSafely("postUnit", "github-sync", async () => {
-      const { runGitHubSync } = await import("../github-sync/sync.js");
-      await runGitHubSync(s.basePath, unit.type, unit.id);
-    });
 
     // Prune dead bg-shell processes
     await runSafely("postUnit", "prune-bg-shell", async () => {
@@ -865,7 +1000,7 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
       if (safetyConfig.enabled) {
         const { milestone: sMid, slice: sSid, task: sTid } = parseUnitId(s.currentUnit.id);
 
-        // File change validation (execute-task only, after auto-commit)
+        // File change validation (execute-task only, after unit execution)
         if (safetyConfig.file_change_validation && s.currentUnit.type === "execute-task" && sMid && sSid && sTid && isDbAvailable()) {
           try {
             const taskRow = getTask(sMid, sSid, sTid);
@@ -901,15 +1036,43 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
             const bashCalls = actual.filter(e => e.kind === "bash");
             if (sMid && sSid && sTid && isDbAvailable()) {
               const taskRow = getTask(sMid, sSid, sTid);
-              const claimedCommands = getVerificationEvidence(sMid, sSid, sTid)
-                .map((row) => row.command)
-                .filter((command): command is string => typeof command === "string" && command.trim().length > 0);
-              if (taskRow?.status === "complete" && claimedCommands.length > 0 && bashCalls.length === 0) {
-                logWarning("safety", "task claimed verification command evidence but no execution tool calls were recorded");
-                ctx.ui.notify(
-                  `Safety: task ${sTid} claimed command evidence but no execution tool calls were recorded`,
-                  "warning",
-                );
+              if (taskRow?.status === "complete") {
+                const claimedEvidence: ClaimedEvidence[] = getVerificationEvidence(sMid, sSid, sTid)
+                  .map((row) => ({
+                    command: row.command,
+                    exitCode: row.exit_code,
+                    verdict: row.verdict,
+                    createdAt: row.created_at,
+                  }))
+                  .filter((row) => typeof row.command === "string" && row.command.trim().length > 0);
+                const mismatches = crossReferenceEvidence(claimedEvidence, actual);
+
+                for (const mismatch of mismatches) {
+                  const logMessage = `evidence-xref: ${mismatch.reason}`;
+                  if (mismatch.severity === "error") {
+                    logError("safety", logMessage);
+                  } else {
+                    logWarning("safety", logMessage);
+                  }
+                }
+
+                if (claimedEvidence.length > 0 && bashCalls.length === 0) {
+                  logWarning("safety", "task claimed verification command evidence but no execution tool calls were recorded");
+                  ctx.ui.notify(
+                    `Safety: task ${sTid} claimed command evidence but no execution tool calls were recorded`,
+                    "warning",
+                  );
+                }
+
+                const blockingMismatch = mismatches.find((mismatch) => mismatch.severity === "error");
+                if (blockingMismatch) {
+                  ctx.ui.notify(
+                    `Safety: task ${sTid} claimed passing verification that failed in recorded execution`,
+                    "error",
+                  );
+                  await pauseAuto(ctx, pi);
+                  return "dispatched";
+                }
               }
             }
           } catch (e) {
@@ -1016,6 +1179,7 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
         );
         s.pendingVerificationRetry = null;
         s.verificationRetryCount.delete(retryKey);
+        s.verificationRetryFailureHashes.delete(retryKey);
         triggerArtifactVerified = verifyExpectedArtifact(s.currentUnit.type, s.currentUnit.id, s.basePath);
         if (triggerArtifactVerified) {
           invalidateAllCaches();
@@ -1074,12 +1238,31 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
         s.lastToolInvocationError = null;
         s.pendingVerificationRetry = null;
         s.verificationRetryCount.delete(retryKey);
+        s.verificationRetryFailureHashes.delete(retryKey);
         writeBlockerPlaceholder(s.currentUnit.type, s.currentUnit.id, s.basePath, reason);
         ctx.ui.notify(
-          `${s.currentUnit.type} ${s.currentUnit.id} — deterministic policy rejection, wrote blocker placeholder (no retries) (#4973)`,
+          `${s.currentUnit.type} ${s.currentUnit.id} — deterministic policy rejection, wrote blocker placeholder (no retries)`,
           "warning",
         );
         // Fall through to "continue" — do NOT enter the retry or db-unavailable paths.
+      } else if (!triggerArtifactVerified && diagnoseWorktreeIntegrityFailure(s.basePath)) {
+        const retryKey = `${s.currentUnit.type}:${s.currentUnit.id}`;
+        const worktreeFailure = diagnoseWorktreeIntegrityFailure(s.basePath)!;
+        s.pendingVerificationRetry = null;
+        s.verificationRetryCount.delete(retryKey);
+        s.verificationRetryFailureHashes.delete(retryKey);
+        debugLog("postUnit", {
+          phase: "worktree-integrity-failure",
+          unitType: s.currentUnit.type,
+          unitId: s.currentUnit.id,
+          basePath: s.basePath,
+        });
+        ctx.ui.notify(
+          `${worktreeFailure} Retry ${s.currentUnit.id} after repair.`,
+          "error",
+        );
+        await pauseAuto(ctx, pi);
+        return "dispatched";
       } else if (!triggerArtifactVerified && !isDbAvailable()) {
         debugLog("postUnit", { phase: "artifact-verify-skip-db-unavailable", unitType: s.currentUnit.type, unitId: s.currentUnit.id });
         const dbSkipDiag = diagnoseExpectedArtifact(s.currentUnit.type, s.currentUnit.id, s.basePath);
@@ -1103,6 +1286,34 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
         const hasExpectedArtifact = resolveExpectedArtifactPath(s.currentUnit.type, s.currentUnit.id, s.basePath) !== null;
         if (hasExpectedArtifact) {
           const retryKey = `${s.currentUnit.type}:${s.currentUnit.id}`;
+          const prefs = loadEffectiveGSDPreferences()?.preferences;
+          const perUnitCapUsd =
+            typeof prefs?.per_unit_cost_cap_usd === "number" && Number.isFinite(prefs.per_unit_cost_cap_usd) && prefs.per_unit_cost_cap_usd > 0
+              ? prefs.per_unit_cost_cap_usd
+              : DEFAULT_PER_UNIT_COST_CAP_USD;
+          const { unitCostUsd, rollingAvgUsd } = getCurrentUnitCostStats(s.currentUnit.id);
+          if (unitCostUsd >= perUnitCapUsd) {
+            s.pendingVerificationRetry = null;
+            s.verificationRetryCount.delete(retryKey);
+            s.verificationRetryFailureHashes.delete(retryKey);
+            ctx.ui.notify(
+              `Unit ${s.currentUnit.id} hit per-unit cap $${perUnitCapUsd.toFixed(2)} — pausing auto-mode.`,
+              "error",
+            );
+            await pauseAuto(ctx, pi);
+            return "dispatched";
+          }
+          if (getUnitCostSpikeAction(unitCostUsd, rollingAvgUsd, 3.0) === "pause") {
+            s.pendingVerificationRetry = null;
+            s.verificationRetryCount.delete(retryKey);
+            s.verificationRetryFailureHashes.delete(retryKey);
+            ctx.ui.notify(
+              `Unit ${s.currentUnit.id} cost spike detected (${unitCostUsd.toFixed(2)} vs avg ${rollingAvgUsd.toFixed(2)}) — pausing auto-mode.`,
+              "error",
+            );
+            await pauseAuto(ctx, pi);
+            return "dispatched";
+          }
           const attempt = (s.verificationRetryCount.get(retryKey) ?? 0) + 1;
           const failureDetails = describeArtifactVerificationFailure(
             s.currentUnit.type,
@@ -1111,6 +1322,7 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
           );
           if (attempt > MAX_ARTIFACT_VERIFICATION_RETRIES) {
             s.verificationRetryCount.delete(retryKey);
+            s.verificationRetryFailureHashes.delete(retryKey);
             debugLog("postUnit", { phase: "artifact-verify-exhausted", unitType: s.currentUnit.type, unitId: s.currentUnit.id, attempt });
             ctx.ui.notify(
               `${failureDetails} Pausing auto-mode after ${MAX_ARTIFACT_VERIFICATION_RETRIES} retries.`,
@@ -1137,7 +1349,9 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
       // Verification succeeded — clear the retry counter so a future failure
       // of the same unit gets a full retry budget instead of the stale count.
       if (triggerArtifactVerified) {
-        s.verificationRetryCount.delete(`${s.currentUnit.type}:${s.currentUnit.id}`);
+        const retryKey = verificationRetryKey(s.currentUnit.type, s.currentUnit.id);
+        s.verificationRetryCount.delete(retryKey);
+        s.verificationRetryFailureHashes.delete(retryKey);
       }
     } else {
       // Hook unit completed — no additional processing needed
@@ -1163,6 +1377,13 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
   const { s, ctx, pi, buildSnapshotOpts, lockBase, stopAuto, pauseAuto, updateProgressWidget } = pctx;
 
   if (s.currentUnit) {
+    if (shouldDeferCloseoutGitAction(s.currentUnit.type)) {
+      const gitActionResult = await runCloseoutGitAction(pctx, s.currentUnit, { softFailure: true });
+      if (gitActionResult === "dispatched") {
+        return "stopped";
+      }
+    }
+
     try {
       const codebasePrefs = loadEffectiveGSDPreferences()?.preferences?.codebase;
       const refresh = ensureCodebaseMapFresh(
@@ -1365,7 +1586,9 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
         // s.canonicalProjectRoot is the project root and lacks files that a
         // prior slice wrote to the worktree but hasn't merged to main yet.
         const preExecutionBasePath = s.basePath;
-        const result: PreExecutionResult = await runPreExecutionChecks(tasks, preExecutionBasePath);
+        const result: PreExecutionResult = await runPreExecutionChecks(tasks, preExecutionBasePath, {
+          additionalRoots: [s.canonicalProjectRoot],
+        });
 
         // Log summary to stderr in existing verification output format
         const emoji = result.status === "pass" ? "✅" : result.status === "warn" ? "⚠️" : "❌";
@@ -1382,12 +1605,12 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
         }
 
         // Write evidence JSON to slice artifacts directory
-        const slicePath = resolveSlicePath(preExecutionBasePath, mid, sid);
+        const slicePath = resolveSlicePath(s.canonicalProjectRoot, mid, sid);
         const evidenceFileName = `${sid}-PRE-EXEC-VERIFY.json`;
         let evidencePath = join(".gsd", "milestones", mid, "slices", sid, evidenceFileName);
         if (slicePath) {
           writePreExecutionEvidence(result, slicePath, mid, sid);
-          evidencePath = relative(preExecutionBasePath, join(slicePath, evidenceFileName)) || evidenceFileName;
+          evidencePath = relative(s.canonicalProjectRoot, join(slicePath, evidenceFileName)) || evidenceFileName;
         }
 
         if (uokFlags.gates) {
@@ -1602,17 +1825,21 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
   }
 
   // Step mode → show wizard instead of dispatch.
-  // Without this notify(), /gsd in step mode finishes a unit and silently
-  // exits the loop, leaving the user with no hint to /clear and /gsd again.
+  // Without this notify(), /gsd next finishes a unit and silently exits the
+  // loop, leaving the user with no next-step command.
   if (s.stepMode) {
+    let phaseAfterUnit: string | null = null;
     try {
       const nextState = await deriveState(s.canonicalProjectRoot);
+      phaseAfterUnit = nextState.phase;
       ctx.ui.notify(buildStepCompleteMessage(nextState), "info");
     } catch (e) {
       debugLog("postUnit", { phase: "step-wizard-notify", error: String(e) });
       ctx.ui.notify(STEP_COMPLETE_FALLBACK_MESSAGE, "info");
     }
-    return "step-wizard";
+    return shouldReturnStepWizardAfterUnit(s.currentUnit?.type, phaseAfterUnit)
+      ? "step-wizard"
+      : "continue";
   }
 
   return "continue";

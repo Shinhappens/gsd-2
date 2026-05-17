@@ -2,10 +2,10 @@
 // File Purpose: Git service integration and commit-message tests.
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, symlinkSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, symlinkSync, readFileSync, chmodSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 
 import {
   inferCommitType,
@@ -371,6 +371,18 @@ describe('git-service', async () => {
     return dir;
   }
 
+  function gitRun(args: string[], cwd: string): string {
+    return execFileSync("git", args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        GIT_ALLOW_PROTOCOL: "file",
+      },
+    }).trim();
+  }
+
   // ─── GitServiceImpl: smart staging ─────────────────────────────────────
 
   test('GitServiceImpl: smart staging', () => {
@@ -411,6 +423,96 @@ describe('git-service', async () => {
     assert.ok(statusOut.includes(".gsd/STATE.md"), "STATE.md still untracked after commit");
 
     rmSync(repo, { recursive: true, force: true });
+  });
+
+  test('GitServiceImpl: task autoCommit skips keyFiles inside submodules', () => {
+    const repo = initTempRepo();
+    const subSrc = mkdtempSync(join(tmpdir(), "gsd-git-submodule-src-"));
+
+    try {
+      gitRun(["init", "-b", "main"], subSrc);
+      gitRun(["config", "user.name", "Pi Test"], subSrc);
+      gitRun(["config", "user.email", "pi@example.com"], subSrc);
+      createFile(subSrc, "tracked.txt", "initial\n");
+      gitRun(["add", "-A"], subSrc);
+      gitRun(["commit", "-m", "init submodule"], subSrc);
+
+      gitRun(["-c", "protocol.file.allow=always", "submodule", "add", `file://${subSrc}`, "sub"], repo);
+      gitRun(["commit", "-m", "add submodule"], repo);
+
+      createFile(repo, "sub/copied.txt", "copied from source\n");
+      createFile(repo, "src/feature.ts", "export const feature = true;\n");
+      createFile(repo, "src/unrelated.ts", "export const unrelated = true;\n");
+
+      const svc = new GitServiceImpl(repo);
+      const taskContext: TaskCommitContext = {
+        taskId: "S01/T01",
+        taskDisplayId: "T01",
+        taskTitle: "fix submodule staging",
+        milestoneId: "M001",
+        milestoneTitle: "Submodule auto commit",
+        sliceId: "S01",
+        sliceTitle: "Commit scoped files",
+        oneLiner: "Fixed auto commit when key files include submodule paths",
+        keyFiles: ["sub/copied.txt", "src/feature.ts"],
+      };
+
+      const result = svc.autoCommit("execute-task", "M001/S01/T01", [], taskContext);
+
+      assert.ok(result !== null, "autoCommit should commit non-submodule changes");
+      const committed = gitRun(["show", "--name-only", "--format=", "HEAD"], repo);
+      assert.ok(committed.includes("src/feature.ts"), "non-submodule keyFile is committed");
+      assert.ok(!committed.includes("sub/copied.txt"), "submodule inner keyFile is not pathspec-staged");
+      assert.ok(!committed.includes("src/unrelated.ts"), "scoped staging does not fall back to smartStage");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(subSrc, { recursive: true, force: true });
+    }
+  });
+
+  test('GitServiceImpl: all keyFiles inside submodules falls back to smartStage', () => {
+    const repo = initTempRepo();
+    const subSrc = mkdtempSync(join(tmpdir(), "gsd-git-all-submodule-src-"));
+
+    try {
+      gitRun(["init", "-b", "main"], subSrc);
+      gitRun(["config", "user.name", "Pi Test"], subSrc);
+      gitRun(["config", "user.email", "pi@example.com"], subSrc);
+      createFile(subSrc, "tracked.txt", "initial\n");
+      gitRun(["add", "-A"], subSrc);
+      gitRun(["commit", "-m", "init submodule"], subSrc);
+
+      gitRun(["-c", "protocol.file.allow=always", "submodule", "add", `file://${subSrc}`, "sub"], repo);
+      gitRun(["commit", "-m", "add submodule"], repo);
+
+      createFile(repo, "sub/file1.txt", "inside submodule\n");
+      createFile(repo, "sub/file2.txt", "also inside\n");
+      createFile(repo, "src/real.ts", "export const real = true;\n");
+
+      const svc = new GitServiceImpl(repo);
+      const taskContext: TaskCommitContext = {
+        taskId: "S01/T02",
+        taskDisplayId: "T02",
+        taskTitle: "all keyFiles inside submodule",
+        milestoneId: "M001",
+        milestoneTitle: "Submodule auto commit",
+        sliceId: "S01",
+        sliceTitle: "Commit scoped files",
+        oneLiner: "Fell back when all key files are inside submodules",
+        keyFiles: ["sub", "sub/file1.txt", "sub/file2.txt"],
+      };
+
+      const result = svc.autoCommit("execute-task", "M001/S01/T02", [], taskContext);
+
+      assert.ok(result !== null, "autoCommit falls back to smartStage when all keyFiles are filtered");
+      const committed = gitRun(["show", "--name-only", "--format=", "HEAD"], repo);
+      assert.ok(!committed.includes("sub/file1.txt"), "submodule keyFile is not committed");
+      assert.ok(!committed.includes("sub/file2.txt"), "submodule keyFile is not committed");
+      assert.ok(committed.includes("src/real.ts"), "smartStage fallback commits other dirty files");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(subSrc, { recursive: true, force: true });
+    }
   });
 
   // ─── GitServiceImpl: smart staging excludes tracked runtime files ──────
@@ -529,6 +631,92 @@ describe('git-service', async () => {
     rmSync(repo, { recursive: true, force: true });
   });
 
+  test('GitServiceImpl: autoCommit retries once when pre-commit rewrites files', () => {
+    const repo = initTempRepo();
+    const svc = new GitServiceImpl(repo);
+
+    const hookPath = join(repo, ".git", "hooks", "pre-commit");
+    const countFile = join(repo, ".git", "pre-commit-count");
+    writeFileSync(
+      hookPath,
+      [
+        "#!/bin/sh",
+        `count_file="${countFile}"`,
+        "count=0",
+        "[ -f \"$count_file\" ] && count=$(cat \"$count_file\")",
+        "count=$((count + 1))",
+        "echo \"$count\" > \"$count_file\"",
+        "if [ \"$count\" -eq 1 ]; then",
+        "  printf 'export const fixed = true;\\n' > src/fix-me.ts",
+        "  exit 1",
+        "fi",
+        "exit 0",
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+    chmodSync(hookPath, 0o755);
+
+    createFile(repo, "src/fix-me.ts", "export const fixed = false;\n");
+    const msg = svc.autoCommit("execute-task", "M001/S01/T04");
+
+    assert.ok(msg !== null, "autoCommit succeeds after one retry for hook rewrites");
+    assert.equal(run("git rev-list --count HEAD", repo), "2", "exactly one new commit created");
+    assert.equal(readFileSync(join(repo, "src/fix-me.ts"), "utf-8"), "export const fixed = true;\n"); // allow-source-grep: verifies pre-commit output inside the temp repo fixture, not product source.
+    assert.equal(readFileSync(countFile, "utf-8").trim(), "2", "pre-commit hook ran twice");
+
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  test('GitServiceImpl: autoCommit retry preserves task-scoped staging', () => {
+    const repo = initTempRepo();
+    const svc = new GitServiceImpl(repo);
+
+    const hookPath = join(repo, ".git", "hooks", "pre-commit");
+    const countFile = join(repo, ".git", "pre-commit-count");
+    writeFileSync(
+      hookPath,
+      [
+        "#!/bin/sh",
+        `count_file="${countFile}"`,
+        "count=0",
+        "[ -f \"$count_file\" ] && count=$(cat \"$count_file\")",
+        "count=$((count + 1))",
+        "echo \"$count\" > \"$count_file\"",
+        "if [ \"$count\" -eq 1 ]; then",
+        "  printf 'export const fixed = true;\\n' > src/task.ts",
+        "  exit 1",
+        "fi",
+        "exit 0",
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+    chmodSync(hookPath, 0o755);
+
+    createFile(repo, "src/task.ts", "export const fixed = false;\n");
+    createFile(repo, "src/unrelated.ts", "export const unrelated = true;\n");
+
+    const msg = svc.autoCommit("execute-task", "M001/S01/T05", [], {
+      taskId: "S01/T05",
+      taskTitle: "update task file",
+      oneLiner: "Updated task file after hook rewrite",
+      keyFiles: ["src/task.ts"],
+    });
+
+    assert.ok(msg !== null, "autoCommit succeeds after retry with task-scoped staging");
+    assert.equal(readFileSync(countFile, "utf-8").trim(), "2", "pre-commit hook ran twice");
+
+    const committed = run("git show --name-only --format= HEAD", repo);
+    assert.ok(committed.includes("src/task.ts"), "task file is committed after retry");
+    assert.ok(!committed.includes("src/unrelated.ts"), "retry does not widen staging to unrelated dirty files");
+
+    const status = run("git status --porcelain", repo);
+    assert.ok(status.includes("src/unrelated.ts"), "unrelated dirty file remains in working tree");
+
+    rmSync(repo, { recursive: true, force: true });
+  });
+
   test('GitServiceImpl: task context keyFiles scope autoCommit staging', () => {
     const repo = initTempRepo();
     const svc = new GitServiceImpl(repo);
@@ -604,6 +792,59 @@ describe('git-service', async () => {
       committed.includes("src/actually-changed.ts"),
       "smartStage fallback stages real dirty files when scoped staging finds nothing",
     );
+
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  // Regression: #5529. Some executors emit keyFiles relative to a monorepo
+  // subproject root (e.g. `src/...`) instead of the repo root
+  // (`frontend/src/...`). When none of those keyFiles exist at repo root,
+  // scoped staging must fall back to smartStage instead of failing the turn.
+  test('GitServiceImpl: repo-relative keyFiles mismatch falls back to smartStage', () => {
+    const repo = initTempRepo();
+    const svc = new GitServiceImpl(repo);
+
+    createFile(repo, "frontend/src/lib/onboarding-contract.ts", "export const contract = true;");
+
+    const msg = svc.autoCommit("execute-task", "M001/S01/T04", [], {
+      taskId: "S01/T04",
+      taskTitle: "fix scoped keyFiles path handling",
+      oneLiner: "Handled repo-relative keyFiles mismatch",
+      keyFiles: ["src/lib/onboarding-contract.ts"],
+    });
+    assert.ok(msg !== null, "autoCommit falls back to smartStage when scoped keyFiles are invalid at repo root");
+
+    const committed = run("git show --name-only --format= HEAD", repo);
+    assert.ok(
+      committed.includes("frontend/src/lib/onboarding-contract.ts"),
+      "smartStage fallback stages real dirty files when keyFiles are scoped to a subproject root",
+    );
+
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  test('GitServiceImpl: task context keyFiles ignores gitignored build outputs', () => {
+    const repo = initTempRepo();
+    const svc = new GitServiceImpl(repo);
+
+    createFile(repo, ".gitignore", "dist/\n");
+    runGit(repo, ["add", ".gitignore"]);
+    runGit(repo, ["commit", "-F", "-"], { input: "ignore dist" });
+
+    createFile(repo, "src/task.ts", "export const task = true;");
+    createFile(repo, "dist/task.js", "export const task = true;");
+
+    const msg = svc.autoCommit("execute-task", "M001/S01/T01", [], {
+      taskId: "S01/T01",
+      taskTitle: "implement scoped task",
+      oneLiner: "Added scoped task implementation",
+      keyFiles: ["src/task.ts", "dist/task.js"],
+    });
+    assert.ok(msg !== null, "autoCommit should commit non-ignored key files");
+
+    const committed = run("git show --name-only --format= HEAD", repo);
+    assert.ok(committed.includes("src/task.ts"), "non-ignored key file is committed");
+    assert.ok(!committed.includes("dist/task.js"), "ignored build output is not committed");
 
     rmSync(repo, { recursive: true, force: true });
   });
@@ -1036,6 +1277,15 @@ describe('git-service', async () => {
 
     writeIntegrationBranch(repo, "M001", "gsd/full-project/new-app");
     assert.deepStrictEqual(readIntegrationBranch(repo, "M001"), null, "full-project branch is not recorded");
+
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  test('Integration branch: rejects milestone branches', () => {
+    const repo = initBranchTestRepo();
+
+    writeIntegrationBranch(repo, "M001", "milestone/M001");
+    assert.deepStrictEqual(readIntegrationBranch(repo, "M001"), null, "milestone branches are not recorded as integration branch");
 
     rmSync(repo, { recursive: true, force: true });
   });

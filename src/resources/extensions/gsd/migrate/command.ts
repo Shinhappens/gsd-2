@@ -34,6 +34,9 @@ export type MigrationImportCounts = ReturnType<typeof migrateFromMarkdown>;
 
 function assertMigrationImportMatchesPreview(imported: MigrationImportCounts, preview: MigrationPreview): void {
   const mismatches: string[] = [];
+  if (imported.decisions !== preview.decisions.total) {
+    mismatches.push(`decisions ${imported.decisions}/${preview.decisions.total}`);
+  }
   if (imported.hierarchy.milestones !== preview.milestoneCount) {
     mismatches.push(`milestones ${imported.hierarchy.milestones}/${preview.milestoneCount}`);
   }
@@ -73,6 +76,7 @@ export async function importWrittenMigrationToDb(
 /** Format preview stats for embedding in the review prompt. */
 function formatPreviewStats(preview: MigrationPreview): string {
   const lines = [
+    `- Decisions: ${preview.decisions.total}`,
     `- Milestones: ${preview.milestoneCount}`,
     `- Slices: ${preview.totalSlices} (${preview.doneSlices} done — ${preview.sliceCompletionPct}%)`,
     `- Tasks: ${preview.totalTasks} (${preview.doneTasks} done — ${preview.taskCompletionPct}%)`,
@@ -179,6 +183,7 @@ export async function handleMigrate(
 
   // ── Build preview text ─────────────────────────────────────────────────────
   const lines: string[] = [
+    `Decisions: ${preview.decisions.total}`,
     `Milestones: ${preview.milestoneCount}`,
     `Slices: ${preview.totalSlices} (${preview.doneSlices} done — ${preview.sliceCompletionPct}%)`,
     `Tasks: ${preview.totalTasks} (${preview.doneTasks} done — ${preview.taskCompletionPct}%)`,

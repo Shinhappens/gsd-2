@@ -26,11 +26,11 @@
 | `/gsd forensics` | Full debugger for auto-mode failures (includes worktree lifecycle telemetry) |
 | `/gsd cleanup` | Clean up state files and stale worktrees |
 | `/gsd worktree` (`/gsd wt`) | Manage GSD worktrees from the TUI |
-| `/gsd visualize` | Open workflow visualizer |
+| `/gsd visualize` | Open workflow visualizer (progress, timeline, deps, metrics, health, agent, changes, knowledge, captures, export) |
 | `/gsd export --html` | Generate HTML report for current milestone |
 | `/gsd export --html --all` | Generate reports for all milestones |
 | `/gsd update` | Update GSD to the latest version |
-| `/gsd knowledge` | Add persistent project knowledge |
+| `/gsd knowledge` | Add persistent project knowledge. Rules append to `KNOWLEDGE.md`; patterns and lessons are captured as memories and projected back into `KNOWLEDGE.md`. |
 | `/gsd fast` | Toggle service tier for supported models |
 | `/gsd rate` | Rate last unit's model tier (over/ok/under) |
 | `/gsd changelog` | Show release notes |

@@ -160,6 +160,69 @@ Recommended verification order:
 - If a server is team-shared and safe to commit, `.mcp.json` is usually the better home.
 - If a server depends on machine-local paths, personal services, or local-only secrets, prefer `.gsd/mcp.json`.
 
+### Per-Model MCP Filtering
+
+Small-context models (e.g. Claude Haiku) suffer prompt-size blowouts when every available MCP server is announced to them. A subagent that only needs `gsd-workflow` does not need the 28 other servers in the prompt. GSD lets you restrict, per model, which MCP servers are exposed to the SDK by configuring `claude_code_mcp.per_model` in `.gsd/PREFERENCES.md`.
+
+#### YAML shape
+
+The block lives in the YAML frontmatter of `.gsd/PREFERENCES.md` under `claude_code_mcp.per_model`. Each key is a **model-ID prefix**; each value has optional `allowed_servers` and `blocked_servers` arrays of MCP server names:
+
+```yaml
+claude_code_mcp:
+  per_model:
+    <model-prefix>:
+      allowed_servers: [server-a, server-b]
+      blocked_servers: [server-c]
+```
+
+Both fields are optional. A model with no matching prefix gets the unfiltered set.
+
+#### Longest-prefix-wins matching
+
+Keys are matched against the active model ID by prefix; when multiple keys match, the **longest matching prefix wins** (longest-prefix-wins). This lets you set a coarse default for a model family and override it for a specific variant without tracking every date-stamped ID:
+
+| Model ID at runtime           | Keys configured                       | Winner             |
+|-------------------------------|---------------------------------------|--------------------|
+| `claude-haiku-4-5-20251001`   | `claude-haiku`, `claude-haiku-4-5`    | `claude-haiku-4-5` |
+| `claude-haiku-3-5-20241022`   | `claude-haiku`, `claude-haiku-4-5`    | `claude-haiku`     |
+| `claude-sonnet-4-6-20250101`  | `claude-haiku`                        | (no match)         |
+
+#### Resolution order: allowlist-first, blocklist-removes
+
+When `allowed_servers` is present, only those servers (plus the implicit `gsd-workflow` allow described below) are exposed; everything else is blocked. `blocked_servers` then removes entries from the resulting set. On overlap, **the blocklist wins** — a server listed in both `allowed_servers` and `blocked_servers` is blocked.
+
+| `allowed_servers` | `blocked_servers` | Effective exposure                                                |
+|-------------------|-------------------|-------------------------------------------------------------------|
+| absent / empty    | absent / empty    | All discovered servers exposed                                    |
+| `[a, b]`          | absent / empty    | Only `a`, `b`, and `gsd-workflow`                                 |
+| absent / empty    | `[c]`             | All discovered servers except `c`                                 |
+| `[a, b]`          | `[b]`             | Only `a` and `gsd-workflow` (`b` removed by blocklist)            |
+
+Blocking is implemented two ways depending on how the server arrives: user MCPs loaded by the SDK from `.mcp.json` / `.claude/settings.json` are blocked via `disallowedTools` patterns (`mcp__<name>__*`); the `gsd-workflow` server, which GSD controls directly, is dropped from the `mcpServers` map when explicitly blocked.
+
+#### `gsd-workflow` implicit allow
+
+GSD's own workflow MCP server (`gsd-workflow`) is **always allowed**, even when not listed in `allowed_servers`, because the GSD engine itself depends on it. The only way to remove `gsd-workflow` from a model's exposure is to name it explicitly in `blocked_servers`. Do this only if you understand that auto-mode tooling on that model will stop working.
+
+#### Worked example
+
+A Haiku subagent that only needs `gsd-workflow` and a single search MCP, and a Sonnet model that has everything except a noisy analytics server:
+
+```yaml
+claude_code_mcp:
+  per_model:
+    claude-haiku-4-5:
+      allowed_servers:
+        - google-search
+      # gsd-workflow is allowed implicitly; no need to list it.
+    claude-sonnet-4-6:
+      blocked_servers:
+        - analytics-noisy
+```
+
+With this configuration, a Haiku-4-5 subagent sees only `gsd-workflow` and `google-search` regardless of how many servers `.mcp.json` defines; a Sonnet-4-6 session sees every discovered server except `analytics-noisy`. Other models match no prefix and are unaffected.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -359,6 +422,24 @@ Defaults and tuning:
 
 When `enabled` is omitted, reactive execution uses the default-on safety threshold of three ready tasks before it attempts a parallel batch. When `enabled: true` is set explicitly, GSD uses the earlier opt-in threshold of two ready tasks.
 
+### `taskIsolation`
+
+Controls optional filesystem isolation for explicit subagent tool calls that set `isolated: true`. This is a global `~/.gsd/agent/settings.json` setting.
+
+```json
+{
+  "taskIsolation": {
+    "mode": "worktree"
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | string | none | `"worktree"` creates a temporary detached git worktree for the child task. `"fuse-overlay"` uses `fuse-overlayfs` on Linux when installed and falls back to `worktree`. Any other value disables subagent filesystem isolation. |
+
+See [Subagents](./subagents.md#filesystem-isolation) for invocation, merge, and recovery behavior.
+
 ### `skill_discovery`
 
 Controls how GSD finds and applies skills during auto mode.
@@ -427,6 +508,8 @@ Enable automatic UAT (User Acceptance Test) runs after slice completion:
 uat_dispatch: true
 ```
 
+When enabled, auto-mode runs UAT after slice completion. Non-PASS verdicts on closed slices do not hard-stop dispatch progression, so downstream remediation slices can continue, but automatic milestone closure is still gated on explicit UAT PASS sign-off for closed slices.
+
 ### Verification (v2.26)
 
 Configure shell commands that run automatically after every task execution. Failures trigger auto-fix retries before advancing.
@@ -441,9 +524,13 @@ verification_max_retries: 2       # max retry attempts (default: 2)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `verification_commands` | string[] | `[]` | Shell commands to run after task execution |
+| `verification_commands` | string[] | `[]` | Simple executable commands to run after task execution |
 | `verification_auto_fix` | boolean | `true` | Auto-retry when verification fails |
 | `verification_max_retries` | number | `2` | Maximum auto-fix retry attempts |
+
+Verification commands must be simple executable commands, not shell pipelines or scripts packed into one line. GSD rejects pipes (`|`), redirects (`>` and `<`), semicolons, backticks, and command substitution (`$(...)`) because verification is run as a controlled command list, not as an arbitrary shell program. Use `python3 -m pytest tests -q` instead of `python3 -m pytest tests -q 2>&1 | tail -5`.
+
+When `verification_commands` is empty and no task-level `verify` command is available, GSD can auto-discover project checks. JavaScript projects use `package.json` scripts in this order: `typecheck`, `lint`, `test`. Python projects use the `python-project` discovery source and run `python3 -m pytest` when GSD finds files matching pytest's default test file patterns (`test_*.py` or `*_test.py`) under `tests/` or an explicit pytest configuration marker: `pytest.ini`, `[tool.pytest]`, `[tool.pytest.*]`, `[pytest]`, or `[tool:pytest]` in `pyproject.toml`.
 
 ### URL Blocking (`fetch_page`)
 
@@ -752,7 +839,7 @@ custom_instructions:
   - "Prefer functional patterns over classes"
 ```
 
-For project-specific knowledge (patterns, gotchas, lessons learned), use `.gsd/KNOWLEDGE.md` instead — it's injected into every agent prompt automatically. Add entries with `/gsd knowledge rule|pattern|lesson <description>`.
+For project-specific knowledge, use the GSD knowledge and memory surfaces instead. `.gsd/KNOWLEDGE.md` is a hybrid projection: manually maintained Rules stay in the file, while generated Patterns and Lessons are backed by the `memories` table and rendered back into the file for review. Add durable operating rules with `/gsd knowledge rule <description>`; agent-discovered patterns and lessons are stored as memories and selected for prompt injection automatically.
 
 ### `RUNTIME.md` — Runtime Context (v2.39)
 
@@ -778,7 +865,7 @@ Declare project-level runtime context in `.gsd/RUNTIME.md`. This file is inlined
 - Redis: localhost:6379
 ```
 
-Use this for information that the agent needs during execution but that doesn't belong in `DECISIONS.md` (architectural) or `KNOWLEDGE.md` (patterns/rules). Common examples: API base URLs, service ports, deployment targets, and environment-specific configuration.
+Use this for information that the agent needs during execution but that doesn't belong in `DECISIONS.md` (architectural) or project knowledge (rules, patterns, lessons). Common examples: API base URLs, service ports, deployment targets, and environment-specific configuration.
 
 ### `dynamic_routing`
 

@@ -26,6 +26,7 @@ const PLANNING_DISPATCH_REVIEW: ToolsPolicy = {
 };
 const READ_ONLY: ToolsPolicy = { mode: 'read-only' };
 const ALL: ToolsPolicy = { mode: 'all' };
+const VERIFICATION: ToolsPolicy = { mode: 'verification' };
 const DOCS: ToolsPolicy = {
   mode: 'docs',
   allowedPathGlobs: ['docs/**', 'README.md', 'README.*.md', 'CHANGELOG.md', '*.md'],
@@ -116,6 +117,11 @@ test('planning-unit: allows read-only bash (cat)', () => {
   assert.strictEqual(r.block, false);
 });
 
+test('planning-unit: allows read-only bash prefixed with cd', () => {
+  const r = shouldBlockPlanningUnit('bash', 'cd .gsd && cat PROJECT.md', BASE, 'plan-slice', PLANNING_DISPATCH);
+  assert.strictEqual(r.block, false);
+});
+
 test('planning-unit: blocks mutating bash (rm -rf)', () => {
   const r = shouldBlockPlanningUnit('bash', 'rm -rf /tmp/foo', BASE, 'discuss-milestone', PLANNING);
   assert.strictEqual(r.block, true);
@@ -157,6 +163,13 @@ test('planning-dispatch: allows subagent dispatch (delegated recon/planner durin
   assert.strictEqual(r.block, false);
 });
 
+test('planning-dispatch: allows markdown agent filenames after identity normalization', () => {
+  const agentClasses = extractSubagentAgentClasses({ agent: 'scout.md' });
+  assert.deepEqual(agentClasses, ['scout']);
+  const r = shouldBlockPlanningUnit('subagent', '', BASE, 'plan-slice', PLANNING_DISPATCH, agentClasses);
+  assert.strictEqual(r.block, false);
+});
+
 test('planning-dispatch: allows task dispatch (delegated recon/planner during slice planning)', () => {
   const r = shouldBlockPlanningUnit('task', '', BASE, 'plan-slice', PLANNING_DISPATCH, ['planner']);
   assert.strictEqual(r.block, false);
@@ -172,6 +185,22 @@ test('planning-dispatch: extracts subagent classes from single, parallel, and ch
     extractSubagentAgentClasses({ chain: [{ agent: 'reviewer' }, { agent: 'security' }] }),
     ['reviewer', 'security'],
   );
+  assert.deepEqual(
+    extractSubagentAgentClasses({
+      chain: [
+        { agent: 'scout' },
+        { parallel: [{ agent: 'reviewer' }, { agent: ' security ' }] },
+      ],
+    }),
+    ['scout', 'reviewer', 'security'],
+  );
+});
+
+test('planning-dispatch: extracts subagent classes without recursing through cycles', () => {
+  const input: { agent: string; parallel?: unknown[] } = { agent: 'scout' };
+  input.parallel = [input, { agent: 'reviewer' }];
+
+  assert.deepEqual(extractSubagentAgentClasses(input), ['scout', 'reviewer']);
 });
 
 test('planning-dispatch: blocks subagent dispatch when agentClasses is undefined (stale caller shim)', () => {
@@ -242,6 +271,24 @@ test('planning-dispatch: blocks recon agent under closeout policy', () => {
   assert.doesNotMatch(r.reason!, /read-only specialists/);
 });
 
+test('complete-slice closeout policy blocks edits to user source', () => {
+  const r = shouldBlockPlanningUnit('edit', join(BASE, 'src', 'main.ts'), BASE, 'complete-slice', PLANNING_DISPATCH_REVIEW);
+  assert.strictEqual(r.block, true);
+  assert.match(r.reason!, /complete-slice/);
+  assert.match(r.reason!, /writes are restricted to \.gsd/);
+});
+
+test('complete-slice closeout policy blocks non-allowlisted verification bash', () => {
+  const r = shouldBlockPlanningUnit('bash', 'go test ./...', BASE, 'complete-slice', PLANNING_DISPATCH_REVIEW);
+  assert.strictEqual(r.block, true);
+  assert.match(r.reason!, /bash is restricted/);
+});
+
+test('complete-slice closeout policy allows gsd_exec verification surface', () => {
+  const r = shouldBlockPlanningUnit('gsd_exec', '', BASE, 'complete-slice', PLANNING_DISPATCH_REVIEW);
+  assert.strictEqual(r.block, false);
+});
+
 test('planning-dispatch: still blocks writes to user source (write isolation preserved)', () => {
   const r = shouldBlockPlanningUnit('write', join(BASE, 'src', 'main.ts'), BASE, 'plan-slice', PLANNING_DISPATCH);
   assert.strictEqual(r.block, true);
@@ -295,6 +342,36 @@ test('all-mode: execute-task can run arbitrary bash', () => {
 test('all-mode: execute-task can dispatch subagents', () => {
   const r = shouldBlockPlanningUnit('subagent', '', BASE, 'execute-task', ALL);
   assert.strictEqual(r.block, false);
+});
+
+// ─── verification mode: bash allowed, writes still scoped ─────────────────
+
+test('verification-mode: run-uat can run build commands', () => {
+  const r = shouldBlockPlanningUnit('bash', 'npm run build 2>&1', BASE, 'run-uat', VERIFICATION);
+  assert.strictEqual(r.block, false);
+});
+
+test('verification-mode: run-uat blocks destructive bash (rm -rf)', () => {
+  const r = shouldBlockPlanningUnit('bash', 'rm -rf dist', BASE, 'run-uat', VERIFICATION);
+  assert.strictEqual(r.block, true);
+  assert.match(r.reason!, /bash is restricted to build\/test verification commands/);
+});
+
+test('verification-mode: run-uat allows read-only investigative bash (git status)', () => {
+  const r = shouldBlockPlanningUnit('bash', 'git status', BASE, 'run-uat', VERIFICATION);
+  assert.strictEqual(r.block, false);
+});
+
+test('verification-mode: run-uat still blocks user source edits', () => {
+  const r = shouldBlockPlanningUnit('edit', join(BASE, 'src', 'main.ts'), BASE, 'run-uat', VERIFICATION);
+  assert.strictEqual(r.block, true);
+  assert.match(r.reason!, /tools-policy "verification"/);
+});
+
+test('verification-mode: run-uat still blocks subagent dispatch', () => {
+  const r = shouldBlockPlanningUnit('subagent', '', BASE, 'run-uat', VERIFICATION);
+  assert.strictEqual(r.block, true);
+  assert.match(r.reason!, /subagent dispatch is not permitted/);
 });
 
 // ─── read-only mode ───────────────────────────────────────────────────────

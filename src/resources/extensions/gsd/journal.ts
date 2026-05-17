@@ -39,6 +39,8 @@ export type JournalEventType =
   | "unit-start"
   | "unit-end"
   | "post-unit-hook"
+  | "post-unit-finalize-start"
+  | "post-unit-finalize-end"
   | "terminal"
   | "guard-block"
   | "milestone-transition"
@@ -63,7 +65,14 @@ export type JournalEventType =
   | "milestone-resquash"
   // dispatch telemetry — measure agent/subagent invocation frequency and shape
   | "subagent-invoked"
-  | "subagent-completed";
+  | "subagent-completed"
+  // auto orchestrator telemetry namespace (kept separate from auto-loop events)
+  | "orchestrator-iteration-start"
+  | "orchestrator-dispatch-match"
+  | "orchestrator-dispatch-stop"
+  | "orchestrator-guard-block"
+  | "orchestrator-terminal"
+  | "orchestrator-iteration-end";
 
 /** A single structured event in the journal. */
 export interface JournalEntry {

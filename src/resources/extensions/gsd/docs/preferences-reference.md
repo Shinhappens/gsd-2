@@ -100,7 +100,7 @@ Setting `prefer_skills: []` does **not** disable skill discovery — it just mea
 
 - `skill_rules`: situational rules with a human-readable `when` trigger and one or more of `use`, `prefer`, or `avoid`.
 
-- `custom_instructions`: extra durable instructions related to skill use. For operational project knowledge (recurring rules, gotchas, patterns), use `.gsd/KNOWLEDGE.md` instead — it's injected into every agent prompt automatically and agents can append to it during execution.
+- `custom_instructions`: extra durable instructions related to skill use. For operational project knowledge, use `.gsd/KNOWLEDGE.md` instead. Rules are file-canonical; patterns and lessons are persisted to the `memories` table and projected back into `KNOWLEDGE.md` on the next session start.
 
 - `language`: preferred response language for all GSD interactions. Accepts any language name or code — `"Chinese"`, `"zh"`, `"German"`, `"de"`, `"日本語"`, etc. When set, GSD injects "Always respond in \<language\>" into every agent's system prompt, including after `/clear`. Quickest way to set it: `/gsd language <name>`. To clear: `/gsd language off`.
 
@@ -146,6 +146,14 @@ Setting `prefer_skills: []` does **not** disable skill discovery — it just mea
   - **Deprecated:** `merge_to_main` — no longer valid; milestone-level merge is always used. Remove this setting.
 
 - `unique_milestone_ids`: boolean — when `true`, generates milestone IDs in `M{seq}-{rand6}` format (e.g. `M001-eh88as`) instead of plain sequential `M001`. Prevents ID collisions in team workflows where multiple contributors create milestones concurrently. Both formats coexist — existing `M001`-style milestones remain valid. Default: `false`.
+
+- `workspace`: optional parent-workspace repository registry. Keys:
+  - `mode`: `"project"` or `"parent"` — registry mode for repository lookup. Default: `"project"`.
+  - `repositories`: object keyed by repository id. A default `"project"` repository pointing at the project root is always available, even when not listed here (and can be overridden by explicitly defining `"project"`). Each repository supports:
+    - `path`: string — repository root path relative to project root.
+    - `role`: string — optional human label for prompts/reporting.
+    - `verification`: string[] — optional default verification commands.
+    - `commit_policy`: `"auto"` or `"skip"` — optional turn-commit policy for auto-mode commit actions. Defaults to `"auto"` when omitted. `"skip"` suppresses commit execution for that target repo.
 
 - `budget_ceiling`: number — maximum dollar amount to spend on auto-mode. When reached, behavior is controlled by `budget_enforcement`. Default: no limit.
 
@@ -245,6 +253,8 @@ Setting `prefer_skills: []` does **not** disable skill discovery — it just mea
 - `verification_auto_fix`: boolean — when `true`, automatically attempt to fix verification failures instead of just reporting them. Default: `false`.
 
 - `verification_max_retries`: number — maximum number of fix-and-retry cycles for verification failures. Default: `0` (no retries).
+
+- `per_unit_cost_cap_usd`: number — per-unit retry cost ceiling in USD for verification retries. Must be a positive finite number when set; invalid values are rejected during preference validation. Default: `5.0`. During auto-verification and artifact-retry flows, auto-mode pauses when the current unit reaches this cap or when current unit cost spikes to at least `3.0x` the rolling average.
 
 - `uat_dispatch`: boolean — when `true`, enables UAT (User Acceptance Testing) dispatch mode. Default: `false`.
 

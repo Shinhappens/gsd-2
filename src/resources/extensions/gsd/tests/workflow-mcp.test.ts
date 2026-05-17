@@ -35,6 +35,12 @@ test("auto execute-task requires canonical task completion tool", () => {
   assert.deepEqual(getRequiredWorkflowToolsForAutoUnit("execute-task"), ["gsd_task_complete"]);
 });
 
+test("complete-slice requires closeout and execution handoff tools", () => {
+  const expected = ["gsd_slice_complete", "gsd_task_reopen", "gsd_replan_slice"];
+  assert.deepEqual(getRequiredWorkflowToolsForGuidedUnit("complete-slice"), expected);
+  assert.deepEqual(getRequiredWorkflowToolsForAutoUnit("complete-slice"), expected);
+});
+
 test("deep project setup units declare required workflow MCP tools", () => {
   assert.deepEqual(getRequiredWorkflowToolsForGuidedUnit("discuss-project"), [
     "ask_user_questions",
@@ -369,7 +375,7 @@ test("workflow MCP launch config reaches mutation tools over stdio", async () =>
               estimate: "10m",
               files: ["src/resources/extensions/gsd/workflow-mcp.ts"],
               verify: "node --test",
-              inputs: ["M001-ROADMAP.md"],
+              inputs: [".gsd/milestones/M001/M001-ROADMAP.md"],
               expectedOutput: ["S01-PLAN.md", "T01-PLAN.md"],
             },
           ],
@@ -739,4 +745,22 @@ test("transport compatibility still blocks units whose MCP tools are not exposed
 
   assert.match(error ?? "", /requires secure_env_collect/);
   assert.match(error ?? "", /currently exposes only/);
+});
+
+test("transport compatibility accepts MCP-namespaced runtime tools", () => {
+  const error = getWorkflowTransportSupportError(
+    "claude-code",
+    ["gsd_summary_save"],
+    {
+      projectRoot: "/tmp/project",
+      env: { GSD_WORKFLOW_MCP_COMMAND: "node" },
+      surface: "auto-mode",
+      unitType: "research-slice",
+      authMode: "externalCli",
+      baseUrl: "local://claude-code",
+      activeTools: ["mcp__gsd-workflow__gsd_summary_save"],
+    },
+  );
+
+  assert.equal(error, null);
 });

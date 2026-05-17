@@ -8,12 +8,14 @@
  *
  * Design constraints (from Trek-e approval):
  *  - Warn the user before stashing (no silent surprises)
- *  - git stash push / git stash pop only — no custom stash management layer
- *  - Stash/pop errors are logged but MUST NOT block the merge itself
+ *  - git stash push / git stash apply+drop for targeted restore
+ *  - Stash/apply errors are logged but MUST NOT block the merge itself
  *  - Fast-path status check — clean trees pay no extra cost
  */
 
 import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { GIT_NO_PROMPT_ENV } from "./git-constants.js";
 import { logWarning } from "./workflow-logger.js";
 import { nativeHasChanges } from "./native-git-bridge.js";
@@ -32,6 +34,148 @@ export interface PostflightResult {
   needsManualRecovery: boolean;
   message: string;
   stashRef?: string;
+  resolution?: "applied" | "already-present-dropped" | "already-present-preserved" | "manual-recovery";
+  collidedPaths?: string[];
+}
+
+function gitText(basePath: string, args: string[]): string {
+  return execFileSync("git", args, {
+    cwd: basePath,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf-8",
+    env: GIT_NO_PROMPT_ENV,
+  });
+}
+
+function gitBuffer(basePath: string, args: string[]): Buffer {
+  return execFileSync("git", args, {
+    cwd: basePath,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: GIT_NO_PROMPT_ENV,
+  });
+}
+
+function errorText(err: unknown): string {
+  if (!err || typeof err !== "object") return String(err);
+  const parts: string[] = [];
+  const stderr = (err as { stderr?: unknown }).stderr;
+  const stdout = (err as { stdout?: unknown }).stdout;
+  for (const value of [stderr, stdout]) {
+    if (typeof value === "string") parts.push(value);
+    else if (value instanceof Uint8Array) parts.push(Buffer.from(value).toString("utf-8"));
+  }
+  parts.push(err instanceof Error ? err.message : String(err));
+  return parts.filter(Boolean).join("\n");
+}
+
+function parseAlreadyExistsNoCheckoutPaths(text: string): string[] {
+  const paths: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const match = /^(.+?) already exists, no checkout$/i.exec(line.trim());
+    if (match?.[1]) paths.push(match[1]);
+  }
+  return [...new Set(paths)];
+}
+
+function readZeroDelimitedPaths(output: string): string[] {
+  return output.split("\0").filter(Boolean);
+}
+
+function listStashUntrackedPaths(basePath: string, stashRef: string): string[] | null {
+  try {
+    const output = gitText(basePath, ["ls-tree", "-r", "-z", "--name-only", `${stashRef}^3`]);
+    return readZeroDelimitedPaths(output);
+  } catch {
+    return null;
+  }
+}
+
+function listStashTrackedPaths(basePath: string, stashRef: string): string[] | null {
+  try {
+    const output = gitText(basePath, ["diff", "--name-only", "-z", `${stashRef}^1`, stashRef]);
+    return readZeroDelimitedPaths(output);
+  } catch {
+    return null;
+  }
+}
+
+function isWorktreeClean(basePath: string): boolean | null {
+  try {
+    return gitText(basePath, ["status", "--porcelain"]).trim() === "";
+  } catch {
+    return null;
+  }
+}
+
+function stashBlobEqualsWorktreeFile(basePath: string, stashRef: string, path: string): boolean | null {
+  try {
+    const worktreePath = join(basePath, path);
+    if (!existsSync(worktreePath)) return false;
+    const worktreeContent = readFileSync(worktreePath);
+    const stashContent = gitBuffer(basePath, ["show", `${stashRef}^3:${path}`]);
+    return Buffer.compare(worktreeContent, stashContent) === 0;
+  } catch {
+    return null;
+  }
+}
+
+function reconcileAlreadyPresentUntrackedStash(
+  basePath: string,
+  milestoneId: string,
+  stashRef: string,
+  err: unknown,
+): PostflightResult | null {
+  const text = errorText(err);
+  const collidedPaths = parseAlreadyExistsNoCheckoutPaths(text);
+  if (collidedPaths.length === 0) return null;
+
+  const untrackedPaths = listStashUntrackedPaths(basePath, stashRef);
+  if (!untrackedPaths || untrackedPaths.length === 0) return null;
+
+  const trackedPaths = listStashTrackedPaths(basePath, stashRef);
+  if (trackedPaths === null || trackedPaths.length > 0) return null;
+
+  const untrackedPathSet = new Set(untrackedPaths);
+  if (!collidedPaths.every((path) => untrackedPathSet.has(path))) return null;
+  if (!untrackedPaths.every((path) => existsSync(join(basePath, path)))) return null;
+  if (isWorktreeClean(basePath) !== true) return null;
+
+  const blobComparisons = untrackedPaths.map((path) => stashBlobEqualsWorktreeFile(basePath, stashRef, path));
+  if (blobComparisons.some((result) => result === null)) return null;
+  const allIdentical = blobComparisons.every(Boolean);
+  if (allIdentical) {
+    let dropped = true;
+    try {
+      execFileSync("git", ["stash", "drop", stashRef], {
+        cwd: basePath,
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "utf-8",
+        env: GIT_NO_PROMPT_ENV,
+      });
+    } catch (err) {
+      dropped = false;
+      logWarning("preflight", `git stash drop ${stashRef} failed after identical preflight stash reconciliation: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return {
+      restored: true,
+      needsManualRecovery: false,
+      message: dropped
+        ? `Preflight stash for milestone ${milestoneId} contained files already present after merge; identical stash dropped.`
+        : `Preflight stash for milestone ${milestoneId} contained files already present after merge, but ${stashRef} could not be dropped and remains as a backup.`,
+      stashRef,
+      resolution: dropped ? "already-present-dropped" : "already-present-preserved",
+      collidedPaths,
+    };
+  }
+
+  return {
+    restored: false,
+    needsManualRecovery: false,
+    message: `Preflight stash for milestone ${milestoneId} contained untracked files already present after merge. Keeping merged files and preserving ${stashRef} as a backup.`,
+    stashRef,
+    resolution: "already-present-preserved",
+    collidedPaths,
+  };
 }
 
 function findPreflightStashRef(basePath: string, milestoneId: string, stashMarker?: string): string | null {
@@ -141,27 +285,48 @@ export function postflightPopStash(
         message: msg,
       };
     }
-    execFileSync("git", ["stash", "pop", stashRef], {
+    execFileSync("git", ["stash", "apply", stashRef], {
       cwd: basePath,
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf-8",
       env: GIT_NO_PROMPT_ENV,
     });
+    let dropWarning: string | null = null;
+    try {
+      execFileSync("git", ["stash", "drop", stashRef], {
+        cwd: basePath,
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "utf-8",
+        env: GIT_NO_PROMPT_ENV,
+      });
+    } catch (err) {
+      dropWarning = ` Stash was restored, but git stash drop ${stashRef} failed: ${err instanceof Error ? err.message : String(err)}.`;
+      logWarning("preflight", dropWarning.trim());
+    }
     const msg = `Restored stashed changes after milestone ${milestoneId} merge.`;
-    notify(msg, "info");
+    notify(`${msg}${dropWarning ?? ""}`, dropWarning ? "warning" : "info");
     return {
       restored: true,
       needsManualRecovery: false,
-      message: msg,
+      message: `${msg}${dropWarning ?? ""}`,
       stashRef,
+      resolution: "applied",
     };
   } catch (err) {
-    // Pop conflicts mean the merged code collides with the stashed changes.
+    if (stashRef) {
+      const reconciled = reconcileAlreadyPresentUntrackedStash(basePath, milestoneId, stashRef, err);
+      if (reconciled) {
+        logWarning("preflight", reconciled.message);
+        notify(reconciled.message, reconciled.resolution === "already-present-preserved" ? "warning" : "info");
+        return reconciled;
+      }
+    }
+    // Apply conflicts mean the merged code collides with the stashed changes.
     // Log a warning — the user needs to resolve manually, but the merge succeeded.
     const restoreHint = stashRef
-      ? `Run "git stash pop ${stashRef}" or "git stash apply ${stashRef}" manually to restore the correct stash.`
+      ? `Run "git stash apply ${stashRef}" manually to restore the correct stash, then "git stash drop ${stashRef}" after recovery.`
       : `Run "git stash list" to find the matching GSD preflight stash before restoring manually.`;
-    const msg = `git stash pop ${stashRef ?? ""}`.trim() + ` failed after merge of milestone ${milestoneId}: ${err instanceof Error ? err.message : String(err)}. ${restoreHint}`;
+    const msg = `git stash apply ${stashRef ?? ""}`.trim() + ` failed after merge of milestone ${milestoneId}: ${err instanceof Error ? err.message : String(err)}. ${restoreHint}`;
     logWarning("preflight", msg);
     notify(msg, "warning");
     return {
@@ -169,6 +334,7 @@ export function postflightPopStash(
       needsManualRecovery: true,
       message: msg,
       ...(stashRef ? { stashRef } : {}),
+      resolution: "manual-recovery",
     };
   }
 }

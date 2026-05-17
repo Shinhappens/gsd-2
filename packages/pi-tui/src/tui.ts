@@ -733,11 +733,60 @@ export class TUI extends Container {
 		}
 
 		if (
-			newLines.length !== this.previousLines.length &&
+			newLines.length < this.previousLines.length &&
 			(newLines.length <= height || this.previousLines.length <= height)
 		) {
-			logRedraw(`bottom-anchored short block resized (${this.previousLines.length} -> ${newLines.length})`);
+			logRedraw(`bottom-anchored short block shrunk (${this.previousLines.length} -> ${newLines.length})`);
 			fullRender(true);
+			return;
+		}
+
+		// Tall→tall shrink with viewport baseline shift. Both buffers fill the
+		// viewport, but newLines is shorter, so the viewport baseline must move
+		// from (previousLines.length - height) down to (newLines.length - height).
+		// The differential render below would see no diff in the overlapping
+		// indices (content[20..39] is identical between frames) and would leave
+		// the screen showing stale rows from the old viewport.
+		//
+		// Repaint the visible viewport in place without \x1b[2J — the four-pass
+		// flicker fix exists exactly to avoid that full-screen clear — then reset
+		// maxLinesRendered and previousViewportTop so subsequent diffs anchor
+		// against the new baseline.
+		if (
+			this.previousLines.length > height &&
+			newLines.length > height &&
+			newLines.length < this.previousLines.length &&
+			this.overlayStack.length === 0
+		) {
+			logRedraw(`tall→tall shrink viewport realign (${this.previousLines.length} -> ${newLines.length})`);
+			const newViewportTop = getViewportTop(newLines.length);
+			const currentScreenRow = Math.max(0, hardwareCursorRow - prevViewportTop);
+			let buffer = "\x1b[?2026h";
+			if (currentScreenRow > 0) {
+				buffer += `\x1b[${currentScreenRow}A`;
+			}
+			buffer += "\r";
+			for (let i = 0; i < height; i++) {
+				const idx = newViewportTop + i;
+				if (i > 0) buffer += "\r\n";
+				buffer += "\x1b[2K";
+				let line = newLines[idx] ?? "";
+				if (!isImageLine(line) && visibleWidth(line) > width) {
+					line = truncateToWidth(line, width);
+				}
+				buffer += line;
+			}
+			buffer += "\x1b[?2026l";
+			this.terminal.write(buffer);
+			this.cursorRow = newLines.length - 1;
+			this.hardwareCursorRow = newLines.length - 1;
+			this.maxLinesRendered = newLines.length;
+			this.previousViewportTop = newViewportTop;
+			this.positionHardwareCursor(cursorPos, newLines.length);
+			this.previousLines = newLines;
+			this.previousWidth = width;
+			this.previousHeight = height;
+			this._shrinkDebounceActive = false;
 			return;
 		}
 
@@ -788,7 +837,7 @@ export class TUI extends Container {
 			}
 			lastChanged = newLines.length - 1;
 		}
-		const appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0;
+		let appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0;
 
 		// No changes - but still need to update hardware cursor position if it moved
 		if (firstChanged === -1) {
@@ -838,14 +887,29 @@ export class TUI extends Container {
 			return;
 		}
 
-		// Check if firstChanged is above what was previously visible
-		// Use previousLines.length (not maxLinesRendered) to avoid false positives after content shrinks
+		// Check if firstChanged is above what was previously visible.
+		// Use previousLines.length (not maxLinesRendered) to avoid false positives after content shrinks.
 		const previousContentViewportTop = getViewportTop(this.previousLines.length);
+		let clampedToViewport = false;
 		if (firstChanged < previousContentViewportTop) {
-			// First change is above previous viewport - need full re-render
-			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${previousContentViewportTop})`);
-			fullRender(true);
-			return;
+			// First change is above the viewport. Avoid a full screen clear (\x1b[2J)
+			// which causes the bottom panel to flicker. Instead redraw from the actual
+			// viewport top down through the bottom of new content so every visible row
+			// gets the correct line, even if the viewport shifted (content shrank).
+			//
+			// Pick the smaller of the two viewport tops so any row currently on screen
+			// is covered. Force lastChanged to the end of new content so the render loop
+			// repaints the bottom rows that may now hold stale content from the previous
+			// frame (the case that caused "empty screen until next tick" after the clamp).
+			const newViewportTop = getViewportTop(newLines.length);
+			const clampedFirst = Math.max(0, Math.min(previousContentViewportTop, newViewportTop));
+			logRedraw(
+				`firstChanged < viewportTop (${firstChanged} < ${previousContentViewportTop}) — repaint from ${clampedFirst}`,
+			);
+			firstChanged = clampedFirst;
+			lastChanged = Math.max(lastChanged, newLines.length - 1);
+			appendStart = false;
+			clampedToViewport = true;
 		}
 
 		// Render from first changed line to end
@@ -893,20 +957,35 @@ export class TUI extends Container {
 		// Track where cursor ended up after rendering
 		let finalCursorRow = renderEnd;
 
-		// If we had more lines before, clear them and move cursor back
-		if (this.previousLines.length > newLines.length) {
-			// Move to end of new content first if we stopped before it
-			if (renderEnd < newLines.length - 1) {
-				const moveDown = newLines.length - 1 - renderEnd;
-				buffer += `\x1b[${moveDown}B`;
-				finalCursorRow = newLines.length - 1;
+		// If we had more lines before, clear ghost lines — but only when they are
+		// actually visible. For tall buffers (both counts > height) the viewport shifts
+		// up so the differential render already overwrites the old bottom rows; emitting
+		// \r\n at screen-bottom would cause spurious terminal scrolling.
+		//
+		// Also skip ghost clearing when the clamp-to-viewport path was taken: that path
+		// renders from clampedFirst through newLines.length-1, filling the entire visible
+		// viewport. There are no ghost lines below renderEnd, and the local `viewportTop`
+		// is based on the stale (larger) maxLinesRendered, so the renderEndScreenRow
+		// check below would compute a negative value and incorrectly fire the cleanup —
+		// which then emits \r\n past screen-bottom and scrolls correct lines into
+		// scrollback while filling the viewport with blanks.
+		if (this.previousLines.length > newLines.length && !clampedToViewport) {
+			const renderEndScreenRow = renderEnd - viewportTop;
+			const ghostLinesVisible = renderEndScreenRow < height - 1;
+			if (ghostLinesVisible) {
+				// Move to end of new content first if we stopped before it
+				if (renderEnd < newLines.length - 1) {
+					const moveDown = newLines.length - 1 - renderEnd;
+					buffer += `\x1b[${moveDown}B`;
+					finalCursorRow = newLines.length - 1;
+				}
+				const extraLines = this.previousLines.length - newLines.length;
+				for (let i = newLines.length; i < this.previousLines.length; i++) {
+					buffer += "\r\n\x1b[2K";
+				}
+				// Move cursor back to end of new content
+				buffer += `\x1b[${extraLines}A`;
 			}
-			const extraLines = this.previousLines.length - newLines.length;
-			for (let i = newLines.length; i < this.previousLines.length; i++) {
-				buffer += "\r\n\x1b[2K";
-			}
-			// Move cursor back to end of new content
-			buffer += `\x1b[${extraLines}A`;
 		}
 
 		buffer += "\x1b[?2026l"; // End synchronized output
@@ -948,8 +1027,16 @@ export class TUI extends Container {
 		// hardwareCursorRow tracks actual terminal cursor position (for movement)
 		this.cursorRow = Math.max(0, newLines.length - 1);
 		this.hardwareCursorRow = finalCursorRow;
-		// Track terminal's working area (grows but doesn't shrink unless cleared)
-		this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+		// Track terminal's working area (grows but doesn't shrink unless cleared).
+		// Exception: when the clamp-to-viewport path repainted shrunk content, the
+		// visible viewport now anchors to newLines.length, so subsequent
+		// computeLineDiff calls need viewportTop = newLines.length - height.
+		// Without this reset, hardwareCursorRow's physical row goes negative.
+		if (clampedToViewport && newLines.length < this.maxLinesRendered) {
+			this.maxLinesRendered = newLines.length;
+		} else {
+			this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+		}
 		this.previousViewportTop = getViewportTop(this.maxLinesRendered);
 
 		// Position hardware cursor for IME

@@ -162,7 +162,7 @@ describe("validate-milestone stuck-loop guard (#4094)", () => {
     assert.equal(pauseAutoMock.mock.callCount(), 0);
   });
 
-  test("continues when no VALIDATION file exists yet", async () => {
+  test("retries when no VALIDATION file exists yet", async () => {
     insertMilestone({ id: "M001" });
     insertSlice({ id: "S01", milestoneId: "M001", title: "Slice 1", status: "complete" });
 
@@ -173,7 +173,34 @@ describe("validate-milestone stuck-loop guard (#4094)", () => {
 
     const result = await runPostUnitVerification({ s, ctx, pi } as VerificationContext, pauseAutoMock);
 
-    assert.equal(result, "continue");
+    assert.equal(result, "retry");
     assert.equal(pauseAutoMock.mock.callCount(), 0);
+    assert.ok(s.pendingVerificationRetry);
+    assert.equal(s.pendingVerificationRetry!.unitId, "M001");
+    assert.match(s.pendingVerificationRetry!.failureContext, /gsd_validate_milestone/);
+    assert.equal(s.pendingVerificationRetry!.attempt, 1);
+  });
+
+  test("retries when VALIDATION file exists but is empty", async () => {
+    insertMilestone({ id: "M001" });
+    insertSlice({ id: "S01", milestoneId: "M001", title: "Slice 1", status: "complete" });
+
+    const path = join(tempDir, ".gsd", "milestones", "M001", "M001-VALIDATION.md");
+    writeFileSync(path, "", "utf-8");
+    invalidateAllCaches();
+
+    const ctx = makeMockCtx();
+    const pi = makeMockPi();
+    const pauseAutoMock = mock.fn(async () => {});
+    const s = makeMockSession(tempDir, "validate-milestone", "M001");
+
+    const result = await runPostUnitVerification({ s, ctx, pi } as VerificationContext, pauseAutoMock);
+
+    assert.equal(result, "retry");
+    assert.equal(pauseAutoMock.mock.callCount(), 0);
+    assert.ok(s.pendingVerificationRetry);
+    assert.equal(s.pendingVerificationRetry!.unitId, "M001");
+    assert.match(s.pendingVerificationRetry!.failureContext, /exists but is empty/);
+    assert.equal(s.pendingVerificationRetry!.attempt, 1);
   });
 });

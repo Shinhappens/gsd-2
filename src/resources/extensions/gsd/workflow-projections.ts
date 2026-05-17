@@ -195,11 +195,11 @@ export function renderSummaryContent(
 
   // ── Frontmatter (YAML list format, matches parseSummary() expectations) ──
   const keyFilesYaml = taskRow.key_files && taskRow.key_files.length > 0
-    ? taskRow.key_files.map(f => `  - ${f}`).join("\n")
-    : "  - (none)";
+    ? `\n${taskRow.key_files.map(f => `  - ${f}`).join("\n")}`
+    : " []";
   const keyDecisionsYaml = taskRow.key_decisions && taskRow.key_decisions.length > 0
-    ? taskRow.key_decisions.map(d => `  - ${d}`).join("\n")
-    : "  - (none)";
+    ? `\n${taskRow.key_decisions.map(d => `  - ${d}`).join("\n")}`
+    : " []";
 
   // Derive verification_result from evidence if available
   const evidenceList = evidence ?? [];
@@ -230,10 +230,8 @@ export function renderSummaryContent(
 id: ${taskRow.id}
 parent: ${sliceId}
 milestone: ${milestoneId}
-key_files:
-${keyFilesYaml}
-key_decisions:
-${keyDecisionsYaml}
+key_files:${keyFilesYaml}
+key_decisions:${keyDecisionsYaml}
 duration: ${taskRow.duration || ""}
 verification_result: ${verificationResult}
 completed_at: ${taskRow.completed_at || ""}

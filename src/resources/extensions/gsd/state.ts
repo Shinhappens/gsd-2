@@ -40,6 +40,7 @@ import { findMilestoneIds } from './milestone-ids.js';
 import { loadQueueOrder, sortByQueueOrder } from './queue-order.js';
 import { isClosedStatus, isDeferredStatus } from './status-guards.js';
 import { nativeBatchParseGsdFiles, type BatchParsedFile } from './native-parser-bridge.js';
+import { autoHealSketchFlags } from './state-reconciliation/drift/sketch-flag.js';
 
 import { join, resolve } from 'path';
 import { existsSync, readdirSync } from 'node:fs';
@@ -324,7 +325,7 @@ export async function deriveState(
   // from ROADMAP.md, PLAN.md, SUMMARY.md, REQUIREMENTS.md, or flag files.
   if (isDbAvailable()) {
     const stopDbTimer = debugTime("derive-state-db");
-    result = await deriveStateFromDb(basePath);
+    result = await deriveStateFromDb(basePath, opts?.projectRootForReads ?? basePath);
     stopDbTimer({ phase: result.phase, milestone: result.activeMilestone?.id });
     _telemetry.dbDeriveCount++;
   } else if (process.env.GSD_ALLOW_MARKDOWN_DERIVE_FALLBACK === "1") {
@@ -463,6 +464,13 @@ async function buildRegistryAndFindActive(
       }
 
       if (allSlicesDone) {
+        const validation = getLatestAssessmentByScope(m.id, "milestone-validation");
+        const verdict = typeof validation?.status === "string" ? validation.status : undefined;
+        if (verdict === "needs-attention") {
+          registry.push({ id: m.id, title, status: "parked", ...(deps.length > 0 ? { dependsOn: deps } : {}) });
+          continue;
+        }
+
         activeMilestone = { id: m.id, title };
         activeMilestoneSlices = slices;
         activeMilestoneFound = true;
@@ -591,7 +599,7 @@ async function handleAllSlicesDone(
       recentDecisions: [],
       blockers: [
         `Milestone ${activeMilestone.id} validation verdict is needs-remediation but all slices are complete. ` +
-          `Add remediation slices via gsd_reassess_roadmap or override the verdict manually.`,
+          `Add remediation slices via gsd_reassess_roadmap, or run \`/gsd verdict pass --rationale "..."\` to override.`,
       ],
       nextAction: `Resolve ${activeMilestone.id} remediation before proceeding.`,
       registry, requirements,
@@ -651,7 +659,10 @@ function checkReplanTrigger(basePath: string, milestoneId: string, sliceId: stri
   return !!sliceRow?.replan_triggered_at;
 }
 
-export async function deriveStateFromDb(basePath: string): Promise<GSDState> {
+export async function deriveStateFromDb(
+  basePath: string,
+  artifactReadRoot: string = basePath,
+): Promise<GSDState> {
   const requirements = getRequirementCounts();
 
   const allMilestones = getAllMilestones();
@@ -729,7 +740,18 @@ export async function deriveStateFromDb(basePath: string): Promise<GSDState> {
       progress: { milestones: milestoneProgress, slices: sliceProgress },
     };
   }
-  const { activeSlice, activeSliceRow } = activeSliceContext;
+  const { activeSlice } = activeSliceContext;
+  let activeSliceRow = activeSliceContext.activeSliceRow;
+
+  // Heal stale sketch flags before honoring the DB-authoritative sketch gate.
+  // This recovers if PLAN.md exists but is_sketch was never flipped to 0.
+  if (activeMilestone?.id) {
+    autoHealSketchFlags(activeMilestone.id, (sid) => {
+      const planPath = resolveSliceFile(artifactReadRoot, activeMilestone.id, sid, "PLAN");
+      return planPath !== null && existsSync(planPath);
+    });
+    activeSliceRow = getSlice(activeMilestone.id, activeSlice.id);
+  }
 
   // ADR-011: DB slice metadata is authoritative for sketch refinement.
   // PLAN.md and preference flags are projections/configuration and are
@@ -1074,6 +1096,10 @@ export async function _deriveStateImpl(
       const validationContent = validationFile ? await cachedLoadFile(validationFile) : null;
       const validationTerminal = validationContent ? isValidationTerminal(validationContent) : false;
       const verdict = validationContent ? extractVerdict(validationContent) : undefined;
+      if (verdict === "needs-attention") {
+        registry.push({ id: mid, title, status: "parked" });
+        continue;
+      }
       // needs-remediation is terminal but requires re-validation (#3596)
       const needsRevalidation = !validationTerminal || verdict === 'needs-remediation';
 
@@ -1091,7 +1117,7 @@ export async function _deriveStateImpl(
         // Needs (re-)validation, but another milestone is already active
         registry.push({ id: mid, title, status: 'pending' });
       } else if (!activeMilestoneFound) {
-        // Terminal validation (pass/needs-attention) but no summary → completing-milestone
+        // Terminal passing validation but no summary → completing-milestone
         activeMilestone = { id: mid, title };
         activeRoadmap = roadmap;
         activeMilestoneFound = true;
@@ -1314,7 +1340,7 @@ export async function _deriveStateImpl(
         recentDecisions: [],
         blockers: [
           `Milestone ${activeMilestone.id} validation verdict is needs-remediation but all slices are complete. ` +
-            `Add remediation slices via gsd_reassess_roadmap or override the verdict manually.`,
+            `Add remediation slices via gsd_reassess_roadmap, or run \`/gsd verdict pass --rationale "..."\` to override.`,
         ],
         nextAction: `Resolve ${activeMilestone.id} remediation before proceeding.`,
         registry,
@@ -1441,7 +1467,7 @@ export async function _deriveStateImpl(
     const summaryPath = resolveTaskFile(basePath, activeMilestone.id, activeSlice.id, t.id, "SUMMARY");
     if (summaryPath && existsSync(summaryPath)) {
       t.done = true;
-      logWarning("reconcile", `task ${activeMilestone.id}/${activeSlice.id}/${t.id} reconciled via SUMMARY on disk (#2514)`, { mid: activeMilestone.id, sid: activeSlice.id, tid: t.id });
+      logWarning("reconcile", `task ${activeMilestone.id}/${activeSlice.id}/${t.id} reconciled via SUMMARY on disk`, { mid: activeMilestone.id, sid: activeSlice.id, tid: t.id });
     }
   }
 

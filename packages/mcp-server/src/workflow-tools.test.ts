@@ -1,3 +1,6 @@
+// Project/App: GSD-2
+// File Purpose: Tests packaged workflow tools exposed by the GSD MCP server.
+
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
@@ -94,6 +97,22 @@ describe("workflow MCP tools", () => {
 
     assert.equal(server.tools.length, WORKFLOW_TOOL_NAMES.length);
     assert.deepEqual(server.tools.map((t) => t.name), [...WORKFLOW_TOOL_NAMES]);
+  });
+
+  it("registers task reopen in the workflow MCP tool surface", () => {
+    const server = makeMockServer();
+    registerWorkflowTools(server as any);
+
+    const toolNames = server.tools.map((t) => t.name);
+    assert.ok(toolNames.includes("gsd_task_reopen"));
+    assert.ok(toolNames.includes("gsd_reopen_task"));
+
+    const taskReopen = server.tools.find((t) => t.name === "gsd_task_reopen");
+    assert.ok(taskReopen);
+    assert.ok("milestoneId" in taskReopen.params);
+    assert.ok("sliceId" in taskReopen.params);
+    assert.ok("taskId" in taskReopen.params);
+    assert.ok("reason" in taskReopen.params);
   });
 
   it("prefers source TypeScript before compiled dist fallbacks", () => {
@@ -645,6 +664,9 @@ export const executeValidateMilestone = noop;
 export const executeReassessRoadmap = noop;
 export const executeSaveGateResult = noop;
 export const executeSummarySave = noop;
+export const executeTaskReopen = noop;
+export const executeSliceReopen = noop;
+export const executeMilestoneReopen = noop;
 
 export const executeTaskComplete = async (params, projectDir) => {
   const capturePath = process.env.GSD_TEST_TASK_COMPLETE_CAPTURE_PATH;
@@ -820,7 +842,7 @@ export const executeTaskComplete = async (params, projectDir) => {
             estimate: "15m",
             files: ["src/resources/extensions/gsd/tools/workflow-tool-executors.ts"],
             verify: "node --test",
-            inputs: ["ROADMAP.md"],
+            inputs: [".gsd/milestones/M001/M001-ROADMAP.md"],
             expectedOutput: ["S01-PLAN.md", "T01-PLAN.md"],
           },
         ],

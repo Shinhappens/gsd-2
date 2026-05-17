@@ -806,14 +806,22 @@ export async function inlineDecisionsFromDb(
   try {
     const { isDbAvailable } = await import("./gsd-db.js");
     if (isDbAvailable()) {
-      const { queryDecisions, formatDecisionsForPrompt } = await import("./context-store.js");
+      // ADR-013 Phase 6 cutover (Stage 1): read decisions from the `memories`
+      // table. Both `queryDecisions` (legacy) and `queryDecisionsFromMemories`
+      // return identical Decision[] for active rows once Phase 5 dual-write is
+      // caught up. Switching the read here lets the destructive Phase 6 step
+      // (#5755) retire the legacy `decisions` table without changing prompt
+      // contents. Projection regen (`DECISIONS.md`) still sources from the
+      // legacy table — that switch lands separately to handle superseded
+      // history cleanly.
+      const { queryDecisionsFromMemories, formatDecisionsForPrompt } = await import("./context-store.js");
 
       // First query: try with both milestoneId and scope (if scope provided)
-      let decisions = queryDecisions({ milestoneId, scope });
+      let decisions = queryDecisionsFromMemories({ milestoneId, scope });
 
       // Cascade: if empty AND scope was provided, retry without scope
       if (decisions.length === 0 && scope) {
-        decisions = queryDecisions({ milestoneId });
+        decisions = queryDecisionsFromMemories({ milestoneId });
       }
 
       if (decisions.length > 0) {
@@ -3087,17 +3095,40 @@ export async function buildReactiveExecutePrompt(
       mid, sid, tid, node?.dependsOn ?? [], base,
     );
 
-    // Build a full execute-task prompt with dependency-based carry-forward
-    const taskPrompt = await buildExecuteTaskPrompt(
-      mid, sid, sTitle, tid, tTitle, base,
-      {
-        carryForwardPaths: depPaths,
-        sessionContextWindow: opts?.sessionContextWindow,
-        modelRegistry: opts?.modelRegistry,
-        sessionProvider: opts?.sessionProvider,
-        contextModeRenderMode: "nested",
-      },
-    );
+    const taskPlanPath = resolveTaskFile(base, mid, sid, tid, "PLAN");
+    const taskPlanContent = taskPlanPath ? await loadFile(taskPlanPath) : null;
+    const taskPlanRelPath = `${relSlicePath(base, mid, sid)}/tasks/${tid}-PLAN.md`;
+    const taskPlanInline = taskPlanContent
+      ? [
+          "## Inlined Task Plan (authoritative local execution contract)",
+          `Source: \`${taskPlanRelPath}\``,
+          "",
+          taskPlanContent.trim(),
+        ].join("\n")
+      : [
+          "## Inlined Task Plan (authoritative local execution contract)",
+          `Task plan not found at dispatch time. Read \`${taskPlanRelPath}\` before executing.`,
+        ].join("\n");
+    const carryForwardSection = await buildCarryForwardSection(depPaths, base);
+    const taskSummaryPath = `${relSlicePath(base, mid, sid)}/tasks/${tid}-SUMMARY.md`;
+    const taskPrompt = [
+      `## UNIT: Execute Task ${tid} ("${tTitle}")`,
+      "",
+      "Work only in the repository root.",
+      "Implement from the inlined task plan below. Verify changes, then call `gsd_task_complete`.",
+      "Do not run git commands.",
+      "",
+      carryForwardSection,
+      "",
+      taskPlanInline,
+      "",
+      "## Completion Contract",
+      `- Call \`gsd_task_complete\` with camelCase fields: \`milestoneId\`, \`sliceId\`, \`taskId\`, \`oneLiner\`, \`narrative\`, \`verification\`, and \`verificationEvidence\`.`,
+      `- Do not manually write \`${taskSummaryPath}\` or edit PLAN checkboxes; the completion tool is canonical.`,
+      `- Use \`blocker_discovered: true\` only if the task cannot be completed due to a real blocker.`,
+      "",
+      `When done, say: "Task ${tid} complete."`,
+    ].join("\n");
 
     const modelSuffix = subagentModel ? ` with model: "${subagentModel}"` : "";
     subagentSections.push([
@@ -3189,7 +3220,7 @@ export async function buildParallelResearchSlicesPrompt(
     subagentSections.push([
       `### ${slice.id}: ${slice.title}`,
       "",
-      `Use this as the prompt for a \`subagent\` call${modelSuffix} (agent: \`gsd-executor\` or the default agent):`,
+      `Use this as the prompt for a \`subagent\` call${modelSuffix} (agent: \`scout\`):`,
       "",
       "```",
       slicePrompt,
@@ -3271,7 +3302,7 @@ export async function buildGateEvaluatePrompt(
     subagentSections.push([
       `### ${def.id}: ${def.question}`,
       "",
-      `Use this as the prompt for a \`subagent\` call${modelSuffix}:`,
+      `Use this as the prompt for a \`subagent\` call${modelSuffix} (agent: \`tester\`):`,
       "",
       "```",
       subPrompt,

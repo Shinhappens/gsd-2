@@ -15,6 +15,7 @@ import {
   getMilestone,
   getMilestoneSlices,
   getSliceTasks,
+  getLatestAssessmentByScope,
   updateMilestoneStatus,
 } from "../gsd-db.js";
 import { resolveMilestonePath, clearPathCache } from "../paths.js";
@@ -38,9 +39,9 @@ export interface CompleteMilestoneParams {
   definitionOfDoneResults?: string;
   /** @optional — empty/omitted renders as "Not provided." */
   requirementOutcomes?: string;
-  /** @optional — empty/omitted renders as "(none)" */
+  /** @optional — empty/omitted renders as an empty frontmatter list */
   keyDecisions?: string[];
-  /** @optional — empty/omitted renders as "(none)" */
+  /** @optional — empty/omitted renders as an empty frontmatter list */
   keyFiles?: string[];
   /** @optional — empty/omitted renders as "(none)" */
   lessonsLearned?: string[];
@@ -70,12 +71,12 @@ function renderMilestoneSummaryMarkdown(params: CompleteMilestoneParams, complet
   const lessonsLearned = params.lessonsLearned ?? [];
 
   const keyDecisionsYaml = keyDecisions.length > 0
-    ? keyDecisions.map(d => `  - ${d}`).join("\n")
-    : "  - (none)";
+    ? `\n${keyDecisions.map(d => `  - ${d}`).join("\n")}`
+    : " []";
 
   const keyFilesYaml = keyFiles.length > 0
-    ? keyFiles.map(f => `  - ${f}`).join("\n")
-    : "  - (none)";
+    ? `\n${keyFiles.map(f => `  - ${f}`).join("\n")}`
+    : " []";
 
   const lessonsYaml = lessonsLearned.length > 0
     ? lessonsLearned.map(l => `  - ${l}`).join("\n")
@@ -86,10 +87,8 @@ id: ${params.milestoneId}
 title: "${displayTitle}"
 status: complete
 completed_at: ${completedAt}
-key_decisions:
-${keyDecisionsYaml}
-key_files:
-${keyFilesYaml}
+key_decisions:${keyDecisionsYaml}
+key_files:${keyFilesYaml}
 lessons_learned:
 ${lessonsYaml}
 ---
@@ -155,6 +154,15 @@ export async function handleCompleteMilestone(
     }
     if (isClosedStatus(milestone.status)) {
       alreadyComplete = true;
+      return;
+    }
+
+    // Defense-in-depth: only a passing milestone validation permits closeout.
+    const validation = getLatestAssessmentByScope(params.milestoneId, "milestone-validation");
+    if (validation?.status !== "pass") {
+      guardError =
+        `Refusing to complete ${params.milestoneId}: latest milestone-validation verdict is ` +
+        `"${validation?.status ?? "absent"}". Only verdict=pass permits closeout.`;
       return;
     }
 

@@ -1,3 +1,5 @@
+// Project/App: GSD-2
+// File Purpose: Tests for post-execution retry bypass and verification gate failure handling.
 /**
  * post-exec-retry-bypass.test.ts — Tests for post-execution blocking failure retry bypass.
  *
@@ -9,7 +11,7 @@
 import { describe, test, mock, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
-import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { runPostUnitVerification, type VerificationContext } from "../auto-verification.ts";
@@ -71,6 +73,7 @@ function setupTestEnvironment(): void {
   mkdirSync(milestonesDir, { recursive: true });
 
   process.chdir(tempDir);
+  invalidateAllCaches();
   _clearGsdRootCache();
 
   dbPath = join(gsdDir, "gsd.db");
@@ -134,6 +137,34 @@ function createBasicTask(): void {
       verify: "echo pass", // Simple verification that always passes
       inputs: [],
       expectedOutput: ["output.ts"],
+      observabilityImpact: "",
+    },
+    sequence: 0,
+  });
+}
+
+function createTaskWithoutVerify(): void {
+  insertMilestone({ id: "M001" });
+  insertSlice({
+    id: "S01",
+    milestoneId: "M001",
+    title: "Test Slice",
+    risk: "low",
+  });
+
+  insertTask({
+    id: "T01",
+    sliceId: "S01",
+    milestoneId: "M001",
+    title: "Task without host verification",
+    status: "pending",
+    planning: {
+      description: "Task intentionally missing runnable verification",
+      estimate: "1h",
+      files: [],
+      verify: "",
+      inputs: [],
+      expectedOutput: [],
       observabilityImpact: "",
     },
     sequence: 0,
@@ -250,14 +281,14 @@ describe("Post-execution blocking failure retry bypass", () => {
     const s = makeMockSession(tempDir, { type: "execute-task", id: "M001/S01/T01" });
     
     // Pre-set some retry state
-    s.verificationRetryCount.set("M001/S01/T01", 2);
+    s.verificationRetryCount.set("execute-task:M001/S01/T01", 2);
 
     const vctx: VerificationContext = { s, ctx, pi };
     const result = await runPostUnitVerification(vctx, pauseAutoMock);
 
     // On success, retry count should be cleared
     assert.equal(result, "continue");
-    assert.equal(s.verificationRetryCount.has("M001/S01/T01"), false);
+    assert.equal(s.verificationRetryCount.has("execute-task:M001/S01/T01"), false);
   });
 
   test("post-exec failure notification mentions cross-task consistency", async () => {
@@ -326,6 +357,53 @@ describe("Post-execution blocking failure retry bypass", () => {
     assert.equal(row?.gate_id, "post-execution-checks");
     assert.equal(row?.outcome, "fail");
     assert.equal(row?.failure_class, "artifact");
+  });
+
+  test("execute-task with no host-owned verification pauses fail-closed", async () => {
+    createTaskWithoutVerify();
+
+    const ctx = makeMockCtx();
+    const pi = makeMockPi();
+    const pauseAutoMock = mock.fn(async () => {});
+    const s = makeMockSession(tempDir, { type: "execute-task", id: "M001/S01/T01" });
+
+    const result = await runPostUnitVerification({ s, ctx, pi }, pauseAutoMock);
+
+    assert.equal(result, "pause");
+    assert.equal(pauseAutoMock.mock.callCount(), 1);
+    assert.equal(s.pendingVerificationRetry, null);
+
+    const evidencePath = join(tempDir, ".gsd", "milestones", "M001", "slices", "S01", "tasks", "T01-VERIFY.json");
+    const evidence = JSON.parse(readFileSync(evidencePath, "utf-8"));
+    assert.equal(evidence.passed, false);
+    assert.equal(evidence.discoverySource, "none");
+    assert.ok(!("retryAttempt" in evidence), "no-host-checks evidence must not include retryAttempt");
+    assert.ok(!("maxRetries" in evidence), "no-host-checks evidence must not include maxRetries");
+  });
+
+  test("auto-discovered package.json verification failure retries instead of continuing", async () => {
+    createTaskWithoutVerify();
+    writeFileSync(
+      join(tempDir, "package.json"),
+      JSON.stringify({ scripts: { test: "exit 1" } }),
+      "utf-8",
+    );
+    writePreferences({
+      verification_auto_fix: true,
+      verification_max_retries: 2,
+    });
+
+    const ctx = makeMockCtx();
+    const pi = makeMockPi();
+    const pauseAutoMock = mock.fn(async () => {});
+    const s = makeMockSession(tempDir, { type: "execute-task", id: "M001/S01/T01" });
+
+    const result = await runPostUnitVerification({ s, ctx, pi }, pauseAutoMock);
+
+    assert.equal(result, "retry");
+    assert.equal(pauseAutoMock.mock.callCount(), 0);
+    assert.equal(s.pendingVerificationRetry?.unitId, "M001/S01/T01");
+    assert.match(s.pendingVerificationRetry?.failureContext ?? "", /npm run test/);
   });
 });
 

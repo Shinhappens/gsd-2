@@ -116,6 +116,32 @@ test('handlePlanMilestone rejects invalid payloads', async () => {
   }
 });
 
+test('handlePlanMilestone rejects delimiter characters in milestone and slice titles', async () => {
+  const base = makeTmpBase();
+  const dbPath = join(base, '.gsd', 'gsd.db');
+  openDatabase(dbPath);
+
+  try {
+    const milestoneResult = await handlePlanMilestone({ ...validParams(), title: 'Client/Server split' }, base);
+    assert.ok('error' in milestoneResult);
+    assert.match(milestoneResult.error, /validation failed: title is invalid: .*forward slash/);
+    assert.equal(getMilestone('M001'), null, 'invalid milestone title must not persist');
+
+    const sliceResult = await handlePlanMilestone({
+      ...validParams(),
+      slices: [
+        validParams().slices[0],
+        { ...validParams().slices[1], title: 'Client/Server migration' },
+      ],
+    }, base);
+    assert.ok('error' in sliceResult);
+    assert.match(sliceResult.error, /validation failed: slices\[1\]\.title is invalid: .*forward slash/);
+    assert.equal(getMilestoneSlices('M001').length, 0, 'invalid slice title must not persist partial roadmap state');
+  } finally {
+    cleanup(base);
+  }
+});
+
 test('handlePlanMilestone surfaces render failures and does not clear parse-visible state on failure', async () => {
   const base = makeTmpBase();
   const dbPath = join(base, '.gsd', 'gsd.db');

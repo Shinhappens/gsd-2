@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@gsd/pi-coding-agent";
 import type { Model } from "@gsd/pi-ai";
 import type { GSDState } from "../../types.js";
+import { createRequire } from "node:module";
 
 import { computeProgressScore, formatProgressLine } from "../../progress-score.js";
 import { loadEffectiveGSDPreferences, getGlobalGSDPreferencesPath, getProjectGSDPreferencesPath } from "../../preferences.js";
@@ -11,6 +12,8 @@ import { handleCmux } from "../../commands-cmux.js";
 import { setSessionModelOverride } from "../../session-model-override.js";
 import { projectRoot } from "../context.js";
 import { formattedShortcutPair } from "../../shortcut-defs.js";
+import { getVisualBriefOutputDir } from "../../../visual-brief/artifact-policy.js";
+import { buildVisualBriefPrompt, parseVisualBriefArgs, VISUAL_BRIEF_USAGE } from "../../../visual-brief/prompts.js";
 
 export function showHelp(ctx: ExtensionCommandContext, args = ""): void {
   const summaryLines = [
@@ -27,6 +30,7 @@ export function showHelp(ctx: ExtensionCommandContext, args = ""): void {
     `  /gsd parallel watch Parallel monitor  (${formattedShortcutPair("parallel")})`,
     `  /gsd notifications  Notification history  (${formattedShortcutPair("notifications")})`,
     "  /gsd visualize      Interactive 10-tab TUI",
+    "  /gsd brief <mode>   Visual HTML brief (diagram, plan, diff, recap, table, slides)",
     "  /gsd queue          Show queued/dispatched units",
     "",
     "COURSE CORRECTION",
@@ -67,6 +71,7 @@ export function showHelp(ctx: ExtensionCommandContext, args = ""): void {
     "  /gsd new-project    Bootstrap a new project (use --deep for staged project-level discovery)",
     "  /gsd quick          Execute a quick task without full planning overhead",
     "  /gsd dispatch       Dispatch a specific phase directly  [research|plan|execute|complete|uat|replan]",
+    "  /gsd verdict <v>    Override milestone validation verdict  [pass|needs-attention|needs-remediation] [--milestone Mxxx] [--rationale \"...\"]",
     "  /gsd parallel       Parallel milestone orchestration  [start|status|stop|pause|resume|merge|watch]",
     "  /gsd workflow       Custom workflow lifecycle  [new|run|list|validate|pause|resume]",
     "",
@@ -75,6 +80,7 @@ export function showHelp(ctx: ExtensionCommandContext, args = ""): void {
     `  /gsd parallel watch Open parallel worker monitor  (${formattedShortcutPair("parallel")})`,
     "  /gsd widget         Cycle status widget  [full|small|min|off]",
     "  /gsd visualize      Interactive 10-tab TUI (progress, timeline, deps, metrics, health, agent, changes, knowledge, captures, export)",
+    "  /gsd brief <mode>   Generate a visual HTML brief  [diagram|plan|diff|recap|table|slides] [topic] [--slides]",
     "  /gsd queue          Show queued/dispatched units and execution order",
     "  /gsd history        View execution history  [--cost] [--phase] [--model] [N]",
     "  /gsd changelog      Show categorized release notes  [version]",
@@ -96,7 +102,7 @@ export function showHelp(ctx: ExtensionCommandContext, args = ""): void {
     "  /gsd unpark [id]    Reactivate a parked milestone",
     "",
     "PROJECT KNOWLEDGE",
-    "  /gsd knowledge <type> <text>   Add rule, pattern, or lesson to KNOWLEDGE.md",
+    "  /gsd knowledge <type> <text>   Add a rule to KNOWLEDGE.md or capture a pattern/lesson to memories",
     "  /gsd codebase [generate|update|stats]   Manage the CODEBASE.md cache used in prompt context",
     "",
     "SHIPPING & BACKLOG",
@@ -200,6 +206,37 @@ export async function handleVisualize(ctx: ExtensionCommandContext): Promise<voi
 
   if (result === undefined) {
     ctx.ui.notify("Visualizer requires an interactive terminal. Use /gsd status for a text-based overview.", "warning");
+  }
+}
+
+export async function handleBrief(args: string, ctx: ExtensionCommandContext, pi?: ExtensionAPI): Promise<void> {
+  const request = parseVisualBriefArgs(args);
+  if (!request) {
+    ctx.ui.notify(VISUAL_BRIEF_USAGE, "info");
+    return;
+  }
+
+  if (!pi?.sendUserMessage) {
+    ctx.ui.notify("Visual brief generation is unavailable in this context.", "warning");
+    return;
+  }
+
+  const outputDir = getVisualBriefOutputDir();
+  const version = resolveGsdVersion();
+  pi.sendUserMessage(buildVisualBriefPrompt(request, { outputDir, version }));
+}
+
+const briefRequire = createRequire(import.meta.url);
+
+function resolveGsdVersion(): string | undefined {
+  const envVersion = process.env.GSD_VERSION?.trim();
+  if (envVersion) return envVersion;
+  try {
+    const pkg = briefRequire("../../../../../../package.json") as { version?: unknown };
+    const fromPkg = typeof pkg.version === "string" ? pkg.version.trim() : "";
+    return fromPkg || undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -427,6 +464,10 @@ export async function handleCoreCommand(
   }
   if (trimmed === "visualize") {
     await handleVisualize(ctx);
+    return true;
+  }
+  if (trimmed === "brief" || trimmed.startsWith("brief ")) {
+    await handleBrief(trimmed.replace(/^brief\s*/, "").trim(), ctx, pi);
     return true;
   }
   if (trimmed === "widget" || trimmed.startsWith("widget ")) {

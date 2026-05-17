@@ -324,6 +324,10 @@ FOREIGN KEY (milestone_id, slice_id) → slices
 FOREIGN KEY (milestone_id, depends_on_slice_id) → slices
 ```
 - Index: `idx_slice_deps_target`
+- Maintained from the milestone `ROADMAP.md` slice `depends` declarations. The
+  ADR-017 `roadmap-divergence` reconciliation repair re-imports the roadmap as
+  the source of truth, then refreshes this junction table so dependency checks
+  see the same edges as the markdown projection.
 
 ---
 
@@ -662,7 +666,7 @@ runtime_kv  (soft state KV)
 
 | Tool | Tables READ | Tables WRITTEN | Disk Artifacts |
 |------|------------|----------------|----------------|
-| `gsd_decision_save` | decisions | decisions | DECISIONS.md (regenerated) |
+| `gsd_decision_save` | memories | memories (`category = "architecture"`) | DECISIONS.md (projection) |
 | `gsd_requirement_save` | requirements | requirements | REQUIREMENTS.md |
 | `gsd_requirement_update` | requirements | requirements | REQUIREMENTS.md |
 | `gsd_summary_save` | milestones, slices, tasks | artifacts | M##/S##/T## artifact files |
@@ -681,7 +685,7 @@ runtime_kv  (soft state KV)
 | `gsd_slice_reopen` | slices, tasks, milestones | slices, tasks | deletes S##-SUMMARY.md, UAT, all T##-SUMMARY.md |
 | `gsd_milestone_reopen` | milestones, slices, tasks | milestones, slices, tasks | deletes all summaries |
 | `gsd_save_gate_result` | quality_gates | quality_gates, gate_runs | — |
-| `capture_thought` | memories | memories | KNOWLEDGE.md |
+| `capture_thought` | memories | memories | KNOWLEDGE.md projection for Patterns/Lessons (both backfilled and newly captured) |
 | `memory_query` | memories, memories_fts, memory_embeddings | memories (hit_count++) | — |
 
 ---

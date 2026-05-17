@@ -10,7 +10,12 @@ import assert from "node:assert/strict";
 import { classifyError, isTransient, isTransientNetworkError } from "../error-classifier.ts";
 import { pauseAutoForProviderError } from "../provider-error-pause.ts";
 import { resumeAutoAfterProviderDelay } from "../bootstrap/provider-error-resume.ts";
-import { MAX_TRANSIENT_AUTO_RESUMES, resetTransientRetryState } from "../bootstrap/agent-end-recovery.ts";
+import {
+  MAX_TRANSIENT_AUTO_RESUMES,
+  isTerminalDeletedWorktreeProviderError,
+  resetTransientRetryState,
+  shouldDeferTransientErrorToCoreRetry,
+} from "../bootstrap/agent-end-recovery.ts";
 import { _buildCancelledUnitStopReason } from "../auto/phases.ts";
 import { getNextFallbackModel } from "../preferences.ts";
 // Zero-import module — imported by path rather than through the package
@@ -399,6 +404,25 @@ test("pauseAutoForProviderError falls back to indefinite pause when not rate lim
   ]);
 });
 
+test("isTerminalDeletedWorktreeProviderError matches removed auto-worktree paths only", () => {
+  assert.equal(
+    isTerminalDeletedWorktreeProviderError('Path "/Users/dev/.gsd/projects/abc123/worktrees/M005" does not exist'),
+    true,
+  );
+  assert.equal(
+    isTerminalDeletedWorktreeProviderError('Path "/Users/dev/app/.gsd/worktrees/M005" does not exist'),
+    true,
+  );
+  assert.equal(
+    isTerminalDeletedWorktreeProviderError('Path "/Users/dev/app/src/file.ts" does not exist'),
+    false,
+  );
+  assert.equal(
+    isTerminalDeletedWorktreeProviderError('Path "/Users/dev/.gsd/projects/abc123/worktrees/M005" failed with EACCES'),
+    false,
+  );
+});
+
 // ── resumeAutoAfterProviderDelay ────────────────────────────────────────────
 
 test("resumeAutoAfterProviderDelay restarts paused auto-mode from the recorded base path", async () => {
@@ -658,4 +682,16 @@ test("agent-session retryable error regex matches server_error (underscore)", ()
   assert.ok(!RETRYABLE_ERROR_RE.test("model not found"));
   // "temporarily backed off" must NOT be matched (intentional exclusion #3429)
   assert.ok(!RETRYABLE_ERROR_RE.test("temporarily backed off"));
+});
+
+test("exhausted retry errors are not deferred back to core retry handling", () => {
+  const cls = classifyError("Retry failed after 3 attempts: 500 empty_stream: upstream stream closed before first payload");
+  assert.equal(cls.kind, "server");
+  assert.equal(
+    shouldDeferTransientErrorToCoreRetry(
+      cls,
+      "Retry failed after 3 attempts: 500 empty_stream: upstream stream closed before first payload",
+    ),
+    false,
+  );
 });

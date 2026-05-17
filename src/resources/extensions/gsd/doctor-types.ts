@@ -1,3 +1,4 @@
+// GSD-2 doctor report types
 export type DoctorSeverity = "info" | "warning" | "error";
 export type DoctorIssueCode =
   | "invalid_preferences"
@@ -50,6 +51,7 @@ export type DoctorIssueCode =
   // Git / worktree integrity checks
   | "integration_branch_missing"
   | "worktree_directory_orphaned"
+  | "worktree_empty_with_project_content"
   // GSD state structural checks
   | "circular_slice_dependency"
   | "orphaned_slice_directory"
@@ -65,6 +67,7 @@ export type DoctorIssueCode =
   | "worktree_unpushed"
   // Stale commit safety check
   | "stale_uncommitted_changes"
+  | "conflict_markers_in_tracked_files"
   // Snapshot ref bloat
   | "snapshot_ref_bloat"
   // Runtime data integrity

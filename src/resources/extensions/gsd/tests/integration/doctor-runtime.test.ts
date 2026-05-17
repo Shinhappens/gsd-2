@@ -446,6 +446,26 @@ node_modules/
       const strandedIssues = detect.issues.filter(i => i.code === "stranded_lock_directory");
       assert.deepStrictEqual(strandedIssues.length, 0, "live lock holder: stranded_lock_directory NOT detected");
     });
+
+    test('stranded_lock_directory still reports when worker lookup fails', async () => {
+      const dir = createMinimalProject();
+      cleanups.push(dir);
+
+      const lockDir = join(dir, ".gsd.lock");
+      mkdirSync(lockDir, { recursive: true });
+      const { openDatabase, _getAdapter, closeDatabase } = await import("../../gsd-db.ts");
+      openDatabase(join(dir, ".gsd", "gsd.db"));
+      const db = _getAdapter()!;
+      db.exec("DROP TABLE workers");
+
+      try {
+        const detect = await runGSDDoctor(dir);
+        const strandedIssues = detect.issues.filter(i => i.code === "stranded_lock_directory");
+        assert.ok(strandedIssues.length > 0, "reports stranded lock directory even when active worker lookup fails");
+      } finally {
+        closeDatabase();
+      }
+    });
     } else {
     }
 

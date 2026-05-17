@@ -160,6 +160,10 @@ verification_auto_fix: true       # auto-retry on failure (default)
 verification_max_retries: 2       # max attempts (default: 2)
 ```
 
+Verification commands must be simple executable commands, not shell pipelines or scripts packed into one line. GSD rejects pipes (`|`), redirects (`>` and `<`), semicolons, backticks, and command substitution (`$(...)`) because verification is run as a controlled command list, not as an arbitrary shell program. Use `python3 -m pytest tests -q` instead of `python3 -m pytest tests -q 2>&1 | tail -5`.
+
+When `verification_commands` is empty and no task-level `verify` command is available, GSD can auto-discover project checks. JavaScript projects use `package.json` scripts in this order: `typecheck`, `lint`, `test`. Python projects use the `python-project` discovery source and run `python3 -m pytest` when GSD finds explicit pytest evidence: `pytest.ini`, a pytest configuration section in `pyproject.toml` such as `[tool.pytest.ini_options]`, or files matching pytest's default test file patterns (`test_*.py` or `*_test.py`) under `tests/`.
+
 ### `phases`
 
 Fine-grained control over which phases run:
@@ -263,7 +267,7 @@ custom_instructions:
   - "Prefer functional patterns over classes"
 ```
 
-For project-specific patterns, use `.gsd/KNOWLEDGE.md` instead — it's injected into every agent prompt automatically.
+For project-specific durable guidance, use `.gsd/KNOWLEDGE.md` instead. Rules are read from the file; patterns and lessons are persisted to the `memories` table and projected back into `KNOWLEDGE.md` on the next session start.
 
 ### `context_pause_threshold`
 

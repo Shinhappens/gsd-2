@@ -21,6 +21,15 @@ import {
   checkAutoStartAfterDiscuss,
 } from "../guided-flow.ts";
 
+function pendingInput(basePath: string, milestoneId: string) {
+  return {
+    basePath,
+    milestoneId,
+    ctx: { ui: { notify: () => undefined } } as any,
+    pi: { setActiveTools: () => undefined, getActiveTools: () => [] } as any,
+  };
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 describe("#2985 Bug 3 — concurrent discuss sessions must be independent", () => {
@@ -34,13 +43,11 @@ describe("#2985 Bug 3 — concurrent discuss sessions must be independent", () =
     const projectB = "/projects/beta";
 
     setPendingAutoStart(projectA, {
-      basePath: projectA,
-      milestoneId: "M001-aaa111",
+      ...pendingInput(projectA, "M001-aaa111"),
     });
 
     setPendingAutoStart(projectB, {
-      basePath: projectB,
-      milestoneId: "M002-bbb222",
+      ...pendingInput(projectB, "M002-bbb222"),
     });
 
     // Both sessions should be retrievable
@@ -55,8 +62,8 @@ describe("#2985 Bug 3 — concurrent discuss sessions must be independent", () =
     const projectA = "/projects/alpha";
     const projectB = "/projects/beta";
 
-    setPendingAutoStart(projectA, { basePath: projectA, milestoneId: "M001-aaa111" });
-    setPendingAutoStart(projectB, { basePath: projectB, milestoneId: "M002-bbb222" });
+    setPendingAutoStart(projectA, pendingInput(projectA, "M001-aaa111"));
+    setPendingAutoStart(projectB, pendingInput(projectB, "M002-bbb222"));
 
     // Clear only projectA
     clearPendingAutoStart(projectA);
@@ -72,8 +79,8 @@ describe("#2985 Bug 4 — getDiscussionMilestoneId must be keyed by basePath", (
   });
 
   test("getDiscussionMilestoneId(basePath) returns correct milestone for each project", () => {
-    setPendingAutoStart("/proj/a", { basePath: "/proj/a", milestoneId: "M001" });
-    setPendingAutoStart("/proj/b", { basePath: "/proj/b", milestoneId: "M002" });
+    setPendingAutoStart("/proj/a", pendingInput("/proj/a", "M001"));
+    setPendingAutoStart("/proj/b", pendingInput("/proj/b", "M002"));
 
     assert.equal(getDiscussionMilestoneId("/proj/a"), "M001");
     assert.equal(getDiscussionMilestoneId("/proj/b"), "M002");
@@ -81,8 +88,8 @@ describe("#2985 Bug 4 — getDiscussionMilestoneId must be keyed by basePath", (
   });
 
   test("getDiscussionMilestoneId() without basePath returns null when multiple sessions exist", () => {
-    setPendingAutoStart("/proj/a", { basePath: "/proj/a", milestoneId: "M001" });
-    setPendingAutoStart("/proj/b", { basePath: "/proj/b", milestoneId: "M002" });
+    setPendingAutoStart("/proj/a", pendingInput("/proj/a", "M001"));
+    setPendingAutoStart("/proj/b", pendingInput("/proj/b", "M002"));
 
     // Without a key, the function should not blindly return the first entry
     const result = getDiscussionMilestoneId();
@@ -92,7 +99,7 @@ describe("#2985 Bug 4 — getDiscussionMilestoneId must be keyed by basePath", (
   });
 
   test("getDiscussionMilestoneId() without basePath returns the milestone when only one session", () => {
-    setPendingAutoStart("/proj/a", { basePath: "/proj/a", milestoneId: "M001" });
+    setPendingAutoStart("/proj/a", pendingInput("/proj/a", "M001"));
 
     // With only one session, backward compat — return it
     const result = getDiscussionMilestoneId();
@@ -127,5 +134,46 @@ test("checkAutoStartAfterDiscuss ignores missing manifest for single-milestone d
   } finally {
     clearPendingAutoStart();
     rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("checkAutoStartAfterDiscuss(basePath) selects the matching pending entry when multiple sessions exist", () => {
+  const projectA = mkdtempSync(join(tmpdir(), "gsd-auto-start-project-a-"));
+  const projectB = mkdtempSync(join(tmpdir(), "gsd-auto-start-project-b-"));
+
+  function writeReadyArtifacts(base: string, milestoneId: string): void {
+    const gsdDir = join(base, ".gsd");
+    const milestoneDir = join(gsdDir, "milestones", milestoneId);
+    mkdirSync(milestoneDir, { recursive: true });
+    writeFileSync(join(gsdDir, "PROJECT.md"), `# Project\n\n| ${milestoneId} | Milestone | active |\n`);
+    writeFileSync(join(gsdDir, "STATE.md"), "# State\n");
+    writeFileSync(join(milestoneDir, `${milestoneId}-CONTEXT.md`), "# Context\n");
+  }
+
+  try {
+    clearPendingAutoStart();
+    writeReadyArtifacts(projectA, "M001");
+    writeReadyArtifacts(projectB, "M002");
+    setPendingAutoStart(projectA, {
+      basePath: projectA,
+      milestoneId: "M001",
+      ctx: { ui: { notify: () => undefined } } as any,
+      pi: { setActiveTools: () => undefined, getActiveTools: () => [] } as any,
+    });
+    setPendingAutoStart(projectB, {
+      basePath: projectB,
+      milestoneId: "M002",
+      ctx: { ui: { notify: () => undefined } } as any,
+      pi: { setActiveTools: () => undefined, getActiveTools: () => [] } as any,
+    });
+
+    assert.equal(checkAutoStartAfterDiscuss(), false, "ambiguous pending sessions should not auto-start");
+    assert.equal(checkAutoStartAfterDiscuss(projectB), true, "explicit basePath should select projectB");
+    assert.equal(getDiscussionMilestoneId(projectA), "M001", "projectA should remain pending");
+    assert.equal(getDiscussionMilestoneId(projectB), null, "projectB should be cleared after start");
+  } finally {
+    clearPendingAutoStart();
+    rmSync(projectA, { recursive: true, force: true });
+    rmSync(projectB, { recursive: true, force: true });
   }
 });

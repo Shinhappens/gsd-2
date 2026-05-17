@@ -57,6 +57,14 @@ function getAdditionalRoots(): string[] {
   if (os === "linux") {
     return getLinuxMountPoints();
   }
+  if (os === "win32") {
+    const drives: string[] = [];
+    for (let code = 65; code <= 90; code++) {
+      const drive = `${String.fromCharCode(code)}:\\`;
+      if (existsSync(drive)) drives.push(drive);
+    }
+    return drives;
+  }
   return [];
 }
 
@@ -114,11 +122,16 @@ export async function GET(request: Request): Promise<Response> {
 
     const parentPath = dirname(targetPath);
     // Only offer the parent navigation if it's within the allowed scope
-    const parentAllowed = parentPath.startsWith(devRootParent) && parentPath !== targetPath;
+    const parentAllowed =
+      parentPath !== targetPath &&
+      (parentPath.startsWith(devRoot) ||
+        parentPath === devRootParent ||
+        additionalRoots.some((root) => parentPath.startsWith(root)));
     const entries: Array<{ name: string; path: string }> = [];
 
-    // On Linux, show mount points as quick-access when browsing from home directory
-    const showMountPoints = platform() === "linux" && (targetPath === homedir() || targetPath === devRoot);
+    // Show mount/drive roots as quick-access when browsing from home or dev root.
+    const os = platform();
+    const showAdditionalRoots = (os === "linux" || os === "win32") && (targetPath === homedir() || targetPath === devRoot);
 
     try {
       const items = readdirSync(targetPath, { withFileTypes: true });
@@ -134,8 +147,8 @@ export async function GET(request: Request): Promise<Response> {
         });
       }
 
-      // Add mount points as quick-access entries on Linux
-      if (showMountPoints) {
+      // Add mount points/drives as quick-access entries.
+      if (showAdditionalRoots) {
         for (const mp of additionalRoots) {
           if (existsSync(mp)) {
             const mpName = mp.split("/").pop() || mp;

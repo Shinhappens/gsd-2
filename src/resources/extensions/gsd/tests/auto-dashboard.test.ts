@@ -13,7 +13,9 @@ import {
   formatWidgetTokens,
   estimateTimeRemaining,
   extractUatSliceId,
+  buildPhaseHandoffOutcome,
   updateProgressWidget,
+  setAutoOutcomeWidget,
   getRoadmapSlicesSync,
   clearSliceProgressCache,
   getWidgetMode,
@@ -220,6 +222,110 @@ test("formatRuntimeHealthSignal surfaces idle recovery instead of generic progre
   });
 });
 
+test("setAutoOutcomeWidget renders a durable next-action handoff", () => {
+  let widgetFactory: any;
+  setAutoOutcomeWidget(
+    {
+      hasUI: true,
+      ui: {
+        setWidget(key: string, factory: any) {
+          if (key === "gsd-outcome") widgetFactory = factory;
+        },
+      },
+    } as any,
+    {
+      status: "paused",
+      title: "Auto-mode paused",
+      detail: "Paused by user request.",
+      unitLabel: "researching M005/S01",
+      nextAction: "Type to steer, or run /gsd auto to resume.",
+      commands: ["/gsd auto", "/gsd status for overview"],
+      startedAt: Date.now() - 2_000,
+    },
+  );
+
+  assert.equal(typeof widgetFactory, "function");
+  const component = widgetFactory(
+    { requestRender() {} },
+    { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+  );
+  const output = component.render(100).join("\n");
+  assert.match(output, /Auto-mode paused/);
+  assert.match(output, /Paused by user request/);
+  assert.match(output, /researching M005\/S01/);
+  assert.match(output, /\/gsd auto/);
+});
+
+test("buildPhaseHandoffOutcome summarizes the last phase result", () => {
+  const snapshot = buildPhaseHandoffOutcome({
+    unitType: "plan-slice",
+    unitId: "M005/S01",
+    agentEndMessages: [
+      { message: { role: "assistant", content: "Planned S01 with category-aware filtering and validation steps." } },
+    ],
+  });
+
+  assert.equal(snapshot.status, "complete");
+  assert.equal(snapshot.title, "PLAN complete");
+  assert.match(snapshot.detail ?? "", /category-aware filtering/);
+  assert.equal(snapshot.unitLabel, "planning M005/S01");
+  assert.match(snapshot.nextAction, /next phase/);
+});
+
+test("buildPhaseHandoffOutcome ignores non-assistant trailing messages", () => {
+  const snapshot = buildPhaseHandoffOutcome({
+    unitType: "plan-slice",
+    unitId: "M005/S01",
+    agentEndMessages: [
+      { message: { role: "assistant", content: "Assistant summary to hand off." } },
+      { role: "tool", content: "Tool output should not be shown." },
+      { role: "user", content: "User follow-up should not be shown." },
+    ],
+  });
+
+  assert.match(snapshot.detail ?? "", /Assistant summary/);
+  assert.doesNotMatch(snapshot.detail ?? "", /Tool output/);
+  assert.doesNotMatch(snapshot.detail ?? "", /User follow-up/);
+});
+
+test("updateProgressWidget preserves the phase handoff during session switching", () => {
+  const calls: Array<[string, unknown]> = [];
+  updateProgressWidget(
+    {
+      hasUI: true,
+      ui: {
+        setWidget(key: string, factory: unknown) {
+          calls.push([key, factory]);
+        },
+        setHeader() {},
+        setStatus() {},
+      },
+    } as any,
+    "execute-task",
+    "M005/S01/T01",
+    {
+      phase: "executing",
+      activeSlice: { id: "S01", title: "Filter chip bar" },
+      activeTask: { id: "T01", title: "Add category filter" },
+    } as any,
+    {
+      getAutoStartTime: () => Date.now(),
+      isStepMode: () => false,
+      getCmdCtx: () => null,
+      getBasePath: () => "",
+      isVerbose: () => false,
+      isSessionSwitching: () => true,
+      getCurrentDispatchedModelId: () => null,
+    },
+  );
+
+  assert.ok(calls.some(([key]) => key === "gsd-progress"));
+  assert.ok(
+    !calls.some(([key, value]) => key === "gsd-outcome" && value === undefined),
+    "handoff widget should stay visible until the next progress frame renders",
+  );
+});
+
 test("shouldRenderRoadmapProgress hides pre-roadmap zero-slice progress", () => {
   assert.equal(shouldRenderRoadmapProgress(null), false);
   assert.equal(shouldRenderRoadmapProgress({ done: 0, total: 0, activeSliceTasks: null } as any), false);
@@ -342,6 +448,70 @@ test("updateProgressWidget refreshes slice progress cache immediately", (t) => {
     total: 3,
     activeSliceTasks: { done: 1, total: 1 },
   });
+});
+
+test("updateProgressWidget full mode keeps footer-owned signals out of auto deck", (t) => {
+  const dir = makeTempDir("command-deck");
+  mkdirSync(join(dir, ".gsd"), { recursive: true });
+  let widget: { render(width: number): string[]; dispose?: () => void } | null = null;
+
+  t.after(() => {
+    widget?.dispose?.();
+    clearSliceProgressCache();
+    cleanup(dir);
+  });
+
+  updateProgressWidget(
+    {
+      hasUI: true,
+      ui: {
+        setHeader() {},
+        setStatus() {},
+        setWidget(_key: string, factory: any) {
+          if (_key === "gsd-progress") {
+            widget = factory(
+              { requestRender() {} },
+              { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+            );
+          }
+        },
+      },
+      sessionManager: { getSessionId: () => "session-1" },
+    } as any,
+    "execute-task",
+    "M004/S01/T01",
+    {
+      phase: "executing",
+      activeMilestone: { id: "M004", title: "Budget Tracking" },
+      activeSlice: { id: "S01", title: "Schema migration + expense add --repeat" },
+      activeTask: { id: "T01", title: "Add repeat column via idempotent ALTER TABLE" },
+    } as any,
+    {
+      getAutoStartTime: () => Date.now() - 18_000,
+      isStepMode: () => false,
+      getCmdCtx: () => ({
+        model: { id: "claude-sonnet-4-6", provider: "claude-code", contextWindow: 1_000_000 },
+        getContextUsage: () => ({ percent: 0.2, contextWindow: 1_000_000 }),
+        sessionManager: { getEntries: () => [] },
+      } as any),
+      getBasePath: () => dir,
+      isVerbose: () => false,
+      isSessionSwitching: () => false,
+      getCurrentDispatchedModelId: () => "claude-code/claude-sonnet-4-6",
+    },
+  );
+
+  const installedWidget = widget as { render(width: number): string[]; dispose?: () => void } | null;
+  assert.ok(installedWidget, "progress widget should be installed");
+  const rendered = installedWidget.render(120).join("\n");
+
+  assert.match(rendered, /GSD\s+AUTO/);
+  assert.match(rendered, /Budget Tracking/);
+  assert.match(rendered, /T01: Add repeat column via idempotent ALTER TABLE/);
+  assert.match(rendered, /dashboard/);
+  assert.doesNotMatch(rendered, /claude-sonnet-4-6/, "footer owns provider/model display");
+  assert.doesNotMatch(rendered, /0\.2%|ctx|1\.0M/, "footer owns raw context meter display");
+  assert.doesNotMatch(rendered, /\$/, "footer owns session cost display");
 });
 
 test("last commit refresh backs off cleanly when base path is not a git repo", (t) => {

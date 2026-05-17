@@ -5,9 +5,10 @@ import { findMilestoneIds } from "./guided-flow.js";
 import { parseUnitId } from "./unit-id.js";
 import { isDbAvailable, getMilestoneSlices, getMilestone } from "./gsd-db.js";
 import { parseRoadmap } from "./parsers-legacy.js";
-import { isClosedStatus } from "./status-guards.js";
+import { isClosedStatus, isSkippedForDispatch } from "./status-guards.js";
 import { classifyMilestoneSummaryContent } from "./milestone-summary-classifier.js";
 import { readFileSync } from "node:fs";
+import type { LoopState } from "./auto/types.js";
 
 const SLICE_DISPATCH_TYPES = new Set([
   "research-slice",
@@ -16,6 +17,63 @@ const SLICE_DISPATCH_TYPES = new Set([
   "execute-task",
   "complete-slice",
 ]);
+
+const CONSECUTIVE_SAME_UNIT_CAP_TYPES = new Set([
+  "complete-milestone",
+  "validate-milestone",
+  "research-slice",
+]);
+const CONSECUTIVE_SAME_UNIT_CAP = 2;
+
+type ConsecutiveDispatchState = Pick<
+  LoopState,
+  "consecutiveDispatchCount" | "lastDispatchedKey" | "lastDispatchPhase"
+>;
+
+/**
+ * Prevent repeated dispatches of the same unit within the same phase.
+ *
+ * Applies only to unit types in `CONSECUTIVE_SAME_UNIT_CAP_TYPES`. The first
+ * dispatch for a unit/phase pair starts a counter, unit or phase changes reset
+ * tracking, and dispatch is blocked once the counter reaches
+ * `CONSECUTIVE_SAME_UNIT_CAP`.
+ *
+ * Side effects: mutates `state.consecutiveDispatchCount`,
+ * `state.lastDispatchedKey`, and `state.lastDispatchPhase`.
+ *
+ * Returns `null` when dispatch is allowed, or a blocker message (including
+ * guidance to run `/gsd resume`) when the cap is reached.
+ */
+export function getConsecutiveDispatchBlocker(
+  state: ConsecutiveDispatchState,
+  phase: string,
+  unitType: string,
+  unitId: string,
+): string | null {
+  if (!CONSECUTIVE_SAME_UNIT_CAP_TYPES.has(unitType)) return null;
+  if (!state.consecutiveDispatchCount) state.consecutiveDispatchCount = new Map<string, number>();
+
+  const key = `${unitType}:${unitId}`;
+  const phaseChanged = state.lastDispatchPhase !== phase;
+  const switchedUnit = state.lastDispatchedKey !== key;
+  if (phaseChanged || switchedUnit) {
+    state.consecutiveDispatchCount.clear();
+    state.consecutiveDispatchCount.set(key, 1);
+    state.lastDispatchedKey = key;
+    state.lastDispatchPhase = phase;
+    return null;
+  }
+
+  const count = state.consecutiveDispatchCount.get(key) ?? 0;
+  if (count >= CONSECUTIVE_SAME_UNIT_CAP) {
+    return `Cannot dispatch ${unitType} ${unitId}: dispatched ${count} consecutive times; same-unit repeat cap reached. Resolve via /gsd resume.`;
+  }
+
+  state.consecutiveDispatchCount.set(key, count + 1);
+  state.lastDispatchedKey = key;
+  state.lastDispatchPhase = phase;
+  return null;
+}
 
 export function getPriorSliceCompletionBlocker(
   base: string,
@@ -58,7 +116,7 @@ export function getPriorSliceCompletionBlocker(
     //      DB-backed projects must not treat SUMMARY.md as authoritative.
     if (isDbAvailable()) {
       const milestoneRow = getMilestone(mid);
-      if (milestoneRow && isClosedStatus(milestoneRow.status)) continue;
+      if (milestoneRow && isSkippedForDispatch(milestoneRow.status)) continue;
     } else {
       const summaryPath = resolveMilestoneFile(base, mid, "SUMMARY");
       let summaryContent: string | null = null;

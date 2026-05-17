@@ -1,3 +1,6 @@
+// Project/App: GSD-2
+// File Purpose: Registers packaged workflow tools exposed by the GSD MCP server.
+
 /**
  * Workflow MCP tools — exposes the core GSD mutation/read handlers over MCP.
  */
@@ -225,6 +228,36 @@ type WorkflowToolExecutors = {
       verificationEvidence?: Array<
         { command: string; exitCode: number; verdict: string; durationMs: number } | string
       >;
+    },
+    basePath?: string,
+  ) => Promise<unknown>;
+  executeTaskReopen: (
+    params: {
+      taskId: string;
+      sliceId: string;
+      milestoneId: string;
+      reason?: string;
+      actorName?: string;
+      triggerReason?: string;
+    },
+    basePath?: string,
+  ) => Promise<unknown>;
+  executeSliceReopen: (
+    params: {
+      sliceId: string;
+      milestoneId: string;
+      reason?: string;
+      actorName?: string;
+      triggerReason?: string;
+    },
+    basePath?: string,
+  ) => Promise<unknown>;
+  executeMilestoneReopen: (
+    params: {
+      milestoneId: string;
+      reason?: string;
+      actorName?: string;
+      triggerReason?: string;
     },
     basePath?: string,
   ) => Promise<unknown>;
@@ -478,6 +511,9 @@ function isWorkflowToolExecutors(value: unknown): value is WorkflowToolExecutors
     "executeSaveGateResult",
     "executeSummarySave",
     "executeTaskComplete",
+    "executeTaskReopen",
+    "executeSliceReopen",
+    "executeMilestoneReopen",
   ];
 
   return Array.isArray(record.SUPPORTED_SUMMARY_ARTIFACT_TYPES) &&
@@ -832,6 +868,39 @@ async function handleTaskComplete(
   // handleReplanSlice) eliminates the recurrence risk by construction.
   return adaptExecutorResult(
     await runSerializedWorkflowOperation(() => executeTaskComplete(args, projectDir)),
+  );
+}
+
+async function handleTaskReopen(
+  projectDir: string,
+  args: Omit<z.infer<typeof taskReopenSchema>, "projectDir">,
+): Promise<unknown> {
+  await enforceWorkflowWriteGate("gsd_task_reopen", projectDir, args.milestoneId);
+  const { executeTaskReopen } = await getWorkflowToolExecutors();
+  return adaptExecutorResult(
+    await runSerializedWorkflowOperation(() => executeTaskReopen(args, projectDir)),
+  );
+}
+
+async function handleSliceReopen(
+  projectDir: string,
+  args: Omit<z.infer<typeof sliceReopenSchema>, "projectDir">,
+): Promise<unknown> {
+  await enforceWorkflowWriteGate("gsd_slice_reopen", projectDir, args.milestoneId);
+  const { executeSliceReopen } = await getWorkflowToolExecutors();
+  return adaptExecutorResult(
+    await runSerializedWorkflowOperation(() => executeSliceReopen(args, projectDir)),
+  );
+}
+
+async function handleMilestoneReopen(
+  projectDir: string,
+  args: Omit<z.infer<typeof milestoneReopenSchema>, "projectDir">,
+): Promise<unknown> {
+  await enforceWorkflowWriteGate("gsd_milestone_reopen", projectDir, args.milestoneId);
+  const { executeMilestoneReopen } = await getWorkflowToolExecutors();
+  return adaptExecutorResult(
+    await runSerializedWorkflowOperation(() => executeMilestoneReopen(args, projectDir)),
   );
 }
 
@@ -1384,6 +1453,36 @@ const taskCompleteParams = {
 };
 const taskCompleteSchema = z.object(taskCompleteParams);
 
+const taskReopenParams = {
+  projectDir: projectDirParam,
+  taskId: nonEmptyString("taskId").describe("Task ID (e.g. T01)"),
+  sliceId: nonEmptyString("sliceId").describe("Slice ID (e.g. S01)"),
+  milestoneId: nonEmptyString("milestoneId").describe("Milestone ID (e.g. M001)"),
+  reason: z.string().optional().describe("Why the task is being reopened"),
+  actorName: z.string().optional().describe("Caller-provided actor identity for audit trail"),
+  triggerReason: z.string().optional().describe("Caller-provided reason this action was triggered"),
+};
+const taskReopenSchema = z.object(taskReopenParams);
+
+const sliceReopenParams = {
+  projectDir: projectDirParam,
+  sliceId: nonEmptyString("sliceId").describe("Slice ID (e.g. S01)"),
+  milestoneId: nonEmptyString("milestoneId").describe("Milestone ID (e.g. M001)"),
+  reason: z.string().optional().describe("Why the slice is being reopened"),
+  actorName: z.string().optional().describe("Caller-provided actor identity for audit trail"),
+  triggerReason: z.string().optional().describe("Caller-provided reason this action was triggered"),
+};
+const sliceReopenSchema = z.object(sliceReopenParams);
+
+const milestoneReopenParams = {
+  projectDir: projectDirParam,
+  milestoneId: nonEmptyString("milestoneId").describe("Milestone ID (e.g. M001)"),
+  reason: z.string().optional().describe("Why the milestone is being reopened"),
+  actorName: z.string().optional().describe("Caller-provided actor identity for audit trail"),
+  triggerReason: z.string().optional().describe("Caller-provided reason this action was triggered"),
+};
+const milestoneReopenSchema = z.object(milestoneReopenParams);
+
 const milestoneStatusParams = {
   projectDir: projectDirParam,
   milestoneId: z.string().describe("Milestone ID to query (e.g. M001)"),
@@ -1848,6 +1947,75 @@ export function registerWorkflowTools(realServer: McpToolServer): void {
       const parsed = parseWorkflowArgs(taskCompleteSchema, args);
       const { projectDir, ...taskArgs } = parsed;
       return handleTaskComplete(projectDir, taskArgs);
+    },
+  );
+
+  server.tool(
+    "gsd_task_reopen",
+    "Reset a completed task back to pending so it can be re-done.",
+    taskReopenParams,
+    async (args: Record<string, unknown>) => {
+      const parsed = parseWorkflowArgs(taskReopenSchema, args);
+      const { projectDir, ...taskArgs } = parsed;
+      return handleTaskReopen(projectDir, taskArgs);
+    },
+  );
+
+  server.tool(
+    "gsd_reopen_task",
+    "Alias for gsd_task_reopen. Reset a completed task back to pending so it can be re-done.",
+    taskReopenParams,
+    async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_reopen_task", "gsd_task_reopen");
+      const parsed = parseWorkflowArgs(taskReopenSchema, args);
+      const { projectDir, ...taskArgs } = parsed;
+      return handleTaskReopen(projectDir, taskArgs);
+    },
+  );
+
+  server.tool(
+    "gsd_slice_reopen",
+    "Reset a completed slice back to in_progress and reset its tasks to pending.",
+    sliceReopenParams,
+    async (args: Record<string, unknown>) => {
+      const parsed = parseWorkflowArgs(sliceReopenSchema, args);
+      const { projectDir, ...sliceArgs } = parsed;
+      return handleSliceReopen(projectDir, sliceArgs);
+    },
+  );
+
+  server.tool(
+    "gsd_reopen_slice",
+    "Alias for gsd_slice_reopen. Reset a completed slice back to in_progress and reset its tasks to pending.",
+    sliceReopenParams,
+    async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_reopen_slice", "gsd_slice_reopen");
+      const parsed = parseWorkflowArgs(sliceReopenSchema, args);
+      const { projectDir, ...sliceArgs } = parsed;
+      return handleSliceReopen(projectDir, sliceArgs);
+    },
+  );
+
+  server.tool(
+    "gsd_milestone_reopen",
+    "Reset a closed milestone back to active and reset its slices/tasks for rework.",
+    milestoneReopenParams,
+    async (args: Record<string, unknown>) => {
+      const parsed = parseWorkflowArgs(milestoneReopenSchema, args);
+      const { projectDir, ...milestoneArgs } = parsed;
+      return handleMilestoneReopen(projectDir, milestoneArgs);
+    },
+  );
+
+  server.tool(
+    "gsd_reopen_milestone",
+    "Alias for gsd_milestone_reopen. Reset a closed milestone back to active and reset its slices/tasks for rework.",
+    milestoneReopenParams,
+    async (args: Record<string, unknown>) => {
+      logAliasUsage("gsd_reopen_milestone", "gsd_milestone_reopen");
+      const parsed = parseWorkflowArgs(milestoneReopenSchema, args);
+      const { projectDir, ...milestoneArgs } = parsed;
+      return handleMilestoneReopen(projectDir, milestoneArgs);
     },
   );
 

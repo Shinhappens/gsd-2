@@ -7,7 +7,7 @@ import { milestonesDir, gsdRoot, resolveGsdRootFile } from "./paths.js";
 import { deriveState, isGhostMilestone, isReusableGhostMilestone } from "./state.js";
 import { saveFile } from "./files.js";
 import { nativeIsRepo, nativeForEachRef, nativeUpdateRef } from "./native-git-bridge.js";
-import { readCrashLock, isLockProcessAlive, clearLock } from "./crash-recovery.js";
+import { readCrashLock, isLockProcessAlive, clearStaleWorkerLock } from "./crash-recovery.js";
 import { getActiveAutoWorkers } from "./db/auto-workers.js";
 import { normalizeRealPath } from "./paths.js";
 import { ensureGitignore, isGsdGitignored } from "./gitignore.js";
@@ -56,7 +56,7 @@ export async function checkRuntimeHealth(
         });
 
         if (shouldFix("stale_crash_lock")) {
-          clearLock(basePath);
+          clearStaleWorkerLock(basePath);
           fixesApplied.push("cleared stale auto-mode worker state");
         }
       }
@@ -80,17 +80,29 @@ export async function checkRuntimeHealth(
         // heartbeat for this project?" — readCrashLock returns null for
         // healthy live workers (it surfaces stale ones only), so we must
         // consult getActiveAutoWorkers directly.
-        const projectRoot = normalizeRealPath(basePath);
-        const activeWorkers = getActiveAutoWorkers().filter(
-          (w) => w.project_root_realpath === projectRoot && isLockProcessAlive({
-            pid: w.pid,
-            startedAt: w.started_at,
-            unitType: "starting",
-            unitId: "bootstrap",
-            unitStartedAt: w.started_at,
-          }),
-        );
-        const lockHolderAlive = activeWorkers.length > 0;
+        let lockHolderAlive = false;
+        try {
+          const projectRoot = normalizeRealPath(basePath);
+          for (const worker of getActiveAutoWorkers()) {
+            if (worker.project_root_realpath !== projectRoot) continue;
+            try {
+              if (isLockProcessAlive({
+                pid: worker.pid,
+                startedAt: worker.started_at,
+                unitType: "starting",
+                unitId: "bootstrap",
+                unitStartedAt: worker.started_at,
+              })) {
+                lockHolderAlive = true;
+                break;
+              }
+            } catch {
+              // Ignore malformed worker rows or transient PID probe failures.
+            }
+          }
+        } catch {
+          // If worker lookup fails, continue with the stranded lock diagnosis.
+        }
         if (!lockHolderAlive) {
           issues.push({
             severity: "error",

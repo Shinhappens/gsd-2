@@ -52,7 +52,7 @@ import {
   normalizeWorktreePathForCompare,
   resolveWorktreeProjectRoot,
 } from "./worktree-root.js";
-import { MergeConflictError, createDraftPR, readIntegrationBranch, RUNTIME_EXCLUSION_PATHS } from "./git-service.js";
+import { MergeConflictError, createDraftPR, readIntegrationBranch, resolveMilestoneIntegrationBranch, RUNTIME_EXCLUSION_PATHS } from "./git-service.js";
 import { buildPrEvidence } from "./pr-evidence.js";
 import { debugLog } from "./debug-logger.js";
 import { logWarning, logError } from "./workflow-logger.js";
@@ -252,7 +252,17 @@ function gitPathspecForWorktreePath(basePath: string, targetPath: string): strin
   let base = basePath;
   let target = targetPath;
   try {
-    base = realpathSync.native(basePath);
+    base = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf-8",
+    }).trim() || basePath;
+  } catch {
+    /* keep original */
+    void base;
+  }
+  try {
+    base = realpathSync.native(base);
   } catch {
     /* keep original */
     void base;
@@ -269,6 +279,10 @@ function gitPathspecForWorktreePath(basePath: string, targetPath: string): strin
   return rel.replaceAll("\\", "/");
 }
 
+export function _gitPathspecForWorktreePath(basePath: string, targetPath: string): string | null {
+  return gitPathspecForWorktreePath(basePath, targetPath);
+}
+
 function gitRemoteExists(basePath: string, remote: string): boolean {
   try {
     execFileSync("git", ["remote", "get-url", remote], {
@@ -280,6 +294,50 @@ function gitRemoteExists(basePath: string, remote: string): boolean {
   } catch {
     return false;
   }
+}
+
+function findRegularMergeChangedPaths(basePath: string, milestoneBranch: string, mainBranch: string): Set<string> {
+  const changedPaths = new Set<string>();
+  let mergeLog = "";
+  try {
+    mergeLog = execFileSync("git", ["rev-list", "--merges", "--parents", mainBranch], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    }).trim();
+  } catch (err) {
+    logWarning("worktree", `regular merge lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+    return changedPaths;
+  }
+
+  for (const line of mergeLog.split("\n").filter(Boolean)) {
+    const [mergeCommit, firstParent, ...otherParents] = line.split(" ");
+    if (!mergeCommit || !firstParent || otherParents.length === 0) continue;
+    const mergedMilestone = otherParents.some((parent) => {
+      try {
+        return nativeIsAncestor(basePath, milestoneBranch, parent);
+      } catch {
+        return false;
+      }
+    });
+    if (!mergedMilestone) continue;
+
+    try {
+      const output = execFileSync("git", ["diff", "--name-only", firstParent, mergeCommit], {
+        cwd: basePath,
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "utf-8",
+      }).trim();
+      for (const path of output.split("\n").filter(Boolean)) {
+        if (!path.startsWith(".gsd/")) changedPaths.add(path);
+      }
+    } catch (err) {
+      logWarning("worktree", `regular merge diff lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return changedPaths;
+  }
+
+  return changedPaths;
 }
 
 function clearProjectRootStateFiles(basePath: string, milestoneId: string): void {
@@ -643,7 +701,8 @@ export function syncGsdStateToWorktree(
   // If both resolve to the same directory (symlink), no sync needed
   if (isSamePath(mainGsd, wtGsd)) return { synced };
 
-  if (!existsSync(mainGsd) || !existsSync(wtGsd)) return { synced };
+  if (!existsSync(mainGsd)) return { synced };
+  mkdirSync(wtGsd, { recursive: true });
 
   // Sync root-level .gsd/ files (DECISIONS, REQUIREMENTS, PROJECT, KNOWLEDGE, etc.)
   for (const f of ROOT_STATE_FILES) {
@@ -949,7 +1008,73 @@ export function enterBranchModeForMilestone(
     });
   }
 
-  nativeCheckoutBranch(basePath, branch);
+  checkoutBranchWithStashGuard(basePath, branch, `enter-branch-mode:${milestoneId}`);
+}
+
+export function checkoutBranchWithStashGuard(
+  basePath: string,
+  branch: string,
+  reason: string,
+): void {
+  let stashMarker: string | null = null;
+  let stashed = false;
+
+  const status = nativeWorkingTreeStatus(basePath).trim();
+  if (status.length > 0) {
+    stashMarker = `gsd-checkout-stash:${reason}:${process.pid}:${Date.now()}:${process.hrtime.bigint().toString(36)}`;
+    const stashListBefore = execFileSync("git", ["stash", "list"], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    });
+    execFileSync(
+      "git",
+      ["stash", "push", "--include-untracked", "-m", `gsd: checkout stash [${stashMarker}]`],
+      {
+        cwd: basePath,
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "utf-8",
+      },
+    );
+    const stashListAfter = execFileSync("git", ["stash", "list"], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    });
+    stashed = stashListAfter !== stashListBefore;
+  }
+
+  // Checkout and stash-restore are split so we can distinguish two failure
+  // modes: (a) checkout failed → HEAD did not move, restore stash and rethrow;
+  // (b) checkout succeeded but stash pop failed → HEAD moved to `branch` but
+  // the working-tree changes remain in the stash list. We surface a distinct
+  // error in case (b) so callers don't assume the branch switch was rolled back.
+  try {
+    nativeCheckoutBranch(basePath, branch);
+  } catch (checkoutErr) {
+    if (stashed) {
+      try {
+        popStashByRef(basePath, stashMarker);
+      } catch (restoreErr) {
+        logWarning("worktree", `git stash pop failed during checkout restore: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`);
+      }
+    }
+    throw checkoutErr;
+  }
+
+  if (stashed) {
+    try {
+      popStashByRef(basePath, stashMarker);
+    } catch (popErr) {
+      const msg = popErr instanceof Error ? popErr.message : String(popErr);
+      const wrapped = new Error(
+        `checkout to '${branch}' succeeded but stash restore failed; working tree changes remain in the stash list. Original error: ${msg}`,
+      );
+      const ref = (popErr as { stashRef?: string } | null)?.stashRef;
+      if (ref) (wrapped as { stashRef?: string }).stashRef = ref;
+      throw wrapped;
+    }
+  }
 }
 
 // ─── Public API ────────────────────────────────────────────────────────────
@@ -1596,22 +1721,11 @@ export function mergeMilestoneToMain(
   const previousCwd = process.cwd();
   process.chdir(originalBasePath_);
 
-  // 4. Resolve integration branch — prefer milestone metadata, then preferences,
-  //    then auto-detect (origin/HEAD → main → master → current). Never hardcode
-  //    "main": repos using "master" or a custom default branch would fail at
-  //    checkout and leave the user with a broken merge state (#1668).
+  // 4. Resolve integration branch via shared resolver so stale/invalid
+  //    milestone metadata can recover to configured/detected fallbacks.
   const prefs = loadEffectiveGSDPreferences()?.preferences?.git ?? {};
-  const integrationBranch = readIntegrationBranch(
-    originalBasePath_,
-    milestoneId,
-  );
-  // Validate prefs.main_branch exists before using it — a stale preference
-  // (e.g. "master" when repo uses "main") causes merge failure (#3589).
-  const validatedPrefBranch = prefs.main_branch && nativeBranchExists(originalBasePath_, prefs.main_branch)
-    ? prefs.main_branch
-    : undefined;
-  const mainBranch =
-    integrationBranch ?? validatedPrefBranch ?? nativeDetectMainBranch(originalBasePath_);
+  const branchResolution = resolveMilestoneIntegrationBranch(originalBasePath_, milestoneId, prefs);
+  const mainBranch = branchResolution.effectiveBranch ?? nativeDetectMainBranch(originalBasePath_);
 
   // Fail closed when the resolved integration branch is the milestone branch
   // itself (#5024). Stale or corrupt metadata (e.g. integrationBranch recorded
@@ -1625,9 +1739,8 @@ export function mergeMilestoneToMain(
     throw new GSDError(
       GSD_GIT_ERROR,
       `Resolved integration branch "${mainBranch}" is the same ref as milestone branch ` +
-      `"${milestoneBranch}" — refusing to self-merge. Integration branch metadata is invalid; ` +
-      `set a distinct main_branch in GSD preferences or repair the milestone integration record ` +
-      `before retrying milestone completion.`,
+      `"${milestoneBranch}" — refusing to self-merge. ${branchResolution.reason}. ` +
+      `Repair milestone integration metadata before retrying milestone completion.`,
     );
   }
 
@@ -1737,6 +1850,66 @@ export function mergeMilestoneToMain(
         reason: String(err),
       });
     }
+  }
+
+  // Already regular-merged milestones can skip the squash path and proceed to cleanup (#5831).
+  if (nativeIsAncestor(originalBasePath_, milestoneBranch, mainBranch)) {
+    const codeChanges = nativeDiffNumstat(
+      originalBasePath_,
+      mainBranch,
+      milestoneBranch,
+    ).filter((entry) => !entry.path.startsWith(".gsd/"));
+    if (codeChanges.length > 0) {
+      const regularMergeChangedPaths = findRegularMergeChangedPaths(
+        originalBasePath_,
+        milestoneBranch,
+        mainBranch,
+      );
+      const unanchoredCodeChanges = codeChanges.filter((entry) =>
+        regularMergeChangedPaths.has(entry.path)
+      );
+      if (unanchoredCodeChanges.length > 0) {
+        process.chdir(previousCwd);
+        throw new GSDError(
+          GSD_GIT_ERROR,
+          `Milestone branch "${milestoneBranch}" is reachable from "${mainBranch}" ` +
+            `but has ${unanchoredCodeChanges.length} milestone-touched code file(s) not on current "${mainBranch}". ` +
+            `Aborting worktree teardown to prevent data loss.`,
+        );
+      }
+    }
+    debugLog("mergeMilestoneToMain", {
+      action: "skip-squash-already-merged",
+      milestoneId,
+      milestoneBranch,
+      mainBranch,
+    });
+    try {
+      clearProjectRootStateFiles(originalBasePath_, milestoneId);
+    } catch (err) {
+      logWarning("worktree", `clearProjectRootStateFiles failed during already-merged cleanup: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      removeWorktree(originalBasePath_, milestoneId, {
+        branch: milestoneBranch,
+        deleteBranch: false,
+      });
+    } catch (err) {
+      logWarning("worktree", `worktree removal failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      nativeBranchDelete(originalBasePath_, milestoneBranch);
+    } catch (err) {
+      logWarning("worktree", `git branch-delete failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    setActiveWorkspace(null);
+    nudgeGitBranchCache(previousCwd);
+    try {
+      process.chdir(originalBasePath_);
+    } catch (err) {
+      logWarning("worktree", `chdir to project root after already-merged cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { commitMessage, pushed: false, prCreated: false, codeFilesChanged: true };
   }
 
   // 7. Shelter queued milestone directories before the squash merge (#2505).
@@ -1874,14 +2047,6 @@ export function mergeMilestoneToMain(
     logWarning("worktree", `git stash failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  if (needsDbCycle && dbPathToReopen) {
-    try {
-      openDatabase(dbPathToReopen);
-    } catch (err) {
-      logWarning("worktree", `post-stash db reopen failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
   // 7b. Clean up stale merge state before attempting squash merge (#2912).
   // A leftover MERGE_HEAD (from a previous failed merge, libgit2 native path,
   // or interrupted operation) causes `git merge --squash` to refuse with
@@ -1891,6 +2056,13 @@ export function mergeMilestoneToMain(
 
   // 8. Squash merge — auto-resolve .gsd/ state file conflicts (#530)
   const mergeResult = nativeMergeSquash(originalBasePath_, milestoneBranch);
+  if (needsDbCycle && dbPathToReopen) {
+    try {
+      openDatabase(dbPathToReopen);
+    } catch (err) {
+      logWarning("worktree", `post-merge db reopen failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   if (!mergeResult.success) {
     // Dirty working tree — the merge was rejected before it started (e.g.
